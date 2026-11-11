@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import { Worker } from 'node:worker_threads'
 import { buildObjectiveConfig } from '../model/objective.mjs'
-import { compileExecutablePrefix } from '../planner/compile-prefix.mjs'
+import { compileExecutablePrefix, computeEarliestDomesticTransitionSec } from '../planner/compile-prefix.mjs'
 
 export function buildNeighborSignature(neighborTargets = []) {
   if (!Array.isArray(neighborTargets) || neighborTargets.length === 0) return 'none'
@@ -41,6 +41,11 @@ export class PlanCache {
     createdAtMs = Date.now(),
   }) {
     if (!account || !worldBefore || !plan) return null
+    const bucket0 = plan.trunkBuckets?.[0]
+    const isWaitPlan = (bucket0?.domesticActions?.length || 0) === 0 && (bucket0?.visitActions?.length || 0) === 0
+    const invalidateAtSec = adapter
+      ? computeEarliestDomesticTransitionSec(adapter, worldBefore, isWaitPlan ? plan.nextWakeSec : null)
+      : Infinity
     const entry = {
       account,
       rev: Number(worldBefore.rev ?? -1),
@@ -53,6 +58,8 @@ export class PlanCache {
       constraintsHash: envelope?.constraintsHash || plan.constraintsHash,
       objectiveHash: objectiveCfg?.objectiveHash || plan.objectiveHash,
       neighborSig,
+      isWaitPlan,
+      invalidateAtSec,
       envelope,
       plan,
       horizonStability,
@@ -79,6 +86,11 @@ export class PlanCache {
       }
       return null
     }
+    const nowW = Math.floor(Number(world.now || 0))
+    if (nowW >= entry.invalidateAtSec) {
+      this.byAccount.delete(account)
+      return null
+    }
     if (adapter.R.isleIndex(world.now) !== entry.isleIndex) return null
     if (adapter.R.worldDay(world.now) !== entry.naturalDay) return null
     if (constraintsHash && entry.constraintsHash !== constraintsHash) return null
@@ -86,6 +98,7 @@ export class PlanCache {
     if (entry.neighborSig !== neighborSig) return null
     if (Number(world.coins || 0) !== entry.coins) return null
     if (Number(world.state?.en || 0) < entry.en) return null
+    if (entry.isWaitPlan && Number(world.state?.en || 0) > entry.en) return null
     if (JSON.stringify(world.state?.iq || {}) !== entry.iqJson) return null
 
     const compiled = compileExecutablePrefix(adapter, world, entry.plan, { maxClockDriftSec })
@@ -264,11 +277,27 @@ export class AsyncPlanManager {
       }
     })
 
+    const jobWorld = envelope.observed.world
+    const jobAtSec = Math.floor(Number(jobWorld?.now || 0))
+    const jobInvalidateAtSec = adapter
+      ? computeEarliestDomesticTransitionSec(adapter, jobWorld, null)
+      : Infinity
     this.activeJob = {
       jobId,
       worker: w,
       account,
       matchKey,
+      rev: Number(jobWorld?.rev ?? -1),
+      atSec: jobAtSec,
+      isleIndex: adapter ? adapter.R.isleIndex(jobWorld?.now || 0) : null,
+      naturalDay: adapter ? adapter.R.worldDay(jobWorld?.now || 0) : null,
+      coins: Number(jobWorld?.coins || 0),
+      en: Number(jobWorld?.state?.en || 0),
+      iqJson: JSON.stringify(jobWorld?.state?.iq || {}),
+      constraintsHash: envelope.constraintsHash,
+      objectiveHash: objCfg.objectiveHash,
+      neighborSig,
+      invalidateAtSec: jobInvalidateAtSec,
       isBackground,
       abortReason: null,
       promise,
@@ -355,9 +384,29 @@ export class AsyncPlanManager {
       runStability,
     })
 
-    // 3. Reuse matching in-flight job or preempt stale background job
+    const isCompatibleInFlight = (candJob) => {
+      if (!candJob) return false
+      if (candJob.matchKey === matchKey) return true
+      const nowW = Math.floor(Number(world?.now || 0))
+      const drift = nowW - Number(candJob.atSec || 0)
+      if (candJob.account !== account) return false
+      if (Number(world?.rev ?? -2) !== candJob.rev) return false
+      if (drift < 0 || drift > maxClockDriftSec) return false
+      if (nowW >= candJob.invalidateAtSec) return false
+      if (adapter && (adapter.R.isleIndex(world.now) !== candJob.isleIndex || adapter.R.worldDay(world.now) !== candJob.naturalDay)) return false
+      if (candJob.constraintsHash !== envelope.constraintsHash) return false
+      if (candJob.objectiveHash !== objCfg.objectiveHash) return false
+      if (candJob.neighborSig !== neighborSig) return false
+      if (Number(world?.coins || 0) !== candJob.coins) return false
+      if (Number(world?.state?.en || 0) < candJob.en) return false
+      if (JSON.stringify(world?.state?.iq || {}) !== candJob.iqJson) return false
+      return true
+    }
+
+    // 3. Reuse compatible in-flight job (including `+2s` pre-warm jobs regardless of `runStability`) or preempt stale job
     let job = this.activeJob
-    if (job && job.matchKey !== matchKey) {
+    const reusedInFlight = Boolean(job && isCompatibleInFlight(job))
+    if (job && !reusedInFlight) {
       await this.abortActiveJob('superseded-by-foreground-solve')
       job = null
     }
@@ -420,6 +469,41 @@ export class AsyncPlanManager {
           status: 'aborted-by-deadline',
           reason: winner.reason,
         }
+      }
+      if (reusedInFlight && winner.res?.status === 'solved' && adapter) {
+        const revalidated = this.cache.getValid({
+          adapter,
+          account,
+          world,
+          constraintsHash: envelope.constraintsHash,
+          objectiveHash: objCfg.objectiveHash,
+          neighborSig,
+          maxClockDriftSec,
+        })
+        if (revalidated) {
+          this.stats.cacheHits++
+          return {
+            status: 'cache-hit',
+            plan: revalidated.plan,
+            horizonStability: revalidated.horizonStability,
+            compiled: revalidated.compiled,
+          }
+        }
+        return this.solveOrPreempt({
+          rulesPath,
+          adapter,
+          account,
+          envelope,
+          objectiveCfg: objCfg,
+          neighborTargets,
+          solverOptions,
+          runStability,
+          deadlineAtMs,
+          shouldPreemptFn,
+          pollIntervalMs,
+          maxClockDriftSec,
+          nowMsFn,
+        })
       }
       return winner.res
     } finally {

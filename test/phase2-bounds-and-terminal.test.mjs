@@ -176,7 +176,12 @@ test('Phase 2B.4: Rolling-horizon p(t) = 100 - 1/(t+1) deferral pathology preven
   const stab = solveWithHorizonStability(
     adapter,
     env,
-    buildObjectiveConfig({ horizonSec: 3600, extendedHorizonDeltaSec: 3600, terminalSupplyMode: 'conservative-floor' }),
+    buildObjectiveConfig({
+      horizonSec: 3600,
+      extendedHorizonDeltaSec: 3600,
+      terminalSupplyMode: 'conservative-floor',
+      continuationIsleDays: 0,
+    }),
     { allowedActionTypes: ['sell', 'wait'] }
   )
   assert.equal(stab.prefixStable, true)

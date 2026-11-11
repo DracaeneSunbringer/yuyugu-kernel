@@ -511,6 +511,7 @@ export function auditDecisionAgainstReference(adapter, {
         prevIsleSoldMap: prevSoldAtEnd,
         allowTerminalCraft: allowedRefSet.has('craft'),
         allowTerminalHarvest: allowedRefSet.has('harvest'),
+        allowTerminalPlant: allowedRefSet.has('plant'),
       })
       return { bestVal: ev.totalObjectiveValue, bestTrace: [] }
     }
@@ -526,6 +527,7 @@ export function auditDecisionAgainstReference(adapter, {
         scenarioSupplyFactor: sc.externalSupplyFactor,
         allowTerminalCraft: allowedRefSet.has('craft'),
         allowTerminalHarvest: allowedRefSet.has('harvest'),
+        allowTerminalPlant: allowedRefSet.has('plant'),
       })
       return { bestVal: ev.totalObjectiveValue, bestTrace: [] }
     }
@@ -896,6 +898,7 @@ function computeIndependentContinuationUpperBound(adapter, {
         prevIsleSoldMap: prevSoldTerm,
         allowTerminalCraft: allowed.has('craft'),
         allowTerminalHarvest: allowed.has('harvest'),
+        allowTerminalPlant: allowed.has('plant'),
       })
       expTerm += sc.weight * ev.totalObjectiveValue
     }

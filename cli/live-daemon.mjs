@@ -366,8 +366,8 @@ export async function runLiveAccountTick({
     nextWakeSec = Math.min(nextWakeSec, nowEndSec + 15)
   }
 
-  // Proactive Idle PlanCache Pre-Warming: when waiting for an upcoming domestic maturity within 30s and
-  // no snipe is imminent, pre-compute the next plan in the background Worker so wake execution hits PlanCache in <1ms!
+  // Proactive Idle PlanCache Pre-Warming: when waiting for an upcoming domestic maturity within 45s and
+  // no snipe is imminent, pre-compute the next plan in the background Worker with authoritative neighbors/partner/ledger!
   if (
     !dryRun &&
     activePlanner &&
@@ -375,20 +375,44 @@ export async function runLiveAccountTick({
     controllerOut.status === 'waiting' &&
     controllerOut.world &&
     nextWakeSec > nowEndSec &&
-    (nextWakeSec - nowEndSec) <= 30 &&
+    (nextWakeSec - nowEndSec) <= 45 &&
     !snipeScheduler?.shouldBlockBackgroundWork(nowEndSec)
   ) {
     try {
       const preWorld = adapter.advanceTimeOnly(controllerOut.world, nextWakeSec)
       preWorld.rev = controllerOut.world.rev
       const preStealUsed = journal ? journal.countOccupiedBudget('steal', adapter.R.isleIndex(preWorld.now)) : 0
+      const preNeighbors = controllerOut.observedNeighbors || []
+      const prePartnerWorld = controllerOut.observedPartnerWorld || null
+      const preSoldLedger = controllerOut.soldLedger || new Map()
+      const preConstraints = typeof effectiveConstraints === 'object' && effectiveConstraints !== null
+        ? {
+            ...baseUserConstraints,
+            allowCapex: Boolean(baseUserConstraints.allowCapex) && (
+              Boolean(runtimeState?.pendingCapex) ||
+              (Number(preWorld.now) - Number(runtimeState?.lastCapexEvalAtSec || 0)) >= 600
+            ),
+            staminaReserveFloor: Math.max(
+              Number(baseUserConstraints.staminaReserveFloor || 0),
+              snipeScheduler?.isStealEnabled()
+                ? snipeScheduler.computeImminentSnipeStaminaReservation(adapter, preWorld, preWorld.now).staminaReserveFloor
+                : 0
+            ),
+            staminaReserveUntilSec: Math.max(
+              Number(baseUserConstraints.staminaReserveUntilSec || 0),
+              snipeScheduler?.isStealEnabled()
+                ? snipeScheduler.computeImminentSnipeStaminaReservation(adapter, preWorld, preWorld.now).staminaReserveUntilSec
+                : 0
+            ),
+          }
+        : effectiveConstraints
       const preEnv = buildObservationEnvelope(adapter, {
         account,
         world: preWorld,
-        neighborTargets: [],
-        partnerWorld: null,
-        knownSoldByIsleIndex: new Map(),
-        userConstraints: effectiveConstraints,
+        neighborTargets: preNeighbors,
+        partnerWorld: prePartnerWorld,
+        knownSoldByIsleIndex: preSoldLedger,
+        userConstraints: preConstraints,
         reservedBudgets: { stealUsedOrReservedThisIsleDay: preStealUsed },
       })
       activePlanner.precomputeInBackground({
@@ -397,7 +421,7 @@ export async function runLiveAccountTick({
         account,
         envelope: preEnv,
         objectiveCfg,
-        neighborTargets: [],
+        neighborTargets: preNeighbors,
         solverOptions,
         runStability: false,
       })
@@ -607,8 +631,13 @@ if (isDirectMain) {
             dryRun,
           })
           const nowSec = httpClient.estimatedServerNowSec()
-          const deltaSec = Math.max(1, Math.min(120, Number(res.nextWakeSec || (nowSec + 15)) - nowSec))
-          sleepMs = deltaSec * 1000
+          const nowServerMs = typeof httpClient.estimatedServerNowMs === 'function'
+            ? httpClient.estimatedServerNowMs()
+            : nowSec * 1000
+          const targetWakeSec = Number(res.nextWakeSec || (nowSec + 15))
+          const rawSleepMs = Math.ceil(targetWakeSec * 1000 + 150 - nowServerMs)
+          sleepMs = Math.max(250, Math.min(120000, rawSleepMs))
+          const deltaSec = Number((sleepMs / 1000).toFixed(2))
           if (!snipeScheduler.shouldBlockBackgroundWork(nowSec, 50)) {
             updateNotifier.maybeCheckInBackground()
           }

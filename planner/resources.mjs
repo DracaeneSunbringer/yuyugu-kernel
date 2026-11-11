@@ -37,28 +37,75 @@ export function buildEventBuckets(adapter, world, {
   }
 
   // 2. Isle-day boundaries (4h active clock, respecting 22:00-08:00 freeze)
+  const minGapSec = Math.max(1, Number(R.WORLD?.minGap) || 2)
   let idCursor = t0
   for (let i = 0; i < 32; i++) {
     const nextId = adapter.nextIsleBoundary(idCursor, world?.clockStart)
     if (nextId > tEnd || nextId <= idCursor) break
-    if (i === 0 && nextId - t0 >= 5400) {
-      addPoint(nextId - 60, 'pre-isle-regen-flush', false)
+    if (i === 0 && nextId - minGapSec > t0) {
+      addPoint(nextId - minGapSec, 'isle-day-end-supremum', false)
     }
     addPoint(nextId, 'isle-day-reset', true)
     idCursor = nextId
   }
 
   // 3. Long-night transitions
-  const startIsleIndex = R.isleIndex(t0)
   let lnCursor = t0
   for (let i = 0; i < 16; i++) {
     const ev = adapter.nextLongNightEvent(lnCursor)
     if (!ev || ev.at > tEnd || ev.at <= lnCursor) break
-    if (ev.kind === 'long-night-end' && R.isleIndex(ev.at - 1) === startIsleIndex && ev.at - lnCursor >= 5 * 3600) {
-      addPoint(Math.floor(0.5 * (lnCursor + ev.at)), 'long-night-mid-regen', false)
-    }
     addPoint(ev.at, ev.kind, true)
     lnCursor = ev.at
+  }
+
+  // 3b. Exact passive stamina cap-hit points & multi-bar active stamina turnover points within the first isle day
+  // (derived strictly from `state.enT`, `state.en`, `R.energyMax`, `R.WORLD.regen`, `R.WORLD.minGap`, and inventory/quotas)
+  const firstIsleEnd = Math.min(tEnd, adapter.nextIsleBoundary(t0, world?.clockStart))
+  const enMax = Number(R.energyMax?.(state)) || 100
+  const regenEvery = Number(R.WORLD?.regen) || 180
+  const rawInitEn = Math.max(0, Math.floor(Number(state.en || 0)))
+  const baseEnT = Number.isFinite(state.enT) ? Math.floor(Number(state.enT)) : t0
+  const fullSpanSec = enMax * regenEvery
+  if (fullSpanSec > 0 && firstIsleEnd > t0) {
+    let capAt = rawInitEn >= enMax
+      ? t0 + fullSpanSec
+      : Math.max(t0 + regenEvery, baseEnT + (enMax - rawInitEn) * regenEvery)
+    for (let step = 0; step < 8 && capAt < firstIsleEnd; step++) {
+      addPoint(capAt, 'stamina-regen-cap', false)
+      capAt += fullSpanSec
+    }
+  }
+  if (firstIsleEnd > t0 && enMax > 0 && typeof adapter.listDeterministicEdibleSpecs === 'function') {
+    let edibleInvEn = 0
+    for (const sp of adapter.listDeterministicEdibleSpecs()) {
+      const qty = sp.kind === 'snack'
+        ? Math.min(
+            adapter.availableInv(state, sp.id, 0),
+            sp.dailyCap != null ? Math.max(0, sp.dailyCap - Number(state.cnt?.[sp.id] || 0)) : 999
+          )
+        : adapter.availableInv(state, sp.id, sp.q)
+      if (qty > 0 && sp.energyGain > 0) edibleInvEn += qty * sp.energyGain
+    }
+    const curIsleIdx0 = R.isleIndex(t0)
+    const iq0 = state.iq?.d === curIsleIdx0 ? state.iq : {}
+    let firstIsleWorkEn =
+      Math.max(0, (R.WORLD?.daily?.mine || 100) - Number(iq0.mine || 0)) * (R.WORLD?.cost?.mine ?? 3) +
+      Math.max(0, (R.WORLD?.daily?.fish || 80) - Number(iq0.fish || 0)) * (R.WORLD?.cost?.fish ?? 4) +
+      Math.max(0, (R.WORLD?.daily?.bomb || 10) - Number(iq0.bomb || 0)) * (R.WORLD?.cost?.bomb ?? 6) +
+      Math.max(0, (R.WORLD?.daily?.craft || 80) - Number(iq0.craft || 0)) * (R.WORLD?.cost?.craft ?? 1)
+    for (let i = 0; i < (state.plotN || 0); i++) {
+      if (!state.plots?.[i]) firstIsleWorkEn += R.WORLD?.cost?.plant ?? 2
+    }
+    const extraTurnoverEn = Math.max(0, Math.min(rawInitEn + edibleInvEn, firstIsleWorkEn) - enMax)
+    if (extraTurnoverEn > 0) {
+      const extraBatches = Math.min(5, Math.ceil(extraTurnoverEn / enMax))
+      const turnoverStepSec = Math.max(minGapSec, coalesceWindowSec + 1)
+      for (let k = 1; k <= extraBatches; k++) {
+        const turnSec = t0 + k * turnoverStepSec
+        if (turnSec >= firstIsleEnd || turnSec > tEnd) break
+        addPoint(turnSec, 'stamina-turnover-batch', false)
+      }
+    }
   }
 
   // 4. Standing plot maturity times

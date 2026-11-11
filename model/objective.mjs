@@ -3,7 +3,7 @@ import crypto from 'node:crypto'
 export function buildObjectiveConfig(raw = {}) {
   const horizonSec = Number.isFinite(raw.horizonSec) ? Math.max(0, Math.floor(raw.horizonSec)) : 6 * 14400
   const terminalSupplyMode = raw.terminalSupplyMode || 'conservative-floor'
-  const defaultContinuationIsleDays = terminalSupplyMode === 'zero' || horizonSec < 2 * 14400 ? 0 : 12
+  const defaultContinuationIsleDays = terminalSupplyMode === 'zero' ? 0 : 12
   const cfg = {
     horizonSec,
     extendedHorizonDeltaSec: Number.isFinite(raw.extendedHorizonDeltaSec)
@@ -54,6 +54,472 @@ export function buildTerminalPrices(adapter, worldAtHorizon, initialWorld, objec
 
 const contQuoteCacheByAdapter = new WeakMap()
 const contCraftTemplatesByAdapter = new WeakMap()
+const contFarmCycleMemoByAdapter = new WeakMap()
+
+function expectedContinuationHarvestYield(wateredStages = 3, wasStolen = false) {
+  const w = Math.max(0, Math.min(3, wateredStages))
+  const pGold = 0.05 + 0.1 * w
+  const pSilver = 0.2 + 0.08 * w
+  const pNormal = Math.max(0, 1 - pGold - pSilver)
+  const expectedUnits = wasStolen ? 1.0 : (1.3 + 0.08 * w)
+  return [expectedUnits * pNormal, expectedUnits * pSilver, expectedUnits * pGold]
+}
+
+function getMemoizedCropCycleSpec(adapter, clockStart, crop, isSpr, simT) {
+  let memo = contFarmCycleMemoByAdapter.get(adapter)
+  if (!memo) {
+    memo = new Map()
+    contFarmCycleMemoByAdapter.set(adapter, memo)
+  } else if (memo.size > 8192) {
+    memo.clear()
+  }
+  const key = `${Number(clockStart || 0)}:${isSpr ? 1 : 0}:${simT}:${crop.id}`
+  let spec = memo.get(key)
+  if (spec !== undefined) return spec
+
+  const { R } = adapter
+  const maxTimes = crop.regrow ? (crop.times || 1) : 1
+  const harvests = []
+  let curT = simT
+  let h = 0
+  let totalPlantAndCareEn = R.WORLD?.cost?.plant ?? 2
+  let witheredAtEnd = false
+
+  while (h < maxTimes) {
+    const plantedDay = R.isleDay(curT)
+    if (!crop.seasons.includes(R.seasonOf(plantedDay))) {
+      witheredAtEnd = true
+      break
+    }
+    const timing = adapter.exactPlotTimings({ c: crop.id, t: curT, w: 0, g: 0, h }, isSpr, curT, clockStart)
+    if (!timing) break
+    const isRain = R.weatherOf(plantedDay) === 1
+    const wateredStages = isSpr || isRain ? 3 : 2
+    let stepEn = R.WORLD?.cost?.harvest ?? 1
+    if (!isSpr && !isRain) {
+      stepEn += wateredStages * (R.WORLD?.cost?.water ?? 1)
+    }
+    totalPlantAndCareEn += stepEn
+    const expByQ = expectedContinuationHarvestYield(wateredStages, false)
+    harvests.push({
+      matureAt: timing.matureAt,
+      expByQ,
+      totalUnits: expByQ[0] + expByQ[1] + expByQ[2],
+      stepEn,
+    })
+    curT = timing.matureAt
+    h++
+  }
+
+  if (harvests.length === 0) {
+    memo.set(key, null)
+    return null
+  }
+
+  spec = {
+    crop,
+    harvests,
+    endSec: curT,
+    occupiedSec: Math.max(60, curT - simT),
+    seedCost: Number(crop.seed || 0),
+    totalPlantAndCareEn,
+    witheredAtEnd,
+  }
+  memo.set(key, spec)
+  return spec
+}
+
+/**
+ * Unified Multi-Season Continuation Farm Flow & Renewal Engine:
+ * Shared between `evaluateTerminalLiquidationTail` (terminal objective valuation) and
+ * `planner/solve.mjs` (background post-horizon workshop & crop-tier saturation).
+ * Simulates both standing plots' remaining legal harvests AND chronological post-release /
+ * empty-plot seasonal renewals across `contSlots` using exact `adapter.exactPlotTimings`,
+ * with smooth pro-rata credit on cycles straddling `contEndSec`.
+ */
+export function projectContinuationFarmFlows(adapter, worldAtStart, contSlots, {
+  craftCapByIsle = new Map(),
+  getScAtSlot = () => 0,
+  addScAtSlot = () => {},
+  approxTaxMult = 1.0,
+  discRatePerHour = 0,
+  discOriginSec = null,
+  allowTerminalCraft = true,
+  allowTerminalHarvest = true,
+  allowTerminalPlant = true,
+  skipStandingPlots = false,
+  freeRegenEnPool = Infinity,
+  staminaShadowCost = 0,
+} = {}) {
+  const S = Array.isArray(contSlots) ? contSlots.length : 0
+  const state = worldAtStart?.state || {}
+  const plotN = Math.max(
+    Number(state.plotN || 0),
+    Array.isArray(state.plots) ? state.plots.length : 0
+  )
+  if (S === 0 || plotN <= 0 || (!allowTerminalHarvest && !allowTerminalPlant)) {
+    return {
+      standingPlotValue: 0,
+      renewalPlotValue: 0,
+      totalPlotContinuationValue: 0,
+    }
+  }
+
+  const { R, graph } = adapter
+  const clockStart = worldAtStart?.clockStart
+  adapter.syncClock(clockStart)
+  const tStart = Number(contSlots[0].atSec || worldAtStart?.now || 0)
+  const originSec = Number.isFinite(discOriginSec) ? Number(discOriginSec) : tStart
+  const contEndSec = Number(contSlots[S - 1].nextAtSec || tStart)
+  if (!(contEndSec > tStart)) {
+    return {
+      standingPlotValue: 0,
+      renewalPlotValue: 0,
+      totalPlotContinuationValue: 0,
+    }
+  }
+
+  let remFreeEn = Math.max(0, Number.isFinite(freeRegenEnPool) ? Number(freeRegenEnPool) : Infinity)
+  const coffeePricePerEn = (Number(R.WORLD?.coffee?.price || 15000)) / Math.max(1, Number(R.WORLD?.coffee?.energy || 60))
+  const clearEnCost = R.WORLD?.cost?.clear ?? 1
+  const harvestEnCost = R.WORLD?.cost?.harvest ?? 1
+  const craftEnCost = R.WORLD?.cost?.craft ?? 1
+
+  const previewStaminaCost = (enUnits, disc = 1.0) => {
+    if (!(enUnits > 0)) return 0
+    const freeTake = Math.min(remFreeEn, enUnits)
+    const paidTake = Math.max(0, enUnits - freeTake)
+    return (freeTake * staminaShadowCost + paidTake * Math.max(staminaShadowCost, coffeePricePerEn)) * disc
+  }
+  const commitStaminaCost = (enUnits, disc = 1.0) => {
+    const cost = previewStaminaCost(enUnits, disc)
+    if (Number.isFinite(remFreeEn) && enUnits > 0) {
+      remFreeEn = Math.max(0, remFreeEn - enUnits)
+    }
+    return cost
+  }
+
+  const slotIdxForSec = (sec) => {
+    let lo = 0
+    let hi = S - 1
+    let ans = S - 1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (contSlots[mid].nextAtSec > sec) {
+        ans = mid
+        hi = mid - 1
+      } else {
+        lo = mid + 1
+      }
+    }
+    return ans
+  }
+
+  const slotDisc = (sIdx) => (
+    Number.isFinite(contSlots[sIdx]?.discFromTH)
+      ? contSlots[sIdx].discFromTH
+      : discountFactor(discRatePerHour, Math.max(0, contSlots[sIdx].atSec - originSec))
+  )
+
+  const suffixBestRecipeVal = new Map()
+  if (allowTerminalCraft) {
+    for (const rec of R.RECIPES || []) {
+      if (!(rec.price > 0) || Object.keys(rec.in || {}).length !== 1) continue
+      const baseP = Number(R.BASE_PRICE?.[rec.id] || 0)
+      if (!(baseP > 0)) continue
+      const arr = new Float64Array(S)
+      let bestVal = 0
+      for (let s = S - 1; s >= 0; s--) {
+        const quoteP = Number(contSlots[s].prices?.[rec.id] || 0)
+        if (quoteP > 0) {
+          const v = Math.round(quoteP) * slotDisc(s)
+          if (v > bestVal) bestVal = v
+        }
+        arr[s] = bestVal
+      }
+      suffixBestRecipeVal.set(rec.id, arr)
+    }
+  }
+
+  const evaluateHarvestBatch = (cropId, expByQ, matureSec, commit) => {
+    const matureSlotIdx = slotIdxForSec(matureSec)
+    let usedRecipe = null
+    let bestRecImplied = 0
+    if (allowTerminalCraft) {
+      for (const rec of graph.consumedByRecipes.get(cropId) || []) {
+        const suffixArr = suffixBestRecipeVal.get(rec.id)
+        if (!suffixArr) continue
+        const needQty = Number(rec.in[cropId] || 0)
+        if (!(needQty > 0)) continue
+        let openCraftSlot = -1
+        for (let s = matureSlotIdx; s < S; s++) {
+          if ((craftCapByIsle.get(contSlots[s].isleIndex) || 0) >= 1 - 1e-9) {
+            openCraftSlot = s
+            break
+          }
+        }
+        if (openCraftSlot < 0) continue
+        const outBestVal = suffixArr[openCraftSlot]
+        const craftDisc = slotDisc(openCraftSlot)
+        const craftEnVal = previewStaminaCost(craftEnCost, craftDisc)
+        const implied = Math.max(0, outBestVal * approxTaxMult - craftEnVal) / needQty
+        if (implied > bestRecImplied) {
+          bestRecImplied = implied
+          usedRecipe = { isleIdx: contSlots[openCraftSlot].isleIndex, needQty, craftDisc }
+        }
+      }
+    }
+
+    let valSum = 0
+    for (const q of [2, 1, 0]) {
+      const units = Number(expByQ[q] || 0)
+      if (!(units > 0)) continue
+      let bestDirVal = 0
+      let bestDirSlot = matureSlotIdx
+      const qual = R.QUALITY?.[q] ?? 1
+      for (let s = matureSlotIdx; s < S; s++) {
+        const quoteP = Number(contSlots[s].prices?.[cropId] || 0)
+        if (!(quoteP > 0)) continue
+        const sc = Number(getScAtSlot(s, cropId) || 0)
+        const mult = sc >= 400 ? 0.70 : sc >= 150 ? 0.85 : 1.0
+        const v = Math.round(quoteP * qual) * mult * slotDisc(s) * approxTaxMult
+        if (v > bestDirVal + 1e-9) {
+          bestDirVal = v
+          bestDirSlot = s
+        }
+      }
+
+      if (usedRecipe && bestRecImplied > bestDirVal) {
+        const curCap = craftCapByIsle.get(usedRecipe.isleIdx) || 0
+        const slotsReq = units / usedRecipe.needQty
+        const slotsTake = Math.min(curCap, slotsReq)
+        const unitsCrafted = slotsTake * usedRecipe.needQty
+        const unitsLeft = Math.max(0, units - unitsCrafted)
+        valSum += unitsCrafted * bestRecImplied + unitsLeft * bestDirVal
+        if (commit) {
+          if (slotsTake > 0) {
+            craftCapByIsle.set(usedRecipe.isleIdx, Math.max(0, curCap - slotsTake))
+            commitStaminaCost(slotsTake * craftEnCost, usedRecipe.craftDisc)
+          }
+          if (unitsLeft > 0) {
+            addScAtSlot(bestDirSlot, cropId, unitsLeft)
+          }
+        }
+      } else {
+        valSum += units * bestDirVal
+        if (commit) addScAtSlot(bestDirSlot, cropId, units)
+      }
+    }
+    return valSum
+  }
+
+  let standingPlotValue = 0
+  let renewalPlotValue = 0
+  const freeAtSec = new Float64Array(plotN)
+  const needsClear = new Uint8Array(plotN)
+
+  if (skipStandingPlots) {
+    freeAtSec.fill(tStart)
+  } else {
+    const standingEvents = []
+    for (let pIdx = 0; pIdx < plotN; pIdx++) {
+      const p0 = state.plots?.[pIdx]
+      if (!p0 || !p0.c) {
+        freeAtSec[pIdx] = tStart
+        continue
+      }
+      const crop = graph.cropsById.get(p0.c)
+      if (!crop) {
+        freeAtSec[pIdx] = tStart
+        needsClear[pIdx] = 1
+        continue
+      }
+      if (!allowTerminalHarvest) {
+        freeAtSec[pIdx] = contEndSec + 1
+        continue
+      }
+      const isSpr = Boolean(R.sprinkled(state, pIdx))
+      const maxTimes = crop.regrow ? (crop.times || 1) : 1
+      let curPlot = { ...p0 }
+      let releaseSec = tStart
+
+      while ((curPlot.h || 0) < maxTimes) {
+        const plantedDay = R.isleDay(curPlot.t)
+        if (!crop.seasons.includes(R.seasonOf(plantedDay))) {
+          releaseSec = Math.max(tStart, Number(curPlot.t || tStart))
+          needsClear[pIdx] = 1
+          break
+        }
+        const evalFrom = Math.max(tStart, Number(curPlot.t || tStart))
+        const timing = adapter.exactPlotTimings(curPlot, isSpr, evalFrom, clockStart)
+        if (!timing) {
+          releaseSec = contEndSec + 1
+          break
+        }
+        const plantedIsRain = R.weatherOf(plantedDay) === 1
+        const wStages = isSpr || plantedIsRain ? 3 : Math.max(Number(curPlot.w || 0), 2)
+        const wasStolen = !!(curPlot.h === p0.h && p0.sv && p0.sv.length > 0)
+        const expByQ = expectedContinuationHarvestYield(wStages, wasStolen)
+        const stepStart = Math.max(tStart, Number(curPlot.t || tStart))
+
+        if (timing.matureAt <= contEndSec) {
+          standingEvents.push({
+            atSec: Math.max(tStart, timing.matureAt),
+            cropId: crop.id,
+            expByQ,
+            frac: 1.0,
+          })
+          releaseSec = Math.max(tStart, timing.matureAt)
+          const nextH = (curPlot.h || 0) + 1
+          if (crop.regrow && nextH < maxTimes) {
+            curPlot = { c: crop.id, t: timing.matureAt, w: 0, g: 0, h: nextH }
+          } else {
+            break
+          }
+        } else {
+          if (stepStart < contEndSec) {
+            const denom = Math.max(60, timing.matureAt - Number(curPlot.t || stepStart))
+            const numer = Math.max(0, contEndSec - Number(curPlot.t || stepStart))
+            const frac = Math.min(1, numer / denom)
+            if (frac > 0) {
+              standingEvents.push({
+                atSec: contEndSec - 1,
+                cropId: crop.id,
+                expByQ: [expByQ[0] * frac, expByQ[1] * frac, expByQ[2] * frac],
+                frac,
+              })
+            }
+          }
+          releaseSec = contEndSec + 1
+          break
+        }
+      }
+      freeAtSec[pIdx] = releaseSec
+    }
+
+    standingEvents.sort((a, b) => a.atSec - b.atSec)
+    for (const ev of standingEvents) {
+      const disc = discountFactor(discRatePerHour, Math.max(0, ev.atSec - originSec))
+      const rev = evaluateHarvestBatch(ev.cropId, ev.expByQ, ev.atSec, true)
+      const enCost = commitStaminaCost(harvestEnCost * ev.frac, disc)
+      standingPlotValue += Math.max(0, rev - enCost)
+    }
+  }
+
+  if (allowTerminalPlant && allowTerminalHarvest) {
+    const cropsBySeason = [0, 1, 2, 3].map((s) => (R.CROPS || []).filter((c) => c.seasons.includes(s)))
+    for (let guard = 0; guard < plotN * 64; guard++) {
+      let bestPlot = -1
+      let minFree = contEndSec
+      for (let pIdx = 0; pIdx < plotN; pIdx++) {
+        if (freeAtSec[pIdx] < minFree) {
+          minFree = freeAtSec[pIdx]
+          bestPlot = pIdx
+        }
+      }
+      if (bestPlot < 0) break
+
+      const simT = minFree
+      const isSpr = Boolean(R.sprinkled(state, bestPlot))
+      const ncFlag = needsClear[bestPlot]
+      const batchPlots = []
+      for (let pIdx = 0; pIdx < plotN; pIdx++) {
+        if (
+          freeAtSec[pIdx] === simT &&
+          Boolean(R.sprinkled(state, pIdx)) === isSpr &&
+          needsClear[pIdx] === ncFlag
+        ) {
+          batchPlots.push(pIdx)
+        }
+      }
+      const batchCount = batchPlots.length
+      const season = R.seasonOf(R.isleDay(simT))
+      const inSeason = cropsBySeason[season] || []
+      const discStart = discountFactor(discRatePerHour, Math.max(0, simT - originSec))
+      const extraClearEnPerPlot = ncFlag ? clearEnCost : 0
+
+      let bestSpec = null
+      let bestRate = 0
+      let bestTotalEnPerPlot = 0
+
+      for (const crop of inSeason) {
+        const spec = getMemoizedCropCycleSpec(adapter, clockStart, crop, isSpr, simT)
+        if (!spec) continue
+        let revBatch = 0
+        for (const h of spec.harvests) {
+          const evalSec = Math.min(contEndSec - 1, h.matureAt)
+          revBatch += evaluateHarvestBatch(
+            crop.id,
+            [h.expByQ[0] * batchCount, h.expByQ[1] * batchCount, h.expByQ[2] * batchCount],
+            evalSec,
+            false
+          )
+        }
+        const totEnPerPlot = extraClearEnPerPlot + spec.totalPlantAndCareEn + (spec.witheredAtEnd ? clearEnCost : 0)
+        const enValBatch = previewStaminaCost(totEnPerPlot * batchCount, discStart)
+        const netBatch = revBatch - spec.seedCost * batchCount * discStart - enValBatch
+        const ratePerPlotSec = netBatch / (batchCount * spec.occupiedSec)
+        if (netBatch > 1e-6 && ratePerPlotSec > bestRate + 1e-9) {
+          bestRate = ratePerPlotSec
+          bestSpec = spec
+          bestTotalEnPerPlot = totEnPerPlot
+        }
+      }
+
+      if (!bestSpec) {
+        const nextB = adapter.nextIsleBoundary(simT, clockStart)
+        const nextFree = nextB > simT ? Math.min(contEndSec, nextB) : contEndSec
+        for (const pIdx of batchPlots) freeAtSec[pIdx] = nextFree
+        continue
+      }
+
+      if (bestSpec.endSec <= contEndSec) {
+        let realizedRev = 0
+        for (const h of bestSpec.harvests) {
+          realizedRev += evaluateHarvestBatch(
+            bestSpec.crop.id,
+            [h.expByQ[0] * batchCount, h.expByQ[1] * batchCount, h.expByQ[2] * batchCount],
+            h.matureAt,
+            true
+          )
+        }
+        const enVal = commitStaminaCost(bestTotalEnPerPlot * batchCount, discStart)
+        renewalPlotValue += Math.max(0, realizedRev - bestSpec.seedCost * batchCount * discStart - enVal)
+        const nextClear = bestSpec.witheredAtEnd ? 1 : 0
+        for (const pIdx of batchPlots) {
+          needsClear[pIdx] = nextClear
+          freeAtSec[pIdx] = bestSpec.endSec
+        }
+      } else {
+        const frac = Math.min(1, Math.max(0, contEndSec - simT) / bestSpec.occupiedSec)
+        if (frac > 0) {
+          let realizedRev = 0
+          for (const h of bestSpec.harvests) {
+            const evalSec = Math.min(contEndSec - 1, h.matureAt)
+            realizedRev += evaluateHarvestBatch(
+              bestSpec.crop.id,
+              [h.expByQ[0] * frac * batchCount, h.expByQ[1] * frac * batchCount, h.expByQ[2] * frac * batchCount],
+              evalSec,
+              true
+            )
+          }
+          const enVal = commitStaminaCost(bestTotalEnPerPlot * frac * batchCount, discStart)
+          renewalPlotValue += Math.max(0, realizedRev - bestSpec.seedCost * discStart * frac * batchCount - enVal)
+        }
+        for (const pIdx of batchPlots) {
+          needsClear[pIdx] = 0
+          freeAtSec[pIdx] = contEndSec
+        }
+      }
+    }
+  }
+
+  return {
+    standingPlotValue,
+    renewalPlotValue,
+    totalPlotContinuationValue: standingPlotValue + renewalPlotValue,
+  }
+}
 
 function getContinuationQuotesForIsleDay(adapter, iDay, sFactor) {
   let cache = contQuoteCacheByAdapter.get(adapter)
@@ -140,8 +606,16 @@ export function buildContinuationTimeline(
   const { R } = adapter
   const tH = Number(worldAtHorizon?.now || 0)
   const t0 = Number(initialWorld?.now ?? tH)
-  const sameIsleDay = R.isleIndex(tH) === R.isleIndex(t0)
-  const contDays = sameIsleDay ? 0 : Math.max(0, Math.floor(Number(objectiveCfg.continuationIsleDays || 0)))
+  const initP = initialWorld?.prices
+  const hasSyntheticZeroPrices = Boolean(
+    initP &&
+    adapter.graph?.sellableIds?.some(
+      (id) => Object.prototype.hasOwnProperty.call(initP, id) && Number(initP[id]) <= 0 && Number(R.BASE_PRICE?.[id]) > 0
+    )
+  )
+  const contDays = hasSyntheticZeroPrices && R.isleIndex(tH) === R.isleIndex(t0)
+    ? 0
+    : Math.max(0, Math.floor(Number(objectiveCfg.continuationIsleDays ?? 0)))
   const sFactor = objectiveCfg.terminalSupplyMode === 'scenario-matched' && Number.isFinite(scenarioSupplyFactor)
     ? scenarioSupplyFactor
     : Number(objectiveCfg.conservativeSupplyFactor ?? 0.8)
@@ -215,6 +689,7 @@ export function evaluateTerminalLiquidationTail(adapter, worldAtHorizon, {
   prevIsleSoldMap = null,
   allowTerminalCraft = true,
   allowTerminalHarvest = true,
+  allowTerminalPlant = allowTerminalHarvest,
 } = {}) {
   if (objectiveCfg.terminalSupplyMode === 'zero') {
     return {
@@ -523,11 +998,16 @@ export function evaluateTerminalLiquidationTail(adapter, worldAtHorizon, {
         }
       }
       if (!bestChoice) break
-      let chunk = bestChoice.chunk
-      if (chunk > 1) {
-        const outMulti = bestChoice.chunk * bestNonCropSale(bestChoice.tpl.outId, bestChoice.sIdx, 0).val
-        const oppMulti = previewOpportunityCost(avail, bestChoice.tpl.rawIn, chunk)
-        if (outMulti - oppMulti <= 1e-6) chunk = 1
+      let chunk = 1
+      if (bestChoice.chunk > 1) {
+        const unitOutVal = bestNonCropSale(bestChoice.tpl.outId, bestChoice.sIdx, 0).val
+        let prevOpp = previewOpportunityCost(avail, bestChoice.tpl.rawIn, 1)
+        for (let m = 2; m <= bestChoice.chunk; m++) {
+          const nextOpp = previewOpportunityCost(avail, bestChoice.tpl.rawIn, m)
+          if (unitOutVal - (nextOpp - prevOpp) <= 1e-6) break
+          chunk = m
+          prevOpp = nextOpp
+        }
       }
       applyDeductRaw(avail, bestChoice.tpl.rawIn, chunk)
       craftCapByIsle.set(bestChoice.iIdx, (craftCapByIsle.get(bestChoice.iIdx) || 0) - bestChoice.tpl.craftSlots * chunk)
@@ -669,108 +1149,30 @@ export function evaluateTerminalLiquidationTail(adapter, worldAtHorizon, {
     discountedNetCash += (afterCoins - beforeCoins) * sl.discFromTH
   }
 
-  // Value standing in-season plots across their remaining legal harvests in `contSlots` (when `allowTerminalHarvest`)
+  // Value standing in-season plots AND chronological post-release / empty-plot seasonal renewals across `contSlots`
   let standingPlotContinuationValue = 0
-  if (allowTerminalHarvest && Array.isArray(worldAtHorizon.state?.plots)) {
+  if (allowTerminalHarvest || allowTerminalPlant) {
     const contEndSec = contSlots[S - 1].nextAtSec
     const approxTaxMult = Number(simWorld.coins || 0) > (R.B12_TAX?.free || 3000000) ? 0.99 : 1.0
-    const yBase = R.WORLD?.yieldBase || [1, 2]
-    const yWBonus = R.WORLD?.yieldWaterBonus || 0.18
-    const qBase = R.WORLD?.qualBase || [0.06, 0.22]
-    const qWBonus = R.WORLD?.qualWaterBonus || [0.05, 0.10]
-
-    for (let pIdx = 0; pIdx < worldAtHorizon.state.plots.length; pIdx++) {
-      const p0 = worldAtHorizon.state.plots[pIdx]
-      if (!p0 || !p0.c) continue
-      const crop = graph.cropsById.get(p0.c)
-      if (!crop) continue
-      const isSpr = Boolean(R.sprinkled(worldAtHorizon.state, pIdx))
-      const maxTimes = crop.regrow ? (crop.times || 1) : 1
-      let curPlot = { ...p0 }
-
-      while ((curPlot.h || 0) < maxTimes) {
-        const plantedDay = R.isleDay(curPlot.t)
-        if (!crop.seasons.includes(R.seasonOf(plantedDay))) break
-        const evalFrom = Math.max(tH, Number(curPlot.t || tH))
-        const timing = adapter.exactPlotTimings(curPlot, isSpr, evalFrom, worldAtHorizon.clockStart)
-        if (!timing || timing.stage === -1 || timing.matureAt > contEndSec) break
-
-        let matureSlotIdx = S - 1
-        for (let s = 0; s < S; s++) {
-          if (contSlots[s].nextAtSec > timing.matureAt) {
-            matureSlotIdx = s
-            break
-          }
-        }
-
-        const wStages = isSpr || R.weatherOf(plantedDay) === 1 ? 3 : Math.max(Number(curPlot.w || 0), 2)
-        const avgCount = 0.5 * (yBase[0] + yBase[1]) + wStages * yWBonus
-        const pQ2 = Math.min(1, qBase[0] + wStages * qWBonus[0])
-        const pQ1 = Math.min(1 - pQ2, qBase[1] + wStages * qWBonus[1])
-        const pQ0 = Math.max(0, 1 - pQ2 - pQ1)
-        const expByQ = [avgCount * pQ0, avgCount * pQ1, avgCount * pQ2]
-
-        // Value expected yield across remaining continuation workshop or crop-tier capacity from `matureSlotIdx`
-        let usedRecipe = null
-        let bestRecImplied = 0
-        if (allowTerminalCraft) {
-          for (const rec of graph.consumedByRecipes.get(crop.id) || []) {
-            if (!(rec.price > 0) || Object.keys(rec.in || {}).length !== 1) continue
-            const needQty = Number(rec.in[crop.id] || 0)
-            if (!(needQty > 0)) continue
-            let openCraftSlot = -1
-            for (let s = matureSlotIdx; s < S; s++) {
-              if ((craftCapByIsle.get(contSlots[s].isleIndex) || 0) >= 1 - 1e-9) {
-                openCraftSlot = s
-                break
-              }
-            }
-            if (openCraftSlot < 0) continue
-            const outBest = bestNonCropSale(rec.id, openCraftSlot, 0)
-            const implied = (outBest.val * approxTaxMult) / needQty
-            if (implied > bestRecImplied) {
-              bestRecImplied = implied
-              usedRecipe = { isleIdx: contSlots[openCraftSlot].isleIndex, needQty }
-            }
-          }
-        }
-
-        for (const q of [2, 1, 0]) {
-          const units = expByQ[q]
-          if (!(units > 0)) continue
-          let bestDirVal = 0
-          let bestDirNdIdx = slotNdIdx[matureSlotIdx]
-          const qual = R.QUALITY?.[q] ?? 1
-          const scArr = scByItem[crop.id]
-          for (let s = matureSlotIdx; s < S; s++) {
-            const quoteP = Number(contSlots[s].prices?.[crop.id] || 0)
-            if (!(quoteP > 0)) continue
-            const sc = scArr ? scArr[slotNdIdx[s]] : 0
-            const mult = sc >= 400 ? 0.70 : sc >= 150 ? 0.85 : 1.0
-            const v = Math.round(quoteP * qual) * mult * contSlots[s].discFromTH * approxTaxMult
-            if (v > bestDirVal + 1e-9) {
-              bestDirVal = v
-              bestDirNdIdx = slotNdIdx[s]
-            }
-          }
-          if (usedRecipe && bestRecImplied > bestDirVal) {
-            standingPlotContinuationValue += units * bestRecImplied
-            const curCap = craftCapByIsle.get(usedRecipe.isleIdx) || 0
-            craftCapByIsle.set(usedRecipe.isleIdx, Math.max(0, curCap - units / usedRecipe.needQty))
-          } else {
-            standingPlotContinuationValue += units * bestDirVal
-            addScAtNdIdx(bestDirNdIdx, crop.id, units)
-          }
-        }
-
-        const nextH = (curPlot.h || 0) + 1
-        if (crop.regrow && nextH < maxTimes) {
-          curPlot = { ...curPlot, t: timing.matureAt, w: 0, g: 0, h: nextH }
-        } else {
-          break
-        }
-      }
-    }
+    const totalPassiveRegen = initEn + Math.floor(Math.max(0, contEndSec - baseEnT) / regenEvery)
+    let craftSpentTotal = 0
+    for (let m = 0; m < spentEnByCraftSlot.length; m++) craftSpentTotal += spentEnByCraftSlot[m]
+    const freeRegenEnPool = Math.max(0, totalPassiveRegen - craftSpentTotal)
+    const farmFlows = projectContinuationFarmFlows(adapter, worldAtHorizon, contSlots, {
+      craftCapByIsle,
+      getScAtSlot: (sIdx, id) => getScAtNdIdx(slotNdIdx[sIdx], id),
+      addScAtSlot: (sIdx, id, qty) => addScAtNdIdx(slotNdIdx[sIdx], id, qty),
+      approxTaxMult,
+      discRatePerHour: Number(objectiveCfg.discountRatePerHour || 0),
+      discOriginSec: tH,
+      allowTerminalCraft,
+      allowTerminalHarvest,
+      allowTerminalPlant,
+      skipStandingPlots: false,
+      freeRegenEnPool,
+      staminaShadowCost: Number(objectiveCfg.energyTerminalCreditPerPoint || 0),
+    })
+    standingPlotContinuationValue = farmFlows.totalPlotContinuationValue
   }
 
   const terminalEnergyCredit = Math.max(0, Number(worldAtHorizon.state?.en || 0)) * objectiveCfg.energyTerminalCreditPerPoint
@@ -799,6 +1201,7 @@ export function evaluateTrajectoryObjective(adapter, {
   prevIsleSoldMap = null,
   allowTerminalCraft = true,
   allowTerminalHarvest = true,
+  allowTerminalPlant = allowTerminalHarvest,
 }) {
   const t0 = Number(initialWorld?.now || 0)
   const tH = Number(finalWorld?.now ?? t0)
@@ -820,6 +1223,7 @@ export function evaluateTrajectoryObjective(adapter, {
     prevIsleSoldMap,
     allowTerminalCraft,
     allowTerminalHarvest,
+    allowTerminalPlant,
   })
   const tailDiscount = discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, tH - t0))
   const totalObjectiveValue = Number(initialWorld?.coins || 0) + discountedNetCashFlow + tail.totalTerminalValue * tailDiscount

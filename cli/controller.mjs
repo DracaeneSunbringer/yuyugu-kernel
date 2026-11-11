@@ -109,6 +109,8 @@ export async function runControllerStep({
     horizonStability,
     compiled,
     planSource = 'inline',
+    observedNeighbors = [],
+    observedPartnerWorld = null,
   }) => {
     if (compiled.status === 'plan-invalid') {
       return {
@@ -176,6 +178,9 @@ export async function runControllerStep({
         planSource,
         account,
         world: effectiveWorldBefore,
+        observedNeighbors,
+        observedPartnerWorld,
+        soldLedger: buildSoldLedger(),
         plan,
         horizonStability,
         compiled,
@@ -290,8 +295,8 @@ export async function runControllerStep({
           const preEnv = buildObservationEnvelope(adapter, {
             account,
             world: preWorld,
-            neighborTargets: [],
-            partnerWorld: null,
+            neighborTargets: observedNeighbors,
+            partnerWorld: observedPartnerWorld,
             knownSoldByIsleIndex: buildSoldLedger(),
             userConstraints: nextU || {},
             reservedBudgets: { stealUsedOrReservedThisIsleDay: nextStealUsed },
@@ -302,7 +307,7 @@ export async function runControllerStep({
             account,
             envelope: preEnv,
             objectiveCfg: objCfg,
-            neighborTargets: [],
+            neighborTargets: observedNeighbors,
             solverOptions,
             runStability: false,
             deadlineAtMs,
@@ -316,6 +321,9 @@ export async function runControllerStep({
       planSource,
       transactionKind: 'act',
       account,
+      observedNeighbors,
+      observedPartnerWorld,
+      soldLedger: buildSoldLedger(),
       plan,
       horizonStability,
       compiled,
@@ -451,6 +459,8 @@ export async function runControllerStep({
         horizonStability,
         compiled: compiledDry,
         planSource,
+        observedNeighbors: neighborTargets,
+        observedPartnerWorld: partnerWorld,
       })
     }
 
@@ -514,6 +524,8 @@ export async function runControllerStep({
         horizonStability,
         compiled: compiledInLock,
         planSource,
+        observedNeighbors: neighborTargets,
+        observedPartnerWorld: partnerWorld,
       })
     }
 
@@ -628,6 +640,8 @@ export async function runControllerStep({
       horizonStability,
       compiled,
       planSource: 'inline',
+      observedNeighbors: neighborTargets,
+      observedPartnerWorld: partnerWorld,
     })
   }
 

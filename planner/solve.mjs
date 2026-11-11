@@ -5,6 +5,7 @@ import {
   buildTerminalPrices,
   discountFactor,
   evaluateTrajectoryObjective,
+  projectContinuationFarmFlows,
 } from '../model/objective.mjs'
 import {
   buildObservationEnvelope,
@@ -95,6 +96,7 @@ function getSlotScheduleItemMeta(R, slots, itemId, needNatDayTable = false) {
     const natDays = []
     const natDayMap = new Map()
     const slotsByNatDay = []
+    const slotNatDayIdx = new Int32Array(slots.length).fill(-1)
     for (let s = 0; s < slots.length; s++) {
       const sl = slots[s]
       if (!sl.allowSell) continue
@@ -106,9 +108,10 @@ function getSlotScheduleItemMeta(R, slots, itemId, needNatDayTable = false) {
         natDays.push(sl.naturalDay)
         slotsByNatDay.push([])
       }
+      slotNatDayIdx[s] = dIdx
       slotsByNatDay[dIdx].push(s)
     }
-    root = { maxAvailU, natDays, slotsByNatDay, byItem: new Map() }
+    root = { maxAvailU, natDays, slotsByNatDay, slotNatDayIdx, byItem: new Map() }
     slotScheduleWeakCache.set(slots, root)
   }
 
@@ -176,31 +179,33 @@ function getSlotScheduleItemMeta(R, slots, itemId, needNatDayTable = false) {
 
 function solveExactItemSaleSchedule(adapter, {
   itemId,
-  supplyByBucket, // Array< [n0, n1, n2] > of length L
-  slots,          // Array<{ slotIdx, bucketIdx, atSec, naturalDay, prices, isTerminal, disc }>
+  supplyByBucket = null, // Array< [n0, n1, n2] > of length L
+  supplyTable = null,    // Optional Array< Record<itemId, [n0, n1, n2]> > to avoid intermediate `.map()`
+  slots,                 // Array<{ slotIdx, bucketIdx, atSec, naturalDay, prices, isTerminal, disc }>
   initialNatDay,
   initialScCount,
+  revenueOnly = false,
 }) {
   const { R, graph } = adapter
   const isCrop = graph.cropsById.has(itemId)
-  const L = supplyByBucket.length
+  const L = supplyTable ? supplyTable.length : supplyByBucket.length
 
   if (!isCrop) {
     // Non-crops have no daily tier decay: O(1) lookup from precomputed `(slots, itemId)` table!
     const { root, itemMeta } = getSlotScheduleItemMeta(R, slots, itemId, false)
-    const sellsBySlot = slots.map(() => [0, 0, 0])
+    const sellsBySlot = revenueOnly ? null : slots.map(() => [0, 0, 0])
     let totalWeightedRevenue = 0
     const uLim = Math.min(L, root.maxAvailU + 1)
     for (let u = 0; u < uLim; u++) {
-      const row = supplyByBucket[u]
+      const row = supplyTable ? supplyTable[u]?.[itemId] : supplyByBucket[u]
       if (!row) continue
       const uBase = u * 3
-      for (const q of [2, 1, 0]) {
+      for (let q = 2; q >= 0; q--) {
         const cnt = Math.floor(Number(row[q] || 0))
         if (!(cnt > 0)) continue
         const bestSlotIdx = itemMeta.bestGlobalSlotIdx[uBase + q]
         if (bestSlotIdx >= 0) {
-          sellsBySlot[bestSlotIdx][q] += cnt
+          if (sellsBySlot) sellsBySlot[bestSlotIdx][q] += cnt
           totalWeightedRevenue += cnt * itemMeta.bestGlobalUnitVal[uBase + q]
         }
       }
@@ -209,38 +214,73 @@ function solveExactItemSaleSchedule(adapter, {
   }
 
   // Crop case: concave natural-day tiers [150 @ 1.0, 250 @ 0.85, inf @ 0.70]
-  const supplyNodes = []
+  const uNodes = new Int32Array(L * 3)
+  const qNodes = new Int32Array(L * 3)
+  const cntNodes = new Int32Array(L * 3)
+  let rawP = 0
   let totalSupply = 0
   for (let u = 0; u < L; u++) {
-    const row = supplyByBucket[u]
+    const row = supplyTable ? supplyTable[u]?.[itemId] : supplyByBucket[u]
     if (!row) continue
-    for (const q of [2, 1, 0]) {
+    for (let q = 2; q >= 0; q--) {
       const cnt = Math.floor(Number(row[q] || 0))
       if (cnt > 0) {
-        supplyNodes.push({ u, q, cnt })
+        uNodes[rawP] = u
+        qNodes[rawP] = q
+        cntNodes[rawP] = cnt
+        rawP++
         totalSupply += cnt
       }
     }
   }
-  const sellsBySlot = slots.map(() => [0, 0, 0])
-  if (supplyNodes.length === 0) {
-    return { sellsBySlot, totalWeightedRevenue: 0 }
+  if (rawP === 0) {
+    return { sellsBySlot: revenueOnly ? null : slots.map(() => [0, 0, 0]), totalWeightedRevenue: 0 }
   }
 
-  // Exact Tier-0 Non-Binding Fast Path:
-  // When `initialScCount + totalSupply <= 150`, Tier 0 (1.0x) has >= totalSupply remaining capacity on EVERY natural day!
-  // Thus Tier 1 (0.85x) and Tier 2 (0.70x) can never be entered, reducing exact global assignment to O(P) table lookup!
-  if (initialScCount + totalSupply <= 150) {
-    const { root, itemMeta } = getSlotScheduleItemMeta(R, slots, itemId, false)
-    let totalWeightedRevenue = 0
-    for (let i = 0; i < supplyNodes.length; i++) {
-      const { u, q, cnt } = supplyNodes[i]
-      if (u > root.maxAvailU) continue
-      const idx = u * 3 + q
-      const bestSlotIdx = itemMeta.bestGlobalSlotIdx[idx]
+  const { root: baseRoot, itemMeta: baseItemMeta } = getSlotScheduleItemMeta(R, slots, itemId, false)
+  const D = baseRoot.natDays.length
+  if (D === 0) {
+    return { sellsBySlot: revenueOnly ? null : slots.map(() => [0, 0, 0]), totalWeightedRevenue: 0 }
+  }
+
+  // Exact Tier-0 Non-Binding Fast Path (single-day AND multi-day unconstrained upper-bound feasibility):
+  // Assigning every `(u, q)` to its unconstrained global best slot achieves a valid global upper bound on revenue;
+  // if every natural day receiving > 0 units satisfies `sc0(d) + dayUsed[d] <= 150`, that assignment is 100% feasible
+  // in Tier 0 (1.0x) and therefore guaranteed globally optimal!
+  let tier0Feasible = initialScCount + totalSupply <= 150
+  if (!tier0Feasible) {
+    const dayUsed = new Int32Array(D)
+    tier0Feasible = true
+    for (let i = 0; i < rawP; i++) {
+      const u = uNodes[i]
+      if (u > baseRoot.maxAvailU) continue
+      const bestSlotIdx = baseItemMeta.bestGlobalSlotIdx[u * 3 + qNodes[i]]
       if (bestSlotIdx >= 0) {
-        sellsBySlot[bestSlotIdx][q] += cnt
-        totalWeightedRevenue += cnt * itemMeta.bestGlobalUnitVal[idx]
+        const dIdx = baseRoot.slotNatDayIdx[bestSlotIdx]
+        const nextUsed = dayUsed[dIdx] + cntNodes[i]
+        dayUsed[dIdx] = nextUsed
+        const sc0 = baseRoot.natDays[dIdx] === initialNatDay ? initialScCount : 0
+        if (sc0 + nextUsed > 150) {
+          tier0Feasible = false
+          break
+        }
+      }
+    }
+  }
+
+  if (tier0Feasible) {
+    const sellsBySlot = revenueOnly ? null : slots.map(() => [0, 0, 0])
+    let totalWeightedRevenue = 0
+    for (let i = 0; i < rawP; i++) {
+      const u = uNodes[i]
+      if (u > baseRoot.maxAvailU) continue
+      const q = qNodes[i]
+      const cnt = cntNodes[i]
+      const idx = u * 3 + q
+      const bestSlotIdx = baseItemMeta.bestGlobalSlotIdx[idx]
+      if (bestSlotIdx >= 0) {
+        if (sellsBySlot) sellsBySlot[bestSlotIdx][q] += cnt
+        totalWeightedRevenue += cnt * baseItemMeta.bestGlobalUnitVal[idx]
       }
     }
     return { sellsBySlot, totalWeightedRevenue }
@@ -248,31 +288,89 @@ function solveExactItemSaleSchedule(adapter, {
 
   const { root, itemMeta } = getSlotScheduleItemMeta(R, slots, itemId, true)
   const { natDays, maxAvailU } = root
-  if (natDays.length === 0) {
-    return { sellsBySlot, totalWeightedRevenue: 0 }
+  const U = maxAvailU + 1
+
+  // Coalesce supply nodes `(u, q)` sharing identical `(q, bestNdSlotIdx[0..D-1])` (100% identical outgoing edge costs & slots!)
+  const grpQ = new Int32Array(rawP)
+  const grpRepU = new Int32Array(rawP)
+  const grpCnt = new Int32Array(rawP)
+  let P = 0
+  for (let i = 0; i < rawP; i++) {
+    const u = uNodes[i]
+    if (u > maxAvailU) continue
+    const q = qNodes[i]
+    const cnt = cntNodes[i]
+    let matchedG = -1
+    for (let g = 0; g < P; g++) {
+      if (grpQ[g] !== q) continue
+      const uG = grpRepU[g]
+      let sameVec = true
+      for (let dIdx = 0; dIdx < D; dIdx++) {
+        const base = dIdx * U * 3 + q
+        if (itemMeta.bestNdSlotIdx[base + u * 3] !== itemMeta.bestNdSlotIdx[base + uG * 3]) {
+          sameVec = false
+          break
+        }
+      }
+      if (sameVec) {
+        matchedG = g
+        break
+      }
+    }
+    if (matchedG >= 0) {
+      grpCnt[matchedG] += cnt
+    } else {
+      grpQ[P] = q
+      grpRepU[P] = u
+      grpCnt[P] = cnt
+      P++
+    }
   }
 
-  // Build min-cost max-flow (costs = -gain)
-  // Nodes: 0 = SRC, 1..P = supplyNodes, P+1..P+3*D = (ndIdx, tier), last = SNK
-  const P = supplyNodes.length
-  const D = natDays.length
-  const U = maxAvailU + 1
+  if (P === 0) {
+    return { sellsBySlot: revenueOnly ? null : slots.map(() => [0, 0, 0]), totalWeightedRevenue: 0 }
+  }
+
+  // Flat typed-array Min-Cost Max-Flow (costs = -gain; reverse edge index = `e ^ 1`)
+  // Nodes: 0 = SRC, 1..P = coalesced supply groups, P+1..P+3*D = (ndIdx, tier), last = SNK
   const SRC = 0
   const SNK = 1 + P + 3 * D
   const N = SNK + 1
-  const adj = Array.from({ length: N }, () => [])
+  const maxEdges = 2 * (2 * P + 3 * D + P * 3 * D)
+  const head = new Int32Array(N).fill(-1)
+  const edgeTo = new Int32Array(maxEdges)
+  const edgeNext = new Int32Array(maxEdges)
+  const edgeCap = new Int32Array(maxEdges)
+  const edgeCost = new Float64Array(maxEdges)
+  const edgeSlot = revenueOnly ? null : new Int32Array(maxEdges).fill(-1)
+  const edgeQ = revenueOnly ? null : new Int32Array(maxEdges)
+  let edgeCount = 0
 
-  const addEdge = (from, to, cap, cost, meta = null) => {
-    const fwd = { to, rev: adj[to].length, cap, cost, flow: 0, meta }
-    const bwd = { to: from, rev: adj[from].length, cap: 0, cost: -cost, flow: 0, meta: null }
-    adj[from].push(fwd)
-    adj[to].push(bwd)
+  const addEdge = (from, to, cap, cost, slotIdx = -1, q = 0) => {
+    const fIdx = edgeCount++
+    edgeTo[fIdx] = to
+    edgeCap[fIdx] = cap
+    edgeCost[fIdx] = cost
+    edgeNext[fIdx] = head[from]
+    if (edgeSlot) {
+      edgeSlot[fIdx] = slotIdx
+      edgeQ[fIdx] = q
+    }
+    head[from] = fIdx
+
+    const bIdx = edgeCount++
+    edgeTo[bIdx] = from
+    edgeCap[bIdx] = 0
+    edgeCost[bIdx] = -cost
+    edgeNext[bIdx] = head[to]
+    head[to] = bIdx
   }
 
   for (let i = 0; i < P; i++) {
-    addEdge(SRC, 1 + i, supplyNodes[i].cnt, 0)
+    const cnt = grpCnt[i]
+    addEdge(SRC, 1 + i, cnt, 0)
     // Allow holding unsold with 0 value if all slots have 0 price
-    addEdge(1 + i, SNK, supplyNodes[i].cnt, 0, { slotIdx: -1, q: supplyNodes[i].q })
+    addEdge(1 + i, SNK, cnt, 0, -1, grpQ[i])
   }
 
   const tierMults = [1.0, 0.85, 0.70]
@@ -284,34 +382,31 @@ function solveExactItemSaleSchedule(adapter, {
     const cap1 = Math.max(0, 400 - Math.max(150, sc0))
     const maxReachableTier = totalSupply <= cap0 ? 0 : (totalSupply <= cap0 + cap1 ? 1 : 2)
     maxTierByDay[dIdx] = maxReachableTier
-    const caps = [cap0, cap1, totalSupply]
-    for (let t = 0; t <= maxReachableTier; t++) {
-      const tierNode = 1 + P + dIdx * 3 + t
-      if (caps[t] > 0) addEdge(tierNode, SNK, caps[t], 0)
-    }
+    if (cap0 > 0) addEdge(1 + P + dIdx * 3, SNK, cap0, 0)
+    if (maxReachableTier >= 1 && cap1 > 0) addEdge(1 + P + dIdx * 3 + 1, SNK, cap1, 0)
+    if (maxReachableTier >= 2 && totalSupply > 0) addEdge(1 + P + dIdx * 3 + 2, SNK, totalSupply, 0)
   }
 
-  // Connect each supplyNode (u, q) to best slot s >= u within each naturalDay dIdx
   for (let i = 0; i < P; i++) {
-    const { u, q, cnt } = supplyNodes[i]
-    if (u > maxAvailU) continue
+    const u = grpRepU[i]
+    const q = grpQ[i]
+    const cnt = grpCnt[i]
     const qual = R.QUALITY?.[q] ?? 1
     for (let dIdx = 0; dIdx < D; dIdx++) {
       const bestSlotIdx = itemMeta.bestNdSlotIdx[dIdx * U * 3 + u * 3 + q]
       if (bestSlotIdx >= 0) {
         const sl = slots[bestSlotIdx]
         const rawUnit = Math.round(Number(sl.prices[itemId]) * qual)
+        const baseFactor = rawUnit * sl.disc * sl.netTaxFactor
         const maxT = maxTierByDay[dIdx]
         for (let t = 0; t <= maxT; t++) {
-          const tierNode = 1 + P + dIdx * 3 + t
-          const gain = rawUnit * tierMults[t] * sl.disc * sl.netTaxFactor
-          addEdge(1 + i, tierNode, cnt, -gain, { slotIdx: bestSlotIdx, q })
+          addEdge(1 + i, 1 + P + dIdx * 3 + t, cnt, -(baseFactor * tierMults[t]), bestSlotIdx, q)
         }
       }
     }
   }
 
-  // SPFA Successive Shortest Path with O(1) ring-buffer queue
+  // SPFA Successive Shortest Path with O(1) ring-buffer queue over flat typed arrays
   let totalCost = 0
   const dist = new Float64Array(N)
   const parentNode = new Int32Array(N)
@@ -335,44 +430,49 @@ function solveExactItemSaleSchedule(adapter, {
       const v = ringQueue[qHead]
       qHead = (qHead + 1) % qCap
       inQueue[v] = 0
-      const edges = adj[v]
-      for (let eIdx = 0; eIdx < edges.length; eIdx++) {
-        const e = edges[eIdx]
-        if (e.cap - e.flow <= 0) continue
-        const ndist = dist[v] + e.cost
-        if (ndist < dist[e.to] - 1e-9) {
-          dist[e.to] = ndist
-          parentNode[e.to] = v
-          parentEdge[e.to] = eIdx
-          if (!inQueue[e.to]) {
-            ringQueue[qTail] = e.to
+      for (let e = head[v]; e >= 0; e = edgeNext[e]) {
+        if (edgeCap[e] <= 0) continue
+        const to = edgeTo[e]
+        const ndist = dist[v] + edgeCost[e]
+        if (ndist < dist[to] - 1e-9) {
+          dist[to] = ndist
+          parentNode[to] = v
+          parentEdge[to] = e
+          if (!inQueue[to]) {
+            ringQueue[qTail] = to
             qTail = (qTail + 1) % qCap
-            inQueue[e.to] = 1
+            inQueue[to] = 1
           }
         }
       }
     }
 
     if (!Number.isFinite(dist[SNK])) break
-    let push = Infinity
+    let push = 2147483647
     for (let cur = SNK; cur !== SRC; cur = parentNode[cur]) {
-      const e = adj[parentNode[cur]][parentEdge[cur]]
-      if (e.cap - e.flow < push) push = e.cap - e.flow
+      const rem = edgeCap[parentEdge[cur]]
+      if (rem < push) push = rem
     }
-    if (!(push > 0) || !Number.isFinite(push)) break
+    if (!(push > 0)) break
     for (let cur = SNK; cur !== SRC; cur = parentNode[cur]) {
-      const p = parentNode[cur]
-      const e = adj[p][parentEdge[cur]]
-      e.flow += push
-      adj[cur][e.rev].flow -= push
+      const e = parentEdge[cur]
+      edgeCap[e] -= push
+      edgeCap[e ^ 1] += push
     }
     totalCost += push * dist[SNK]
   }
 
-  for (let i = 0; i < P; i++) {
-    for (const e of adj[1 + i]) {
-      if (e.flow > 0 && e.meta && e.meta.slotIdx >= 0) {
-        sellsBySlot[e.meta.slotIdx][e.meta.q] += e.flow
+  let sellsBySlot = null
+  if (!revenueOnly) {
+    sellsBySlot = slots.map(() => [0, 0, 0])
+    for (let i = 0; i < P; i++) {
+      for (let e = head[1 + i]; e >= 0; e = edgeNext[e]) {
+        if ((e & 1) === 0 && edgeSlot[e] >= 0) {
+          const flowed = edgeCap[e ^ 1]
+          if (flowed > 0) {
+            sellsBySlot[edgeSlot[e]][edgeQ[e]] += flowed
+          }
+        }
       }
     }
   }
@@ -388,6 +488,7 @@ function solveExactItemSaleSchedule(adapter, {
  * Completely invariant to `R.RECIPES` permutation!
  */
 function buildCanonicalCraftTemplates(adapter) {
+  if (adapter._canonicalCraftTemplates) return adapter._canonicalCraftTemplates
   const { R, graph } = adapter
   const sellableRecipes = (R.RECIPES || []).filter((r) => Number(r.price) > 0)
   const templates = []
@@ -443,6 +544,7 @@ function buildCanonicalCraftTemplates(adapter) {
   }
 
   templates.sort((a, b) => a.signature.localeCompare(b.signature))
+  adapter._canonicalCraftTemplates = templates
   return templates
 }
 
@@ -529,6 +631,7 @@ function evaluateSupplyPortfolio(adapter, {
   slots,
   initialNatDay,
   initialCnt,
+  revenueOnly = false,
 }) {
   const itemSet = new Set()
   for (const bm of supplyByBucket) {
@@ -538,14 +641,14 @@ function evaluateSupplyPortfolio(adapter, {
   let totalValue = 0
   for (const id of itemSet) {
     if (!(Number(adapter.R.BASE_PRICE?.[id] || 0) > 0)) continue
-    const perBucketRows = supplyByBucket.map((bm) => bm[id] || [0, 0, 0])
     const initSc = Number(initialCnt?.['sc_' + id] || 0)
     const sched = solveExactItemSaleSchedule(adapter, {
       itemId: id,
-      supplyByBucket: perBucketRows,
+      supplyTable: supplyByBucket,
       slots,
       initialNatDay,
       initialScCount: initSc,
+      revenueOnly,
     })
     perItem.set(id, sched)
     totalValue += sched.totalWeightedRevenue
@@ -560,16 +663,24 @@ function evaluateSupplyPortfolioIncremental(adapter, {
   slots,
   initialNatDay,
   initialCnt,
+  revenueOnly = false,
 }) {
   const nextPerItem = new Map(baseEval.perItem)
   let nextTotal = baseEval.totalValue
+  const L = supplyByBucket.length
 
   for (const id of changedItemIds) {
     if (!(Number(adapter.R.BASE_PRICE?.[id] || 0) > 0)) continue
     const oldSched = nextPerItem.get(id)
     if (oldSched) nextTotal -= oldSched.totalWeightedRevenue
-    const perBucketRows = supplyByBucket.map((bm) => bm[id] || [0, 0, 0])
-    const hasAny = perBucketRows.some((r) => (r[0] || 0) + (r[1] || 0) + (r[2] || 0) > 0)
+    let hasAny = false
+    for (let u = 0; u < L; u++) {
+      const r = supplyByBucket[u]?.[id]
+      if (r && (r[0] || 0) + (r[1] || 0) + (r[2] || 0) > 0) {
+        hasAny = true
+        break
+      }
+    }
     if (!hasAny) {
       nextPerItem.delete(id)
       continue
@@ -577,16 +688,57 @@ function evaluateSupplyPortfolioIncremental(adapter, {
     const initSc = Number(initialCnt?.['sc_' + id] || 0)
     const sched = solveExactItemSaleSchedule(adapter, {
       itemId: id,
-      supplyByBucket: perBucketRows,
+      supplyTable: supplyByBucket,
       slots,
       initialNatDay,
       initialScCount: initSc,
+      revenueOnly,
     })
     nextPerItem.set(id, sched)
     nextTotal += sched.totalWeightedRevenue
   }
 
   return { totalValue: nextTotal, perItem: nextPerItem }
+}
+
+function evaluateSupplyPortfolioValueOnly(adapter, {
+  baseEval,
+  supplyByBucket,
+  changedItemIds,
+  slots,
+  initialNatDay,
+  initialCnt,
+}) {
+  let nextTotal = baseEval.totalValue
+  const L = supplyByBucket.length
+
+  for (let idx = 0; idx < changedItemIds.length; idx++) {
+    const id = changedItemIds[idx]
+    if (!(Number(adapter.R.BASE_PRICE?.[id] || 0) > 0)) continue
+    const oldSched = baseEval.perItem.get(id)
+    if (oldSched) nextTotal -= oldSched.totalWeightedRevenue
+    let hasAny = false
+    for (let u = 0; u < L; u++) {
+      const r = supplyByBucket[u]?.[id]
+      if (r && (r[0] || 0) + (r[1] || 0) + (r[2] || 0) > 0) {
+        hasAny = true
+        break
+      }
+    }
+    if (!hasAny) continue
+    const initSc = Number(initialCnt?.['sc_' + id] || 0)
+    const sched = solveExactItemSaleSchedule(adapter, {
+      itemId: id,
+      supplyTable: supplyByBucket,
+      slots,
+      initialNatDay,
+      initialScCount: initSc,
+      revenueOnly: true,
+    })
+    nextTotal += sched.totalWeightedRevenue
+  }
+
+  return nextTotal
 }
 
 /**
@@ -609,6 +761,8 @@ function solveJointCraftAndSell(adapter, {
   allowCraft = true,
   maxCraftHoldIsleDays = null,
   baseEvalOverride = null,
+  onlyTouchItemIds = null,
+  revenueOnly = false,
 }) {
   const L = buckets.length
   const baseEval = baseEvalOverride || evaluateSupplyPortfolio(adapter, {
@@ -616,11 +770,13 @@ function solveJointCraftAndSell(adapter, {
     slots,
     initialNatDay,
     initialCnt,
+    revenueOnly,
   })
 
   if (!allowCraft || L === 0) {
     return {
       craftsByBucket: buckets.map(() => []),
+      executionOrderMoves: [],
       supplyAfterCrafts: initialSupplyByBucket,
       baseRawPortfolio: baseEval,
       salePortfolio: baseEval,
@@ -631,22 +787,32 @@ function solveJointCraftAndSell(adapter, {
   const templates = buildCanonicalCraftTemplates(adapter)
   const craftEnCost = adapter.R.WORLD?.cost?.craft ?? 1
 
-  // Filter templates that could ever be feasible with total horizon supply
+  // Filter templates that could ever be feasible with total / prefix horizon supply
   const totalRaw = {}
   for (let u = 0; u < L; u++) {
     for (const [id, r] of Object.entries(initialSupplyByBucket[u])) {
       totalRaw[id] = (totalRaw[id] || 0) + (r[0] || 0) + (r[1] || 0) + (r[2] || 0)
     }
   }
+  const prefixRaw = {}
   const baseOriginOffset = buckets[0]?.isleDayOffset ?? 0
   const candidateMoves = [] // { moveId, tpl, u, isleIdx }
   for (let u = 0; u < L; u++) {
+    for (const [id, r] of Object.entries(initialSupplyByBucket[u])) {
+      prefixRaw[id] = (prefixRaw[id] || 0) + (r[0] || 0) + (r[1] || 0) + (r[2] || 0)
+    }
     const isleIdx = buckets[u].isleIndex
     if ((craftCapByIsle.get(isleIdx) || 0) <= 0 || (enCapByBucket[u] || 0) < craftEnCost) continue
     for (const tpl of templates) {
+      if (onlyTouchItemIds && !onlyTouchItemIds.has(tpl.outId) && !Object.keys(tpl.rawIn).some((inId) => onlyTouchItemIds.has(inId))) {
+        continue
+      }
       if (tpl.craftSlots > (craftCapByIsle.get(isleIdx) || 0)) continue
       if (tpl.craftSlots * craftEnCost > (enCapByBucket[u] || 0)) continue
-      const possible = Object.entries(tpl.rawIn).every(([inId, need]) => (totalRaw[inId] || 0) >= need)
+      const possible = Object.entries(tpl.rawIn).every(([inId, need]) => {
+        const capAtU = adapter.graph.recipesById.has(inId) ? (totalRaw[inId] || 0) : (prefixRaw[inId] || 0)
+        return capAtU >= need
+      })
       if (!possible) continue
       const hasLocalArrival = u > 0 && Object.keys(tpl.rawIn).some((inId) => {
         const r = initialSupplyByBucket[u]?.[inId]
@@ -678,6 +844,7 @@ function solveJointCraftAndSell(adapter, {
   if (candidateMoves.length === 0) {
     return {
       craftsByBucket: buckets.map(() => []),
+      executionOrderMoves: [],
       supplyAfterCrafts: initialSupplyByBucket,
       baseRawPortfolio: baseEval,
       salePortfolio: baseEval,
@@ -685,34 +852,63 @@ function solveJointCraftAndSell(adapter, {
     }
   }
 
-  // Estimate maximum total craft steps possible from raw inputs & quotas
-  let maxMaterialCrafts = 0
+  // Bound maximum total craft steps possible simultaneously across all active isles & raw inputs
+  const MAX_EXACT_NODES = 600
+  const maxMoveLimByIsle = new Map()
+  const minNeedByRawIn = new Map()
   for (const mv of candidateMoves) {
     const lim = Math.min(
-      craftCapByIsle.get(mv.isleIdx) || 0,
+      Math.floor((craftCapByIsle.get(mv.isleIdx) || 0) / mv.tpl.craftSlots),
       ...Object.entries(mv.tpl.rawIn).map(([inId, need]) => Math.floor((totalRaw[inId] || 0) / need))
     )
-    maxMaterialCrafts = Math.max(maxMaterialCrafts, lim)
+    if (lim > 0) {
+      maxMoveLimByIsle.set(mv.isleIdx, (maxMoveLimByIsle.get(mv.isleIdx) || 0) + lim)
+      for (const [inId, need] of Object.entries(mv.tpl.rawIn)) {
+        const prev = minNeedByRawIn.get(inId)
+        if (prev == null || need < prev) minNeedByRawIn.set(inId, need)
+      }
+    }
+  }
+  let totalIsleCraftBound = 0
+  for (const [iIdx, sumLim] of maxMoveLimByIsle.entries()) {
+    totalIsleCraftBound += Math.min(craftCapByIsle.get(iIdx) || 0, sumLim)
+  }
+  let totalRawCraftBound = 0
+  for (const [inId, minNeed] of minNeedByRawIn.entries()) {
+    totalRawCraftBound += Math.floor((totalRaw[inId] || 0) / minNeed)
+  }
+  const maxTotalCraftSteps = Math.min(totalIsleCraftBound, totalRawCraftBound)
+  let exactTreeBound = 1
+  if (maxTotalCraftSteps > 0 && candidateMoves.length > 0) {
+    const M = candidateMoves.length
+    for (let d = 1; d <= maxTotalCraftSteps; d++) {
+      exactTreeBound = Math.floor((exactTreeBound * (M + d)) / d)
+      if (exactTreeBound > MAX_EXACT_NODES) break
+    }
   }
 
   const applyMoveOnce = (supply, mv, count = 1) =>
     deductFromPrefixSupply(supply, mv.u, mv.tpl.rawIn, count, mv.tpl.outId)
 
-  // Exact DFS with canonical non-decreasing move index when search space is compact
-  if (candidateMoves.length <= 14 && maxMaterialCrafts <= 8) {
+  // Exact DFS with canonical non-decreasing move index when full search tree fits within MAX_EXACT_NODES
+  let dfsFallbackCandidate = null
+  if (exactTreeBound <= MAX_EXACT_NODES) {
     let bestScore = baseEval.totalValue
     let bestSupply = initialSupplyByBucket
     let bestEval = baseEval
     let bestCounts = new Int32Array(candidateMoves.length)
     let visitedNodes = 0
-    const MAX_EXACT_NODES = 600
+    let dfsTruncated = false
 
     const remCraft = new Map(craftCapByIsle)
     const remEn = Float64Array.from(enCapByBucket)
     const curCounts = new Int32Array(candidateMoves.length)
 
     const dfs = (startIdx, curSupply, curEval, spentStaminaCost) => {
-      if (++visitedNodes > MAX_EXACT_NODES) return
+      if (++visitedNodes > MAX_EXACT_NODES) {
+        dfsTruncated = true
+        return
+      }
       const score = curEval.totalValue - spentStaminaCost
       if (score > bestScore + 1e-6) {
         bestScore = score
@@ -726,9 +922,9 @@ function solveJointCraftAndSell(adapter, {
         const slotsNeed = mv.tpl.craftSlots
         const enNeed = slotsNeed * craftEnCost
         if ((remCraft.get(mv.isleIdx) || 0) < slotsNeed) continue
-        // Prefix stamina constraint: spending enNeed at mv.u reduces stamina for u..L-1
+        // Per-isle prefix stamina constraint: spending enNeed at mv.u reduces stamina within mv.isleIdx
         let enOk = true
-        for (let fb = mv.u; fb < L; fb++) {
+        for (let fb = mv.u; fb < L && buckets[fb].isleIndex === mv.isleIdx; fb++) {
           if (remEn[fb] < enNeed) { enOk = false; break }
         }
         if (!enOk) continue
@@ -742,16 +938,23 @@ function solveJointCraftAndSell(adapter, {
           slots,
           initialNatDay,
           initialCnt,
+          revenueOnly,
         })
 
         remCraft.set(mv.isleIdx, remCraft.get(mv.isleIdx) - slotsNeed)
-        for (let fb = mv.u; fb < L; fb++) remEn[fb] -= enNeed
+        for (let fb = mv.u; fb < L && buckets[fb].isleIndex === mv.isleIdx; fb++) remEn[fb] -= enNeed
         curCounts[i]++
 
         dfs(i, nextSup, nextEval, spentStaminaCost + enNeed * staminaShadowCost)
+        if (dfsTruncated) {
+          curCounts[i]--
+          for (let fb = mv.u; fb < L && buckets[fb].isleIndex === mv.isleIdx; fb++) remEn[fb] += enNeed
+          remCraft.set(mv.isleIdx, remCraft.get(mv.isleIdx) + slotsNeed)
+          return
+        }
 
         curCounts[i]--
-        for (let fb = mv.u; fb < L; fb++) remEn[fb] += enNeed
+        for (let fb = mv.u; fb < L && buckets[fb].isleIndex === mv.isleIdx; fb++) remEn[fb] += enNeed
         remCraft.set(mv.isleIdx, remCraft.get(mv.isleIdx) + slotsNeed)
       }
     }
@@ -759,22 +962,27 @@ function solveJointCraftAndSell(adapter, {
     dfs(0, initialSupplyByBucket, baseEval, 0)
 
     const craftsByBucket = buckets.map(() => [])
+    const executionOrderMoves = []
     for (let i = 0; i < candidateMoves.length; i++) {
       const cnt = bestCounts[i]
       if (cnt > 0) {
         const mv = candidateMoves[i]
+        executionOrderMoves.push({ u: mv.u, isleIdx: mv.isleIdx, tpl: mv.tpl, count: cnt, changedIds: mv.changedIds })
         for (const step of mv.tpl.actions) {
           craftsByBucket[mv.u].push({ a: 'craft', id: step.id, n: step.n * cnt })
         }
       }
     }
-    return {
+    const dfsResult = {
       craftsByBucket: craftsByBucket.map(mergeCraftActionsPreserveTopo),
+      executionOrderMoves,
       supplyAfterCrafts: bestSupply,
       baseRawPortfolio: baseEval,
       salePortfolio: bestEval,
       netPortfolioScore: bestScore,
     }
+    if (!dfsTruncated) return dfsResult
+    dfsFallbackCandidate = dfsResult
   }
 
   // Large-scale case: iterative highest marginal gain per craft slot with exact separable per-item cache
@@ -784,10 +992,12 @@ function solveJointCraftAndSell(adapter, {
   const remCraft = new Map(craftCapByIsle)
   const remEn = Float64Array.from(enCapByBucket)
   const chosenCounts = new Int32Array(candidateMoves.length)
+  const executionOrderMoves = []
   // Cache `{ desiredChunk, actualChunk, ratio, feasible }` for moves whose `changedIds` were not touched!
   const moveCache = new Array(candidateMoves.length).fill(null)
+  const moveMaxChunkCap = new Int32Array(candidateMoves.length).fill(16)
 
-  for (let guard = 0; guard < 120; guard++) {
+  for (let guard = 0; guard < 240; guard++) {
     let bestIdx = -1
     let bestRatio = 0
     let bestChunk = 1
@@ -799,24 +1009,29 @@ function solveJointCraftAndSell(adapter, {
       const capLeft = Math.floor((remCraft.get(mv.isleIdx) || 0) / slotsNeed)
       if (capLeft <= 0) continue
       let maxEnMult = capLeft
-      for (let fb = mv.u; fb < L; fb++) {
+      for (let fb = mv.u; fb < L && buckets[fb].isleIndex === mv.isleIdx; fb++) {
         maxEnMult = Math.min(maxEnMult, Math.floor(remEn[fb] / enNeed))
       }
       if (maxEnMult <= 0) continue
 
-      const desiredChunk = maxEnMult >= 8 ? 4 : 1
+      const rawDesiredChunk = maxEnMult >= 32 ? 16 : (maxEnMult >= 8 ? 4 : 1)
+      const desiredChunk = Math.min(rawDesiredChunk, moveMaxChunkCap[i])
       let cached = moveCache[i]
       if (!cached || cached.desiredChunk !== desiredChunk) {
         let actualChunk = desiredChunk
-        let nextSup = applyMoveOnce(curSupply, mv, desiredChunk)
-        if (!nextSup && desiredChunk > 1) {
+        let nextSup = applyMoveOnce(curSupply, mv, actualChunk)
+        if (!nextSup && actualChunk > 4) {
+          actualChunk = 4
+          nextSup = applyMoveOnce(curSupply, mv, 4)
+        }
+        if (!nextSup && actualChunk > 1) {
           actualChunk = 1
           nextSup = applyMoveOnce(curSupply, mv, 1)
         }
         if (!nextSup) {
           cached = { desiredChunk, feasible: false, actualChunk: 0, ratio: -Infinity }
         } else {
-          const ev = evaluateSupplyPortfolioIncremental(adapter, {
+          const evTotal = evaluateSupplyPortfolioValueOnly(adapter, {
             baseEval: curEval,
             supplyByBucket: nextSup,
             changedItemIds: mv.changedIds,
@@ -824,7 +1039,7 @@ function solveJointCraftAndSell(adapter, {
             initialNatDay,
             initialCnt,
           })
-          const delta = (ev.totalValue - curEval.totalValue) - (actualChunk * enNeed * staminaShadowCost)
+          const delta = (evTotal - curEval.totalValue) - (actualChunk * enNeed * staminaShadowCost)
           const ratio = delta / (actualChunk * slotsNeed)
           cached = { desiredChunk, feasible: true, actualChunk, ratio }
         }
@@ -852,12 +1067,39 @@ function solveJointCraftAndSell(adapter, {
       slots,
       initialNatDay,
       initialCnt,
+      revenueOnly,
     })
+    if (bestChunk > 1) {
+      const prevSup = applyMoveOnce(curSupply, mv, bestChunk - 1)
+      if (prevSup) {
+        const evPrevTotal = evaluateSupplyPortfolioValueOnly(adapter, {
+          baseEval: curEval,
+          supplyByBucket: prevSup,
+          changedItemIds: mv.changedIds,
+          slots,
+          initialNatDay,
+          initialCnt,
+        })
+        const enNeedSingle = mv.tpl.craftSlots * craftEnCost
+        if ((bestNextEval.totalValue - evPrevTotal) - enNeedSingle * staminaShadowCost <= 1e-6) {
+          const nextCap = bestChunk > 4 ? 4 : 1
+          moveMaxChunkCap[bestIdx] = nextCap
+          moveCache[bestIdx] = null
+          continue
+        }
+      }
+    }
     const slotsUsed = mv.tpl.craftSlots * bestChunk
     const enUsed = slotsUsed * craftEnCost
     remCraft.set(mv.isleIdx, remCraft.get(mv.isleIdx) - slotsUsed)
-    for (let fb = mv.u; fb < L; fb++) remEn[fb] -= enUsed
+    for (let fb = mv.u; fb < L && buckets[fb].isleIndex === mv.isleIdx; fb++) remEn[fb] -= enUsed
     chosenCounts[bestIdx] += bestChunk
+    const lastExec = executionOrderMoves[executionOrderMoves.length - 1]
+    if (lastExec && lastExec.u === mv.u && lastExec.tpl === mv.tpl) {
+      lastExec.count += bestChunk
+    } else {
+      executionOrderMoves.push({ u: mv.u, isleIdx: mv.isleIdx, tpl: mv.tpl, count: bestChunk, changedIds: mv.changedIds })
+    }
     curSupply = bestNextSup
     curEval = bestNextEval
     curSpentStaminaCost += enUsed * staminaShadowCost
@@ -887,12 +1129,18 @@ function solveJointCraftAndSell(adapter, {
     }
   }
 
+  const iterScore = curEval.totalValue - curSpentStaminaCost
+  if (dfsFallbackCandidate && dfsFallbackCandidate.netPortfolioScore > iterScore + 1e-6) {
+    return dfsFallbackCandidate
+  }
+
   return {
     craftsByBucket: craftsByBucket.map(mergeCraftActionsPreserveTopo),
+    executionOrderMoves,
     supplyAfterCrafts: curSupply,
     baseRawPortfolio: baseEval,
     salePortfolio: curEval,
-    netPortfolioScore: curEval.totalValue - curSpentStaminaCost,
+    netPortfolioScore: iterScore,
   }
 }
 
@@ -935,15 +1183,11 @@ function selectBestCropToPlant(adapter, {
   const iDay = R.isleDay(atSec)
   const season = R.seasonOf(iDay)
   const isSpr = R.sprinkled(state, plotIdx)
-  let bestCrop = null
-  let bestNet = 0
-  let bestScore = 0
-  let bestOccupiedSec = 0
-  let bestTotalUnits = 0
 
-  for (const crop of R.CROPS || []) {
-    if (!crop.seasons.includes(season)) continue
-    let simT = atSec
+  const evalCropAt = (crop, startSec, cutoff) => {
+    const startSeason = R.seasonOf(R.isleDay(startSec))
+    if (!crop.seasons.includes(startSeason)) return null
+    let simT = startSec
     let h = 0
     const maxTimes = crop.regrow ? (crop.times || 1) : 1
     let totalExpectedRevenue = 0
@@ -952,13 +1196,17 @@ function selectBestCropToPlant(adapter, {
 
     while (h < maxTimes) {
       if (!crop.seasons.includes(R.seasonOf(R.isleDay(simT)))) {
-        // Regrow planted at simT across season change immediately withers (`stage = -1`) and needs `clear`!
         totalStaminaSpent += R.WORLD?.cost?.clear ?? 1
         break
       }
       const mockPlot = { c: crop.id, t: simT, w: 0, g: 0, h }
-      const timing = adapter.exactPlotTimings(mockPlot, isSpr, simT)
-      if (!timing || (enforceHorizonCutoff && timing.matureAt > tEnd)) break
+      const timing = adapter.exactPlotTimings(mockPlot, isSpr, simT, state?.clockStart)
+      if (!timing || (cutoff && timing.matureAt > tEnd)) break
+      if (!crop.seasons.includes(R.seasonOf(R.isleDay(timing.matureAt)))) {
+        // Crop withers at the season boundary before `timing.matureAt` (`cropStage === -1`)!
+        totalStaminaSpent += R.WORLD?.cost?.clear ?? 1
+        break
+      }
 
       const wateredStages = isSpr || R.weatherOf(R.isleDay(simT)) === 1 ? 3 : 2
       if (!isSpr && R.weatherOf(R.isleDay(simT)) !== 1) {
@@ -976,18 +1224,60 @@ function selectBestCropToPlant(adapter, {
       h++
     }
 
-    if (h <= 0) continue
-    const occupiedSec = Math.max(60, simT - atSec)
-    const freeSeedAvail = adapter.availableInv(state, `sd_${crop.id}`, 0) > 0
+    if (h <= 0) return null
+    const occupiedSec = Math.max(60, simT - startSec)
+    const freeSeedAvail = startSec === atSec && adapter.availableInv(state, `sd_${crop.id}`, 0) > 0
     const seedCashCost = freeSeedAvail ? 0 : crop.seed
     const net = totalExpectedRevenue - seedCashCost - totalStaminaSpent * staminaPointCost
-    const score = enforceHorizonCutoff ? net : (net / occupiedSec)
-    if (net > 1e-6 && score > bestScore + 1e-9) {
+    return {
+      net,
+      occupiedSec,
+      endSec: simT,
+      totalExpectedUnits,
+      rawRatePerSec: net / occupiedSec,
+    }
+  }
+
+  let nextSeasonBoundarySec = -1
+  let rNextSeason = 0
+  if (!enforceHorizonCutoff) {
+    const nextIsleB = adapter.nextIsleBoundary(atSec, state?.clockStart)
+    if (nextIsleB > atSec && R.seasonOf(R.isleDay(nextIsleB)) !== season) {
+      nextSeasonBoundarySec = nextIsleB
+      for (const futCrop of R.CROPS || []) {
+        const resNext = evalCropAt(futCrop, nextIsleB, false)
+        if (resNext && resNext.rawRatePerSec > rNextSeason) {
+          rNextSeason = resNext.rawRatePerSec
+        }
+      }
+    }
+  }
+
+  let bestCrop = null
+  let bestNet = 0
+  let bestScore = 0
+  let bestRawRate = 0
+  let bestOccupiedSec = 0
+  let bestTotalUnits = 0
+
+  for (const crop of R.CROPS || []) {
+    const res = evalCropAt(crop, atSec, enforceHorizonCutoff)
+    if (!res || !(res.net > 1e-6)) continue
+    let score = enforceHorizonCutoff ? res.net : res.rawRatePerSec
+    if (!enforceHorizonCutoff && nextSeasonBoundarySec > atSec && rNextSeason > 0) {
+      const spillNextSec = Math.max(0, res.endSec - nextSeasonBoundarySec)
+      const surplusVsWait = res.net - spillNextSec * rNextSeason
+      if (!(surplusVsWait > 1e-6)) continue
+      const preBoundaryWindowSec = Math.min(res.occupiedSec, Math.max(60, nextSeasonBoundarySec - atSec))
+      score = surplusVsWait / preBoundaryWindowSec
+    }
+    if (score > bestScore + 1e-9) {
       bestScore = score
-      bestNet = net
+      bestNet = res.net
+      bestRawRate = res.rawRatePerSec
       bestCrop = crop
-      bestOccupiedSec = occupiedSec
-      bestTotalUnits = totalExpectedUnits
+      bestOccupiedSec = res.occupiedSec
+      bestTotalUnits = res.totalExpectedUnits
     }
   }
 
@@ -995,9 +1285,11 @@ function selectBestCropToPlant(adapter, {
     ? {
         crop: bestCrop,
         expectedNetGain: bestNet,
+        netPresentValue: bestNet,
         occupiedSec: bestOccupiedSec,
         totalExpectedUnits: bestTotalUnits,
-        ratePerSec: bestScore,
+        ratePerSec: bestRawRate,
+        netRatePerSec: bestRawRate,
       }
     : null
 }
@@ -1085,13 +1377,14 @@ function selectCapexByTrajectoryDelta(adapter, {
   const capexObjCfg = buildObjectiveConfig({
     ...objectiveCfg,
     horizonSec: paybackSec,
+    continuationIsleDays: 0,
   })
   const innerAllowed = new Set([...allowedSet].filter((a) => a !== 'capex' && a !== 'visit'))
 
   const evalRolloutMean = (startW) => {
     const tl = buildEventBuckets(adapter, startW, {
       horizonSec: paybackSec,
-      maxBuckets: 8,
+      maxBuckets: 16,
     })
     const initDelta = Number(startW.coins || 0) - Number(world0.coins || 0)
     const runWithStream = (streamIdx) => optimizeAndSimulateSequence(adapter, {
@@ -1140,25 +1433,7 @@ function selectCapexByTrajectoryDelta(adapter, {
       if (candActs.length === 0) continue
       const sim = adapter.simulateBatch(curWorld, candActs, { t: curWorld.now, prices: curWorld.prices })
       if (!sim.allOk) continue
-      let evalWorld = sim.afterWorld
-      // Under continuous `minGap = 2s` execution, an account can run multiple `eat -> work` batches per
-      // 4h isle-day regardless of `energyMax(s)`; prevent coarse 8-bucket single-pass `eat` ceilings from
-      // hallucinating fake per-bucket food capacity for `upgrade(house)` while preserving its real `+20`
-      // instant stamina and overnight freeze cap gain (`energyPerHouse` per long night).
-      if (candActs.length === 1 && candActs[0].a === 'upgrade' && candActs[0].k === 'house') {
-        evalWorld = adapter.cloneWorld(sim.afterWorld)
-        evalWorld.state.tools.house = Number(curWorld.state?.tools?.house || 0)
-        let lnProbe = curWorld.now
-        let nightCount = 0
-        for (let g = 0; g < 16; g++) {
-          const ev = adapter.nextLongNightEvent(lnProbe)
-          if (!ev || ev.at > curWorld.now + paybackSec || ev.at <= lnProbe) break
-          if (ev.kind === 'long-night-end') nightCount++
-          lnProbe = ev.at
-        }
-        evalWorld.state.en = Number(sim.afterWorld.state?.en || 0) + nightCount * Number(adapter.R.WORLD?.energyPerHouse || 20)
-      }
-      const val = evalRolloutMean(evalWorld)
+      const val = evalRolloutMean(sim.afterWorld)
       if (val > bestVal + 1e-6) {
         bestVal = val
         bestActs = candActs
@@ -1198,6 +1473,7 @@ function optimizeAndSimulateSequence(adapter, {
   initialCashEvents = [],
   maxCraftHoldIsleDays = 3,
   hasExplicitPriceOverride = false,
+  skipObjectiveEval = false,
 }) {
   const { R, graph } = adapter
   const L = seqBuckets.length
@@ -1274,7 +1550,9 @@ function optimizeAndSimulateSequence(adapter, {
     ? {}
     : (contTimeline[0]?.prices ?? buildTerminalPrices(adapter, termStub, initialWorldForObjective, objectiveCfg, scenarioSupplyFactor))
 
-  const approxTaxFactor = Number(startWorld.coins || 0) > (R.B12_TAX?.free || 3000000) ? 0.99 : 1.0
+  const approxTaxFactor = typeof R.b12TaxSale === 'function'
+    ? Math.max(0.05, Math.min(1, 1 - R.b12TaxSale(startWorld.state, { t: startWorld.now }, Number(startWorld.coins || 0), 10000) / 10000))
+    : (Number(startWorld.coins || 0) > (R.B12_TAX?.free || 3000000) ? 0.99 : 1.0)
 
   const buildSlots = (pricesArr) => [
     ...seqBuckets.map((b, u) => ({
@@ -1322,10 +1600,29 @@ function optimizeAndSimulateSequence(adapter, {
 
   const contCraftBuckets = []
   if (contTimeline.length > 1 && allowedSet.has('craft')) {
+    const dailyCraftCap = Math.max(1, Number(R.WORLD?.daily?.craft || 80))
+    let estMaxCraftUnits = 0
+    for (const [id, qArr] of Object.entries(startWorld.state?.inv || {})) {
+      const tot = (qArr?.[0] || 0) + (qArr?.[1] || 0) + (qArr?.[2] || 0)
+      if (!(tot > 0)) continue
+      const recs = graph.consumedByRecipes.get(id)
+      if (!recs || recs.length === 0) continue
+      let minNeed = Infinity
+      for (const r of recs) {
+        const n = Number(r.in?.[id] || 0)
+        if (n > 0 && n < minNeed) minNeed = n
+      }
+      if (Number.isFinite(minNeed)) estMaxCraftUnits += Math.ceil(tot / minNeed)
+    }
+    const estHorizonIsleSpan = Math.max(1, Math.ceil(Math.max(0, tH - t0) / 14400))
+    estMaxCraftUnits += ((startWorld.state?.plotN || 0) + (startWorld.state?.barn?.length || 0)) * estHorizonIsleSpan
+    const maxContCraftIsles = Math.max(1, Math.ceil(estMaxCraftUnits / dailyCraftCap))
+
     const seenInHorizonIsles = new Set(seqBuckets.map((b) => b.isleIndex))
     const seenContIsles = new Set()
     const baseOff = L > 0 ? Number(seqBuckets[L - 1].isleDayOffset || 0) : 0
     for (const cs of contTimeline) {
+      if (contCraftBuckets.length >= maxContCraftIsles) break
       if (seenInHorizonIsles.has(cs.isleIndex) || seenContIsles.has(cs.isleIndex)) continue
       seenContIsles.add(cs.isleIndex)
       contCraftBuckets.push({
@@ -1337,7 +1634,6 @@ function optimizeAndSimulateSequence(adapter, {
         isleDay: cs.isleDay,
         isleDayOffset: baseOff + seenContIsles.size,
       })
-      if (contCraftBuckets.length >= 2) break
     }
   }
 
@@ -1451,142 +1747,26 @@ function optimizeAndSimulateSequence(adapter, {
   }
 
   // Project background seasonal farm output across post-`tH` continuation isle-days (`stepIdx >= 1`)
-  // so cross-season renewable crops reflect future tier/workshop saturation while off-season crops reflect true scarcity!
-  const plotCountBg = Number(startWorld.state?.plotN || 0)
-  if (allowedSet.has('plant') && plotCountBg > 0 && contTimeline.length > 1) {
-    let sprCount = 0
-    for (let pi = 0; pi < plotCountBg; pi++) {
-      if (R.sprinkled(startWorld.state, pi)) sprCount++
-    }
-    const mostlySpr = sprCount * 2 >= plotCountBg
-    const contDaysMap = new Map()
-    for (const cs of contTimeline) {
-      if (cs.stepIdx < 1) continue
-      let dInfo = contDaysMap.get(cs.isleIndex)
-      if (!dInfo) {
-        dInfo = {
-          isleIndex: cs.isleIndex,
-          isleDay: cs.isleDay,
-          season: cs.season,
-          weather: cs.weather,
-          atSec: cs.atSec,
-          naturalDay: cs.naturalDay,
-          durationSec: 0,
-        }
-        contDaysMap.set(cs.isleIndex, dInfo)
+  // using the exact shared `projectContinuationFarmFlows` engine from `model/objective.mjs`!
+  const postHorizonContSlots = contTimeline.filter((cs) => cs.stepIdx >= 1)
+  if ((allowedSet.has('plant') || allowedSet.has('harvest')) && postHorizonContSlots.length > 0) {
+    projectContinuationFarmFlows(
+      adapter,
+      { ...startWorld, now: postHorizonContSlots[0].atSec },
+      postHorizonContSlots,
+      {
+        craftCapByIsle: unreservedWorkshopByIsle,
+        getScAtSlot: (sIdx, id) => getProjectedSc(postHorizonContSlots[sIdx].naturalDay, id),
+        addScAtSlot: (sIdx, id, qty) => addProjectedSc(postHorizonContSlots[sIdx].naturalDay, id, qty),
+        approxTaxMult: approxTaxFactor,
+        discRatePerHour: Number(objectiveCfg.discountRatePerHour || 0),
+        discOriginSec: t0,
+        allowTerminalCraft: allowedSet.has('craft'),
+        allowTerminalHarvest: allowedSet.has('harvest'),
+        allowTerminalPlant: allowedSet.has('plant'),
+        skipStandingPlots: true,
       }
-      dInfo.durationSec += Math.max(0, cs.nextAtSec - cs.atSec)
-    }
-
-    const cycleProfileMemo = new Map()
-    const getCropCycleProfile = (crop, weatherIsRain) => {
-      const mKey = `${crop.id}:${mostlySpr ? 1 : 0}:${weatherIsRain ? 1 : 0}`
-      let prof = cycleProfileMemo.get(mKey)
-      if (!prof) {
-        const speedMult = mostlySpr ? 0.6 : (weatherIsRain ? 0.85 : 1.0)
-        const maxTimes = crop.regrow ? (crop.times || 1) : 1
-        const growSec = Math.max(60, crop.grow * 60 * speedMult)
-        const regrowSec = maxTimes > 1 ? Math.max(60, (crop.regrow || crop.grow) * 60 * speedMult) : 0
-        const cycleSec = growSec + Math.max(0, maxTimes - 1) * regrowSec
-        const wStages = mostlySpr || weatherIsRain ? 3 : 2
-        const yld = expectedHarvestYield(adapter, wStages, false)
-        prof = {
-          cycleSec: Math.max(60, cycleSec),
-          totalUnits: maxTimes * yld.expectedUnits,
-          byQ: yld.expectedByQuality.map((v) => v * maxTimes),
-          seedCost: Number(crop.seed || 0),
-        }
-        cycleProfileMemo.set(mKey, prof)
-      }
-      return prof
-    }
-
-    for (const dInfo of contDaysMap.values()) {
-      const activePlotSecCap = plotCountBg * Math.min(28800, Math.max(3600, dInfo.durationSec))
-      const chunkCount = 4
-      const chunkPlotSec = activePlotSecCap / chunkCount
-      const inSeasonCrops = (R.CROPS || []).filter((c) => c.seasons.includes(dInfo.season))
-      if (inSeasonCrops.length === 0) continue
-
-      for (let ch = 0; ch < chunkCount; ch++) {
-        let bestBg = null
-        for (const crop of inSeasonCrops) {
-          const prof = getCropCycleProfile(crop, dInfo.weather === 1)
-          const cycles = chunkPlotSec / prof.cycleSec
-          if (!(cycles > 0)) continue
-
-          // Best direct sale slot from dInfo.atSec onwards
-          let dirRevPerCycle = 0
-          let bestDirNatDay = dInfo.naturalDay
-          for (let q = 0; q < 3; q++) {
-            const uQ = prof.byQ[q]
-            if (!(uQ > 0)) continue
-            const qual = R.QUALITY?.[q] ?? 1
-            let bestUnit = 0
-            let chosenNd = dInfo.naturalDay
-            for (const sl of slots) {
-              if (!sl.allowSell || sl.atSec + 1 < dInfo.atSec) continue
-              const p = Number(sl.prices?.[crop.id] || 0)
-              if (!(p > 0)) continue
-              const sc = getProjectedSc(sl.naturalDay, crop.id)
-              const mult = sc >= 400 ? 0.70 : sc >= 150 ? 0.85 : 1.0
-              const val = Math.round(p * qual) * mult * sl.disc * sl.netTaxFactor
-              if (val > bestUnit + 1e-9) {
-                bestUnit = val
-                chosenNd = sl.naturalDay
-              }
-            }
-            dirRevPerCycle += uQ * bestUnit
-            if (q === 0) bestDirNatDay = chosenNd
-          }
-
-          let bestRevPerCycle = dirRevPerCycle
-          let usedRec = null
-          if (allowedSet.has('craft')) {
-            const openSlotsHere = unreservedWorkshopByIsle.get(dInfo.isleIndex) || 0
-            if (openSlotsHere >= 1 - 1e-9) {
-              for (const rec of graph.consumedByRecipes.get(crop.id) || []) {
-                if (!(rec.price > 0) || Object.keys(rec.in || {}).length !== 1) continue
-                const needQty = Number(rec.in[crop.id] || 0)
-                if (!(needQty > 0)) continue
-                let bestRecOut = 0
-                for (const sl of slots) {
-                  if (!sl.allowSell || sl.atSec + 1 < dInfo.atSec) continue
-                  bestRecOut = Math.max(bestRecOut, Number(sl.prices?.[rec.id] || 0) * sl.disc * sl.netTaxFactor)
-                }
-                const impliedCycle = prof.totalUnits * (bestRecOut / needQty)
-                if (impliedCycle > bestRevPerCycle + 1e-6) {
-                  bestRevPerCycle = impliedCycle
-                  usedRec = { needQty }
-                }
-              }
-            }
-          }
-
-          const rate = (bestRevPerCycle - prof.seedCost) / prof.cycleSec
-          if (rate > 1e-6 && (!bestBg || rate > bestBg.rate + 1e-9)) {
-            bestBg = {
-              crop,
-              rate,
-              units: cycles * prof.totalUnits,
-              usedRec,
-              bestDirNatDay,
-            }
-          }
-        }
-        if (!bestBg) break
-        if (bestBg.usedRec) {
-          const curOpen = unreservedWorkshopByIsle.get(dInfo.isleIndex) || 0
-          const needSlots = bestBg.units / bestBg.usedRec.needQty
-          const usedSlots = Math.min(curOpen, needSlots)
-          unreservedWorkshopByIsle.set(dInfo.isleIndex, Math.max(0, curOpen - usedSlots))
-          const leftoverUnits = Math.max(0, bestBg.units - usedSlots * bestBg.usedRec.needQty)
-          if (leftoverUnits > 0) addProjectedSc(bestBg.bestDirNatDay, bestBg.crop.id, leftoverUnits)
-        } else {
-          addProjectedSc(bestBg.bestDirNatDay, bestBg.crop.id, bestBg.units)
-        }
-      }
-    }
+    )
   }
 
   const findBestDirectSaleChoice = (id, q = 0, atSec = startWorld.now) => {
@@ -1681,13 +1861,116 @@ function optimizeAndSimulateSequence(adapter, {
     return Math.max(0, best)
   }
 
-  // Step B: Pre-pass over deterministic maintenance, farm, barn & cargo `stockBuy` to collect exact supply arrivals per bucket!
+  // Step B: Pre-pass over deterministic maintenance, urgent farm/barn care & cargo `stockBuy` to collect exact supply arrivals per bucket!
   let probeWorld = adapter.cloneWorld(startWorld)
-  const preActionsByU = seqBuckets.map(() => [])
+  const earlyZeroEnPreByU = seqBuckets.map(() => [])
+  const cargoPreByU = seqBuckets.map(() => [])
+  const goalPreByU = seqBuckets.map(() => [])
+  const probeAllPreByU = seqBuckets.map(() => [])
+  const probeVirtualEnByU = new Float64Array(L)
+  const probeCoffeeCashByU = new Float64Array(L)
+  const estUrgentFarmEnByU = new Float64Array(L)
   const supplyByBucket = seqBuckets.map(() => ({}))
   const enAfterPreByU = new Float64Array(L)
   const craftCapByIsle = new Map()
   const seenCargoIsle = new Set()
+  const probeEdibleSpecs = typeof adapter.listDeterministicEdibleSpecs === 'function'
+    ? adapter.listDeterministicEdibleSpecs()
+    : []
+
+  // Endogenous marginal stamina shadow cost derived strictly from game physics (`0` magic constants)
+  const baseStaminaShadowCost = (() => {
+    const termCredit = Math.max(0, Number(objectiveCfg.energyTerminalCreditPerPoint || 0))
+    const s0 = startWorld.state || {}
+    const iIdx0 = R.isleIndex(t0)
+    const regenStep0 = R.WORLD?.regen || 180
+    const isle0End = Math.min(tH, adapter.nextIsleBoundary(t0, startWorld.clockStart))
+    const freeRegen0 = Math.max(0, Math.floor((isle0End - Math.max(t0, Number(s0.enT || t0))) / regenStep0))
+    const usedIq0 = s0.iq?.d === iIdx0 ? s0.iq : {}
+    let shiftableDemand0 = 0
+    if (allowedSet.has('craft')) shiftableDemand0 += Math.max(0, (R.WORLD?.daily?.craft || 80) - Number(usedIq0.craft || 0)) * (R.WORLD?.cost?.craft ?? 1)
+    if (allowedSet.has('bomb')) shiftableDemand0 += Math.max(0, (R.WORLD?.daily?.bomb || 10) - Number(usedIq0.bomb || 0)) * (R.WORLD?.cost?.bomb ?? 6)
+    if (allowedSet.has('fish')) shiftableDemand0 += Math.max(0, (R.WORLD?.daily?.fish || 80) - Number(usedIq0.fish || 0)) * (R.WORLD?.cost?.fish ?? 4)
+    if (allowedSet.has('mine')) shiftableDemand0 += Math.max(0, (R.WORLD?.daily?.mine || 100) - Number(usedIq0.mine || 0)) * (R.WORLD?.cost?.mine ?? 3)
+    if (Math.max(0, Math.floor(Number(s0.en || 0))) + freeRegen0 >= shiftableDemand0) {
+      return termCredit
+    }
+    let minTopUpCpe = Infinity
+    if (allowedSet.has('eat')) {
+      for (const sp of probeEdibleSpecs) {
+        const qty = sp.kind === 'snack'
+          ? Math.min(adapter.availableInv(s0, sp.id, 0), sp.dailyCap != null ? Math.max(0, sp.dailyCap - Number(s0.cnt?.[sp.id] || 0)) : 999)
+          : adapter.availableInv(s0, sp.id, sp.q)
+        if (!(qty > 0) || !(sp.energyGain > 0)) continue
+        const cpe = sp.kind === 'snack' ? 0 : bestDirectUnitValue(sp.id, sp.q, t0) / sp.energyGain
+        if (cpe < minTopUpCpe) minTopUpCpe = cpe
+      }
+    }
+    if (allowedSet.has('coffee')) {
+      const cLeft = Math.max(0, (R.WORLD?.daily?.coffee || 3) - Number(s0.cnt?.coffee || 0))
+      const cPrice = R.WORLD?.coffee?.price || 15000
+      const cEn = R.WORLD?.coffee?.energy || 60
+      if (cLeft > 0 && cEn > 0 && Number(startWorld.coins || 0) - Number(constraints.cashReserveFloor || 0) >= cPrice) {
+        minTopUpCpe = Math.min(minTopUpCpe, cPrice / cEn)
+      }
+    }
+    let bestExtractionPerEn = termCredit
+    if (allowedSet.has('mine')) {
+      const my0 = expectedMineYieldPerHit(adapter, s0, R.isleDay(t0))
+      const mv0 = Object.entries(my0.byOre).reduce((acc, [oId, c]) => acc + c * marginalItemValueFn(oId, 0, t0), 0)
+      bestExtractionPerEn = Math.max(bestExtractionPerEn, mv0 / Math.max(1, R.WORLD?.cost?.mine ?? 3))
+    }
+    if (allowedSet.has('fish')) {
+      const fy0 = expectedFishYieldPerCast(adapter, s0, t0, false)
+      const fv0 = Object.entries(fy0.byFish).reduce(
+        (acc, [fId, qs]) => acc + qs[0] * marginalItemValueFn(fId, 0, t0) + qs[1] * marginalItemValueFn(fId, 1, t0) + qs[2] * marginalItemValueFn(fId, 2, t0),
+        0
+      )
+      bestExtractionPerEn = Math.max(bestExtractionPerEn, fv0 / Math.max(1, R.WORLD?.cost?.fish ?? 4))
+    }
+    return Number.isFinite(minTopUpCpe)
+      ? Math.max(termCredit, Math.min(minTopUpCpe, bestExtractionPerEn))
+      : bestExtractionPerEn
+  })()
+
+  const buildProbeTopUpPool = (stWorld, atSec, bucketDiscVal) => {
+    const s = stWorld.state || {}
+    const pool = []
+    if (allowedSet.has('eat')) {
+      for (const sp of probeEdibleSpecs) {
+        const qty = sp.kind === 'snack'
+          ? Math.min(adapter.availableInv(s, sp.id, 0), sp.dailyCap != null ? Math.max(0, sp.dailyCap - Number(s.cnt?.[sp.id] || 0)) : 999)
+          : adapter.availableInv(s, sp.id, sp.q)
+        if (!(qty > 0) || !(sp.energyGain > 0)) continue
+        const unitOpp = sp.kind === 'snack' ? 0 : Math.max(bestDirectUnitValue(sp.id, sp.q, atSec), marginalItemValueFn(sp.id, sp.q, atSec))
+        pool.push({
+          kind: 'eat',
+          rem: qty,
+          enGain: sp.energyGain,
+          cpe: unitOpp / sp.energyGain,
+          cashPerUnit: 0,
+        })
+      }
+    }
+    if (allowedSet.has('coffee')) {
+      const cLeft = Math.max(0, (R.WORLD?.daily?.coffee || 3) - Number(s.cnt?.coffee || 0))
+      const cPrice = R.WORLD?.coffee?.price || 15000
+      const cEn = R.WORLD?.coffee?.energy || 60
+      const freeC = Math.max(0, Number(stWorld.coins || 0) - Number(constraints.cashReserveFloor || 0))
+      const affordC = cPrice > 0 ? Math.min(cLeft, Math.floor(freeC / cPrice)) : 0
+      if (affordC > 0 && cEn > 0) {
+        pool.push({
+          kind: 'coffee',
+          rem: affordC,
+          enGain: cEn,
+          cpe: (cPrice * bucketDiscVal) / cEn,
+          cashPerUnit: cPrice,
+        })
+      }
+    }
+    pool.sort((a, b2) => a.cpe - b2.cpe)
+    return pool
+  }
 
   const addSupply = (u, id, q, n) => {
     if (!(n > 0)) return
@@ -1698,6 +1981,7 @@ function optimizeAndSimulateSequence(adapter, {
   for (let u = 0; u < L; u++) {
     const b = seqBuckets[u]
     const bPrices = estPricesByU[u] || {}
+    const bDisc = discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, b.atSec - t0))
     probeWorld = adapter.advanceTimeOnly(probeWorld, b.atSec, { futurePrices: bPrices })
     probeWorld = applyExogenousArrivals(probeWorld, b.exogenousArrivalsAtStart)
 
@@ -1706,20 +1990,20 @@ function optimizeAndSimulateSequence(adapter, {
       craftCapByIsle.set(b.isleIndex, allowedSet.has('craft') ? Math.max(0, (R.WORLD?.daily?.craft || 80) - used) : 0)
     }
 
-    const batch = []
+    const earlyBatch = []
     let s = probeWorld.state
     const weather = R.weatherOf(b.isleDay)
 
-    // 1. Pre-selected CapEx at u=0 if authorized
+    // 1. Pre-selected CapEx at u=0 if authorized (0 stamina)
     if (u === 0 && allowedSet.has('capex') && preselectedCapexActions.length > 0) {
-      batch.push(...preselectedCapexActions)
+      earlyBatch.push(...preselectedCapexActions)
     }
 
     // 2. Zero-stamina crab traps
     if (allowedSet.has('trap')) {
       for (let i = 0; i < (s.traps?.length || 0); i++) {
         if (R.trapReady(s.traps[i], b.atSec, weather === 2).n > 0) {
-          batch.push({ a: 'trap', i })
+          earlyBatch.push({ a: 'trap', i })
         }
       }
     }
@@ -1734,21 +2018,18 @@ function optimizeAndSimulateSequence(adapter, {
       const canCollect = allowedSet.has('collect') && st.ready
       if (canCollect && canPet) {
         if ((pen.m || 0) >= 95) {
-          batch.push({ a: 'collect', i }, { a: 'pet', i })
+          earlyBatch.push({ a: 'collect', i }, { a: 'pet', i })
         } else {
-          batch.push({ a: 'pet', i }, { a: 'collect', i })
+          earlyBatch.push({ a: 'pet', i }, { a: 'collect', i })
         }
       } else if (canPet) {
-        batch.push({ a: 'pet', i })
+        earlyBatch.push({ a: 'pet', i })
       } else if (canCollect) {
-        batch.push({ a: 'collect', i })
+        earlyBatch.push({ a: 'collect', i })
       }
     }
 
-    // 3b. Low-cash working-capital pre-sell at `u === 0`:
-    //     When wallet is below the tax-free threshold (`B12_TAX.free`) and short of working capital for
-    //     immediate hungry-barn `feed`, empty-plot `plant`, or high-ROI cargo `stockBuy`, liquidate the
-    //     minimal amount of finished/non-craft-reserved stock first so cash-poor islands never stall!
+    // 3b. Low-cash working-capital pre-sell at `u === 0` (exact seed, feed & positive-arbitrage cargo needs; 0 magic constants)
     if (
       u === 0 &&
       allowedSet.has('sell') &&
@@ -1767,29 +2048,46 @@ function optimizeAndSimulateSequence(adapter, {
         const needFeed = Math.max(0, hungryCnt - adapter.availableInv(s, utilityTokens.feedId, 0))
         estWorkingCapNeed += needFeed * Number(R.SHOP?.[utilityTokens.feedId]?.price || 150)
       }
-      if (allowedSet.has('plant')) {
-        let emptyOrHarvestable = 0
+      if (allowedSet.has('plant') && enableFirstBucketPlant) {
+        const freeSeedRem = new Map()
         for (let i = 0; i < (s.plotN || 0); i++) {
           const p = s.plots?.[i]
-          if (!p) emptyOrHarvestable++
-          else {
+          let willBeEmpty = !p
+          if (p) {
             const st = R.cropStage(p, b.atSec, R.sprinkled(s, i) || weather === 1)
-            if (st.stage === 3 || st.stage === -1) emptyOrHarvestable++
+            willBeEmpty = (st.stage === 3 && allowedSet.has('harvest')) || (st.stage === -1 && allowedSet.has('clear'))
+          }
+          if (!willBeEmpty) continue
+          const bestP = selectBestCropToPlant(adapter, {
+            state: s,
+            plotIdx: i,
+            atSec: b.atSec,
+            tEnd: tH,
+            marginalItemValueFn,
+            staminaPointCost: baseStaminaShadowCost,
+            enforceHorizonCutoff: objectiveCfg.terminalSupplyMode === 'zero',
+          })
+          if (!bestP) continue
+          const sdKey = `sd_${bestP.crop.id}`
+          if (!freeSeedRem.has(sdKey)) freeSeedRem.set(sdKey, adapter.availableInv(s, sdKey, 0))
+          const remSd = freeSeedRem.get(sdKey) || 0
+          if (remSd > 0) {
+            freeSeedRem.set(sdKey, remSd - 1)
+          } else {
+            estWorkingCapNeed += Number(bestP.crop.seed || 0)
           }
         }
-        estWorkingCapNeed += emptyOrHarvestable * 600
       }
-      if (allowedSet.has('stockBuy') && typeof R.b12Stock === 'function') {
+      if (allowedSet.has('stockBuy') && enableFirstBucketStockBuy && typeof R.b12Stock === 'function') {
         const stock0 = R.b12Stock(b.atSec, bPrices)
         const cargoMap0 = new Map(stock0.map((it) => [it.id, { price: Number(it.price || 0), left: R.b12StockLeft(s, it, b.atSec) }]))
-        const edibleSpecs0 = allowedSet.has('eat') && typeof adapter.listDeterministicEdibleSpecs === 'function'
-          ? adapter.listDeterministicEdibleSpecs()
-          : []
         let bestCargoEdible = null
         for (const item of stock0) {
           const left = cargoMap0.get(item.id)?.left || 0
           if (!(left > 0) || !(item.price > 0)) continue
-          const edSp = edibleSpecs0.find((sp) => (sp.kind === 'snack' && sp.id === item.id) || (sp.kind !== 'snack' && sp.id === item.id && sp.q === 0))
+          const edSp = allowedSet.has('eat')
+            ? probeEdibleSpecs.find((sp) => (sp.kind === 'snack' && sp.id === item.id) || (sp.kind !== 'snack' && sp.id === item.id && sp.q === 0))
+            : null
           if (edSp && edSp.energyGain > 0) {
             const cpe = item.price / edSp.energyGain
             if (!bestCargoEdible || cpe < bestCargoEdible.cpe) {
@@ -1798,7 +2096,7 @@ function optimizeAndSimulateSequence(adapter, {
           }
           if (utilityTokens.explosiveId && item.id === utilityTokens.explosiveId && allowedSet.has('bomb')) {
             estWorkingCapNeed += left * item.price
-          } else if (bestDirectUnitValue(item.id, 0, b.atSec) > item.price * 1.02) {
+          } else if (bestDirectUnitValue(item.id, 0, b.atSec) > item.price * bDisc + 1e-6) {
             estWorkingCapNeed += left * item.price
           }
         }
@@ -1829,13 +2127,13 @@ function optimizeAndSimulateSequence(adapter, {
                 usesCargo = true
                 maxB = Math.min(maxB, Math.floor(((unreservedInitCounts[inId] || 0) + cInfo.left) / reqQty))
                 cashPerBundle += reqQty * cInfo.price
-                oppPerBundle += reqQty * cInfo.price
+                oppPerBundle += reqQty * cInfo.price * bDisc
               } else {
                 maxB = Math.min(maxB, Math.floor((unreservedInitCounts[inId] || 0) / reqQty))
                 oppPerBundle += reqQty * bestDirectUnitValue(inId, 0, b.atSec)
               }
             }
-            if (usesCargo && maxB > 0 && outBest > oppPerBundle * 1.02) {
+            if (usesCargo && maxB > 0 && outBest > oppPerBundle + 1e-6) {
               estWorkingCapNeed += maxB * cashPerBundle
               freeSlotsEst -= maxB
             }
@@ -1846,21 +2144,31 @@ function optimizeAndSimulateSequence(adapter, {
       let shortfall = Math.max(0, estWorkingCapNeed - availNow)
       if (shortfall > 0) {
         const snap0 = adapter.availableInvSnapshot(s)
-        // Prefer selling pure finished goods (`consumedByRecipes` empty) whose current quote is not deeply depressed
-        const candidates = Object.keys(snap0)
+        for (const [resId, resNeed] of Object.entries(reservedByInitCS)) {
+          let remRes = Math.max(0, Math.floor(Number(resNeed || 0)))
+          const row = snap0[resId]
+          if (!row || !(remRes > 0)) continue
+          for (let qIdx = 0; qIdx < 3 && remRes > 0; qIdx++) {
+            const tk = Math.min(row[qIdx] || 0, remRes)
+            row[qIdx] -= tk
+            remRes -= tk
+          }
+        }
+        const allCandidates = Object.keys(snap0)
           .filter((id) => Number(bPrices?.[id] || 0) > 0 && Number(R.BASE_PRICE?.[id] || 0) > 0)
           .map((id) => {
             const isRawInput = (graph.consumedByRecipes.get(id) || []).some((r) => r.price > 0)
             const curP = Number(bPrices[id] || 0)
+            const curNet0 = Math.round(curP) * (graph.cropsById.has(id) ? 0.85 : 1) * bDisc * approxTaxFactor
             const futBest = marginalItemValueFn(id, 0, b.atSec)
-            const holdRatio = futBest > 0 ? curP / futBest : 1
-            return { id, isRawInput, curP, holdRatio }
+            const holdRatio = futBest > 0 ? curNet0 / futBest : 1
+            return { id, isRawInput, curP, curNet0, futBest, holdRatio }
           })
-          .filter((c) => !c.isRawInput || c.holdRatio >= 0.92)
+          .filter((c) => !c.isRawInput || c.curNet0 + 1e-6 >= c.futBest)
           .sort((a, b2) => Number(a.isRawInput) - Number(b2.isRawInput) || b2.holdRatio - a.holdRatio)
 
         const wcSells = []
-        for (const c of candidates) {
+        for (const c of allCandidates) {
           if (shortfall <= 0) break
           for (const q of [2, 1, 0]) {
             if (shortfall <= 0) break
@@ -1875,111 +2183,230 @@ function optimizeAndSimulateSequence(adapter, {
           }
         }
         if (wcSells.length > 0) {
-          const svWc = simulateValidBatch(adapter, probeWorld, [...batch, ...wcSells].slice(0, R.WORLD?.maxActions || 40), {
-            t: b.atSec,
-            prices: bPrices,
-            rand: probePrng,
-          })
-          probeWorld = svWc.afterWorld
-          s = probeWorld.state
-          preActionsByU[u].push(...svWc.validActions)
-          batch.length = 0
+          earlyBatch.push(...wcSells)
         }
       }
     }
 
-    // 4. Barn `feed` (buy feed if short)
-    if (allowedSet.has('feed')) {
-      const hungryIndices = []
-      for (let i = 0; i < (s.barn?.length || 0); i++) {
-        const pen = s.barn[i]
-        if (!pen || R.b12AnimalStage(pen, b.atSec).retired) continue
-        const hungryAt = pen.f + 86400
-        if (b.atSec - pen.f >= 8 * 3600 && (hungryAt <= b.nextAtSec || b.atSec >= hungryAt)) {
-          hungryIndices.push(i)
-        }
-      }
-      if (hungryIndices.length > 0 && utilityTokens.feedId) {
-        const haveFeed = adapter.availableInv(s, utilityTokens.feedId, 0)
-        const needBuy = Math.max(0, hungryIndices.length - haveFeed)
-        const feedPrice = Number(R.SHOP?.[utilityTokens.feedId]?.price || 150)
-        if (needBuy > 0 && allowedSet.has('buy') && probeWorld.coins - constraints.cashReserveFloor >= needBuy * feedPrice) {
-          batch.push({ a: 'buy', id: utilityTokens.feedId, n: Math.min(99, needBuy) })
-        }
-        for (const idx of hungryIndices) {
-          batch.push({ a: 'feed', i: idx })
-        }
-      }
-    }
-
-    // 5. Plots: harvest mature, clear withered, water, plant seasonal optimal crop
-    for (let i = 0; i < (s.plots?.length || 0); i++) {
-      const p = s.plots[i]
-      if (!p) continue
-      const auto = R.sprinkled(s, i) || weather === 1
-      const st = R.cropStage(p, b.atSec, auto)
-      if (st.stage === 3 && allowedSet.has('harvest')) {
-        batch.push({ a: 'harvest', i })
-      } else if (st.stage === -1 && allowedSet.has('clear')) {
-        batch.push({ a: 'clear', i })
-      } else if (st.stage >= 0 && st.stage < 3 && !auto && p.w <= st.stage && allowedSet.has('water')) {
-        batch.push({ a: 'water', i })
-      }
-    }
-
-    // Simulate the harvest/clear/collect part first so newly freed plots can be replanted in the same batch!
-    if (batch.length > 0) {
-      const sv1 = simulateValidBatch(adapter, probeWorld, batch.slice(0, R.WORLD?.maxActions || 40), {
+    if (earlyBatch.length > 0) {
+      const svEarly = simulateValidBatch(adapter, probeWorld, earlyBatch, {
         t: b.atSec,
         prices: bPrices,
         rand: probePrng,
       })
-      probeWorld = sv1.afterWorld
-      preActionsByU[u].push(...sv1.validActions)
+      probeWorld = svEarly.afterWorld
+      s = probeWorld.state
+      earlyZeroEnPreByU[u].push(...svEarly.validActions)
+      probeAllPreByU[u].push(...svEarly.validActions)
     }
 
-    // Plant empty plots if profitable (and allowed in u=0 by upstream policy candidate)
-    if (allowedSet.has('plant') && (u > 0 || enableFirstBucketPlant)) {
-      const plantActs = []
-      const ps = probeWorld.state
-      let simCash = Number(probeWorld.coins || 0) - Number(constraints.cashReserveFloor || 0)
-      let simEn = Number(ps.en || 0)
-      for (let i = 0; i < ps.plotN && preActionsByU[u].length + plantActs.length < (R.WORLD?.maxActions || 40) - 4; i++) {
-        if (ps.plots[i]) continue
-        if (simEn < (R.WORLD?.cost?.plant ?? 2)) break
-        const bestP = selectBestCropToPlant(adapter, {
-          state: ps,
-          plotIdx: i,
-          atSec: b.atSec,
-          tEnd: tH,
-          marginalItemValueFn,
-          staminaPointCost: 0,
-          enforceHorizonCutoff: objectiveCfg.terminalSupplyMode === 'zero',
-        })
-        if (!bestP) break
-        const hasFreeSeed = adapter.availableInv(ps, `sd_${bestP.crop.id}`, 0) > 0
-        const costCash = hasFreeSeed ? 0 : bestP.crop.seed
-        if (costCash > simCash) continue
-        // Reserve realistic full-cycle expected harvest units across workshop/crop-tier capacity!
-        marginalItemValueFn(bestP.crop.id, 0, b.atSec, {
-          reserveUnits: Math.max(1, Math.round(bestP.totalExpectedUnits || 2)),
-        })
-        plantActs.push({ a: 'plant', i, c: bestP.crop.id })
-        if (!R.sprinkled(ps, i) && weather !== 1 && simEn >= (R.WORLD?.cost?.plant ?? 2) + (R.WORLD?.cost?.water ?? 1)) {
-          plantActs.push({ a: 'water', i })
-          simEn -= R.WORLD?.cost?.water ?? 1
+    // 4 & 5. Urgent Farm & Barn Care on `probeWorld` in exact economic priority order:
+    //   (a) Ripe `harvest` & withered `clear` (`1 en`)
+    //   (b) Empty-plot `plant` (`2 en`, including plots freed by `harvest`/`clear`!)
+    //   (c) Hungry barn `feed` (`1 en`)
+    //   (d) Expiring manual `water` (`1 en`), and non-expiring manual `water` ONLY after all empty plots are planted!
+    {
+      const regenStepB = R.WORLD?.regen || 180
+      const baseEnTB = Math.max(b.atSec, Number(s.enT || b.atSec))
+      const nextOppSecB = Math.min(b.nextAtSec > b.atSec ? b.nextAtSec : b.atSec + regenStepB, baseEnTB + regenStepB)
+      const topUpPoolB = buildProbeTopUpPool(probeWorld, b.atSec, bDisc)
+
+      const ensureProbeUrgentEn = (neededEn, maxAcceptableCpe) => {
+        const curEnB = Math.max(0, Math.floor(Number(probeWorld.state?.en || 0)))
+        if (curEnB >= neededEn) return true
+        let deficit = neededEn - curEnB
+        let granted = 0
+        let coffeeSpent = 0
+        const freeCoinsNow = Math.max(0, Number(probeWorld.coins || 0) - Number(constraints.cashReserveFloor || 0))
+        for (const entry of topUpPoolB) {
+          if (deficit <= 0) break
+          if (!(entry.rem > 0) || entry.cpe >= maxAcceptableCpe - 1e-6) continue
+          while (entry.rem > 0 && deficit > 0) {
+            if (entry.cashPerUnit > 0 && coffeeSpent + entry.cashPerUnit > freeCoinsNow) break
+            entry.rem -= 1
+            granted += entry.enGain
+            deficit -= entry.enGain
+            coffeeSpent += entry.cashPerUnit
+          }
         }
-        simCash -= costCash
-        simEn -= R.WORLD?.cost?.plant ?? 2
+        if (granted > 0) {
+          probeWorld.state.en = curEnB + granted
+          probeVirtualEnByU[u] += granted
+          if (coffeeSpent > 0) {
+            probeWorld.coins = Math.max(0, Number(probeWorld.coins || 0) - coffeeSpent)
+            probeCoffeeCashByU[u] += coffeeSpent
+          }
+        }
+        return Math.max(0, Math.floor(Number(probeWorld.state?.en || 0))) >= neededEn
       }
-      if (plantActs.length > 0) {
-        const sv2 = simulateValidBatch(adapter, probeWorld, plantActs, {
+
+      // (a) Ripe `harvest` & withered `clear`
+      const hcActs = []
+      let expiringWaters = []
+      let nonExpiringWaters = []
+      for (let i = 0; i < (s.plots?.length || 0); i++) {
+        const p = s.plots[i]
+        if (!p) continue
+        const auto = R.sprinkled(s, i) || weather === 1
+        const st = R.cropStage(p, b.atSec, auto)
+        if (st.stage === 3 && allowedSet.has('harvest')) {
+          const cropDef = graph.cropsById.get(p.c)
+          const unitVal = cropDef ? Math.max(1, marginalItemValueFn(cropDef.id, 0, b.atSec)) : 100
+          const approxDelayLoss = Math.max(20, (unitVal / Math.max(3600, (cropDef?.grow || 120) * 60)) * regenStepB + 0.15 * unitVal)
+          if (ensureProbeUrgentEn(hcActs.length + 1, approxDelayLoss)) {
+            hcActs.push({ a: 'harvest', i })
+          }
+        } else if (st.stage === -1 && allowedSet.has('clear')) {
+          if (ensureProbeUrgentEn(hcActs.length + 1, 500)) {
+            hcActs.push({ a: 'clear', i })
+          }
+        } else if (st.stage >= 0 && st.stage < 3 && !auto && p.w <= st.stage && allowedSet.has('water')) {
+          const stageEndSec = Number(p.t || b.atSec) + Math.ceil((Number(st.total || 3600) * (st.stage + 1)) / 3)
+          const cropDef = graph.cropsById.get(p.c)
+          const unitVal = cropDef ? marginalItemValueFn(cropDef.id, 0, b.atSec) : 0
+          const deltaWaterVal = 0.20 * unitVal
+          if (stageEndSec <= nextOppSecB) {
+            expiringWaters.push({ i, deltaWaterVal })
+          } else {
+            nonExpiringWaters.push({ i, deltaWaterVal })
+          }
+        }
+      }
+      if (hcActs.length > 0) {
+        const svHC = simulateValidBatch(adapter, probeWorld, hcActs, {
           t: b.atSec,
           prices: bPrices,
           rand: probePrng,
         })
-        probeWorld = sv2.afterWorld
-        preActionsByU[u].push(...sv2.validActions)
+        probeWorld = svHC.afterWorld
+        s = probeWorld.state
+        probeAllPreByU[u].push(...svHC.validActions)
+        estUrgentFarmEnByU[u] += svHC.validActions.length * (R.WORLD?.cost?.harvest ?? 1)
+      }
+
+      // (b) Empty-plot `plant` (including plots newly freed by `harvest` / `clear`)
+      let unplantedProfitableCount = 0
+      if (allowedSet.has('plant') && (u > 0 || enableFirstBucketPlant)) {
+        const plantActs = []
+        const plantCostEn = R.WORLD?.cost?.plant ?? 2
+        let simCash = Number(probeWorld.coins || 0) - Number(constraints.cashReserveFloor || 0)
+        for (let i = 0; i < (s.plotN || 0); i++) {
+          if (s.plots?.[i]) continue
+          const bestP = selectBestCropToPlant(adapter, {
+            state: s,
+            plotIdx: i,
+            atSec: b.atSec,
+            tEnd: tH,
+            marginalItemValueFn,
+            staminaPointCost: baseStaminaShadowCost,
+            enforceHorizonCutoff: objectiveCfg.terminalSupplyMode === 'zero',
+          })
+          if (!bestP) continue
+          const hasFreeSeed = adapter.availableInv(s, `sd_${bestP.crop.id}`, 0) > 0
+          const costCash = hasFreeSeed ? 0 : bestP.crop.seed
+          if (costCash > simCash) continue
+          const lossPerEn = Math.max(
+            1,
+            bestP.netRatePerSec * regenStepB +
+              (R.seasonOf(R.isleDay(b.atSec + plantCostEn * regenStepB)) !== R.seasonOf(b.isleDay) ? bestP.netPresentValue / plantCostEn : 0)
+          )
+          if (!ensureProbeUrgentEn((plantActs.length + 1) * plantCostEn, lossPerEn)) {
+            unplantedProfitableCount++
+            continue
+          }
+          marginalItemValueFn(bestP.crop.id, 0, b.atSec, {
+            reserveUnits: Math.max(1, Math.round(bestP.totalExpectedUnits || 2)),
+          })
+          plantActs.push({ a: 'plant', i, c: bestP.crop.id })
+          if (!R.sprinkled(s, i) && weather !== 1) {
+            nonExpiringWaters.push({ i, deltaWaterVal: 0.20 * marginalItemValueFn(bestP.crop.id, 0, b.atSec) })
+          }
+          simCash -= costCash
+        }
+        if (plantActs.length > 0) {
+          const svP = simulateValidBatch(adapter, probeWorld, plantActs, {
+            t: b.atSec,
+            prices: bPrices,
+            rand: probePrng,
+          })
+          probeWorld = svP.afterWorld
+          s = probeWorld.state
+          probeAllPreByU[u].push(...svP.validActions)
+          estUrgentFarmEnByU[u] += svP.validActions.length * plantCostEn
+        }
+      }
+
+      // (c) Hungry barn `feed`
+      if (allowedSet.has('feed')) {
+        const hungryIndices = []
+        for (let i = 0; i < (s.barn?.length || 0); i++) {
+          const pen = s.barn[i]
+          if (!pen || R.b12AnimalStage(pen, b.atSec).retired) continue
+          const hungryAt = pen.f + 86400
+          if (b.atSec - pen.f >= 8 * 3600 && (hungryAt <= b.nextAtSec || b.atSec >= hungryAt)) {
+            hungryIndices.push(i)
+          }
+        }
+        if (hungryIndices.length > 0 && utilityTokens.feedId) {
+          const feedActs = []
+          const haveFeed = adapter.availableInv(s, utilityTokens.feedId, 0)
+          const needBuy = Math.max(0, hungryIndices.length - haveFeed)
+          const feedPrice = Number(R.SHOP?.[utilityTokens.feedId]?.price || 150)
+          if (needBuy > 0 && allowedSet.has('buy') && probeWorld.coins - constraints.cashReserveFloor >= needBuy * feedPrice) {
+            feedActs.push({ a: 'buy', id: utilityTokens.feedId, n: Math.min(99, needBuy) })
+          }
+          let fedCount = 0
+          for (const idx of hungryIndices) {
+            const pen = s.barn[idx]
+            const def = graph.animalsById.get(pen?.k)
+            const prodVal = def ? marginalItemValueFn(def.product, 0, b.atSec) : 500
+            const periodSec = Math.max(3600, R.b12AnimalPeriod?.(pen.k, b.atSec) || 28800)
+            const lossPerEn = (prodVal / periodSec) * regenStepB
+            if (ensureProbeUrgentEn(fedCount + 1, lossPerEn)) {
+              feedActs.push({ a: 'feed', i: idx })
+              fedCount++
+            }
+          }
+          if (fedCount > 0) {
+            const svF = simulateValidBatch(adapter, probeWorld, feedActs, {
+              t: b.atSec,
+              prices: bPrices,
+              rand: probePrng,
+            })
+            probeWorld = svF.afterWorld
+            s = probeWorld.state
+            probeAllPreByU[u].push(...svF.validActions)
+            estUrgentFarmEnByU[u] += svF.validActions.filter((a) => a.a === 'feed').length * (R.WORLD?.cost?.feed ?? 1)
+          }
+        }
+      }
+
+      // (d) Manual `water`: expiring stage-end waters first; non-expiring waters ONLY if zero empty plots remain unplanted!
+      const waterActs = []
+      let neededWEn = 0
+      for (const ew of expiringWaters) {
+        if (ensureProbeUrgentEn(neededWEn + 1, ew.deltaWaterVal)) {
+          waterActs.push({ a: 'water', i: ew.i })
+          neededWEn += R.WORLD?.cost?.water ?? 1
+        }
+      }
+      const expiringCountAccepted = waterActs.length
+      if (unplantedProfitableCount === 0) {
+        const spareEnNow = Math.max(0, Math.floor(Number(probeWorld.state?.en || 0)) - neededWEn)
+        for (let k = 0; k < Math.min(spareEnNow, nonExpiringWaters.length); k++) {
+          waterActs.push({ a: 'water', i: nonExpiringWaters[k].i })
+        }
+      }
+      if (waterActs.length > 0) {
+        const svW = simulateValidBatch(adapter, probeWorld, waterActs, {
+          t: b.atSec,
+          prices: bPrices,
+          rand: probePrng,
+        })
+        probeWorld = svW.afterWorld
+        s = probeWorld.state
+        probeAllPreByU[u].push(...svW.validActions)
+        estUrgentFarmEnByU[u] += Math.min(expiringCountAccepted, svW.validActions.length) * (R.WORLD?.cost?.water ?? 1)
       }
     }
 
@@ -2042,16 +2469,22 @@ function optimizeAndSimulateSequence(adapter, {
         const existingCraftWorkUnits = []
         if (allowedSet.has('craft')) {
           const localEndIdx = u + localCargoBuckets.length - 1
-          const probeCS = solveJointCraftAndSell(adapter, {
-            initialSupplyByBucket: [structuredClone(curSnapCargo), ...localCargoBuckets.slice(1).map(() => ({}))],
-            buckets: localCargoBuckets,
-            slots: slots
+          let subSlots = slots._subSlotsByU?.[u]
+          if (!subSlots) {
+            if (!slots._subSlotsByU) slots._subSlotsByU = []
+            subSlots = slots
               .filter((sl) => sl.availFromBucket >= u)
               .map((sl) => ({
                 ...sl,
                 availFromBucket: Math.min(Math.max(0, localCargoBuckets.length - 1), Math.max(0, sl.availFromBucket - u)),
               }))
-              .filter((sl, idx2, arr2) => !sl.isTerminal || sl.availFromBucket <= localEndIdx - u || idx2 === arr2.length - 1),
+              .filter((sl, idx2, arr2) => !sl.isTerminal || sl.availFromBucket <= localEndIdx - u || idx2 === arr2.length - 1)
+            slots._subSlotsByU[u] = subSlots
+          }
+          const probeCS = solveJointCraftAndSell(adapter, {
+            initialSupplyByBucket: [structuredClone(curSnapCargo), ...localCargoBuckets.slice(1).map(() => ({}))],
+            buckets: localCargoBuckets,
+            slots: subSlots,
             initialNatDay: b.naturalDay,
             initialCnt: probeWorld.state?.cnt || {},
             craftCapByIsle: new Map(probeFreeSlotsByIsle),
@@ -2059,6 +2492,7 @@ function optimizeAndSimulateSequence(adapter, {
             staminaShadowCost: 0,
             allowCraft: true,
             maxCraftHoldIsleDays,
+            revenueOnly: true,
           })
 
           const expandedProbeCrafts = []
@@ -3213,7 +3647,8 @@ function optimizeAndSimulateSequence(adapter, {
             rand: probePrng,
           })
           probeWorld = sv3.afterWorld
-          preActionsByU[u].push(...sv3.validActions)
+          cargoPreByU[u].push(...sv3.validActions)
+          probeAllPreByU[u].push(...sv3.validActions)
         }
       }
     }
@@ -3234,7 +3669,8 @@ function optimizeAndSimulateSequence(adapter, {
           rand: probePrng,
         })
         probeWorld = svG.afterWorld
-        preActionsByU[u].push(...svG.validActions)
+        goalPreByU[u].push(...svG.validActions)
+        probeAllPreByU[u].push(...svG.validActions)
       }
     }
 
@@ -3242,7 +3678,7 @@ function optimizeAndSimulateSequence(adapter, {
   }
 
   // Reconstruct exact net incremental available inventory arriving at each bucket u = 0..L-1
-  // by diffing `availableInvSnapshot` after `preActionsByU[u]` against the previous bucket's post-state!
+  // by diffing `availableInvSnapshot` after `probeAllPreByU[u]` against the previous bucket's post-state!
   {
     let trackWorld = adapter.cloneWorld(startWorld)
     let prevSnap = {}
@@ -3251,8 +3687,14 @@ function optimizeAndSimulateSequence(adapter, {
       const bPrices = estPricesByU[u] || {}
       trackWorld = adapter.advanceTimeOnly(trackWorld, b.atSec, { futurePrices: bPrices })
       trackWorld = applyExogenousArrivals(trackWorld, b.exogenousArrivalsAtStart)
-      if (preActionsByU[u].length > 0) {
-        trackWorld = simulateValidBatch(adapter, trackWorld, preActionsByU[u], { t: b.atSec, prices: bPrices, rand: trackPrng }).afterWorld
+      if (probeVirtualEnByU[u] > 0) {
+        trackWorld.state.en = Math.max(0, Math.floor(Number(trackWorld.state?.en || 0))) + probeVirtualEnByU[u]
+      }
+      if (probeCoffeeCashByU[u] > 0) {
+        trackWorld.coins = Math.max(0, Number(trackWorld.coins || 0) - probeCoffeeCashByU[u])
+      }
+      if (probeAllPreByU[u].length > 0) {
+        trackWorld = simulateValidBatch(adapter, trackWorld, probeAllPreByU[u], { t: b.atSec, prices: bPrices, rand: trackPrng }).afterWorld
       }
       const curSnap = adapter.availableInvSnapshot(trackWorld.state)
       for (const [id, row] of Object.entries(curSnap)) {
@@ -3263,7 +3705,7 @@ function optimizeAndSimulateSequence(adapter, {
         }
       }
       prevSnap = curSnap
-      enAfterPreByU[u] = Number(trackWorld.state?.en || 0)
+      enAfterPreByU[u] = Math.max(0, Number(trackWorld.state?.en || 0) - probeVirtualEnByU[u])
     }
   }
 
@@ -3341,7 +3783,7 @@ function optimizeAndSimulateSequence(adapter, {
     const minGapBucket = R.WORLD?.minGap || 2
     const bucketEndSec = u + 1 < L ? seqBuckets[u + 1].atSec : tH
     const maxBatchesInBucket = 1 + Math.floor(Math.max(0, bucketEndSec - b.atSec) / minGapBucket)
-    const maxBucketActions = Math.min(200, maxBatchesInBucket * maxSingleBatch)
+    const maxBucketActions = Math.min(400, maxBatchesInBucket * maxSingleBatch)
 
     const pushAndSim = (candActs) => {
       if (!candActs || candActs.length === 0) return
@@ -3390,8 +3832,9 @@ function optimizeAndSimulateSequence(adapter, {
       }
     }
 
-    // 1. Execute pre-actions (CapEx, traps, barn, plots, cargo stockBuy, goals)
-    pushAndSim(preActionsByU[u])
+    // 1. Execute zero-stamina pre-actions first (`CapEx`, `trap`, `collect`/`pet`, working-capital `sell`, cargo `stockBuy`)
+    pushAndSim(earlyZeroEnPreByU[u])
+    pushAndSim(cargoPreByU[u])
 
     const directSaleOnlyValue = (stState, id, q = 0, extraSc = 0) => {
       const qual = R.QUALITY?.[q] ?? 1
@@ -3596,7 +4039,7 @@ function optimizeAndSimulateSequence(adapter, {
     ) => {
       const s = stWorld.state
       const freeCash = Math.max(0, Number(stWorld.coins || 0) - Number(constraints.cashReserveFloor || 0))
-      const actionRoom = fullIsleQuotas ? 200 : Math.max(0, maxBucketActions - bucketActs.length)
+      const actionRoom = fullIsleQuotas ? 400 : Math.max(0, maxBucketActions - bucketActs.length)
       const items = [] // Array<{ kind, costEn, gain, craftSteps, cashCost }>
 
       // A) Unreserved Craft units (cached unless an `eat` action consumed a recipe ingredient!)
@@ -3661,7 +4104,7 @@ function optimizeAndSimulateSequence(adapter, {
             && Number(s.en || 0) < (Number.isFinite(enCapCheck) && enCapCheck > 0 ? enCapCheck : 100)
 
           if (!hasBetterWindowLaterSameIsle) {
-            const capCasts = fullIsleQuotas ? fishLeft : Math.min(fishLeft, Math.min(16, actionRoom))
+            const capCasts = fullIsleQuotas ? fishLeft : Math.min(fishLeft, actionRoom)
             const haveBait = utilityTokens.baitId ? adapter.availableInv(s, utilityTokens.baitId, 0) : 0
             const baitPrice = utilityTokens.baitId ? Number(R.SHOP?.[utilityTokens.baitId]?.price || 0) : 0
             let assigned = 0
@@ -3705,7 +4148,7 @@ function optimizeAndSimulateSequence(adapter, {
           const my = expectedMineYieldPerHit(adapter, s, b.isleDay)
           const mv = Object.entries(my.byOre).reduce((acc, [oId, c]) => acc + c * marginalItemValueFn(oId, 0, b.atSec), 0)
           if (mv > 1e-6) {
-            const capHits = fullIsleQuotas ? mineLeft : Math.min(mineLeft, Math.min(20, actionRoom))
+            const capHits = fullIsleQuotas ? mineLeft : Math.min(mineLeft, actionRoom)
             for (let k = 0; k < capHits; k++) {
               items.push({ kind: 'mine', costEn: mineEn, gain: mv })
             }
@@ -3886,20 +4329,278 @@ function optimizeAndSimulateSequence(adapter, {
       return { items, E, bestAtMost, reconstructAt }
     }
 
-    // 2. Exact Post-State Stamina Top-Up (`eat` / `coffee`):
-    //    Every candidate `eat` or `coffee` action is simulated FIRST (`simFood.afterWorld`), and the
-    //    Stamina × Cash Knapsack DP is solved on `simFood.afterWorld` so spent coffee cash (`-15,000 D`)
-    //    and eaten craft ingredients are NEVER double-counted by downstream paid work (`bomb`/`bait`/`craft`)!
+    // 2. Unified Whole-Isle Bellman Stamina Allocation & Multi-Batch Turnover (`eat` / `coffee`):
+    //    Jointly prices Bucket-`u` urgent farm/barn queuing loss (`V_farmCurve`), Bucket-`u` shiftable work,
+    //    and remaining same-isle passive regen + post-midnight coffee across `[u, isleEnd]` with 0 heuristic gates!
     const bucketEnFloor = Number(constraints.staminaReserveFloor || 0) > 0 && b.atSec < Number(constraints.staminaReserveUntilSec || 0)
       ? Math.max(0, Math.floor(Number(constraints.staminaReserveFloor || 0)))
       : 0
 
+    const regenStepU = R.WORLD?.regen || 180
+    const sInitU = execWorld.state
+    const weatherU = R.weatherOf(b.isleDay)
+    const baseEnTU = Math.max(b.atSec, Number(sInitU.enT || b.atSec))
+    const nextOppSecU = Math.min(bucketEndSec > b.atSec ? bucketEndSec : b.atSec + regenStepU, baseEnTU + regenStepU)
+
+    // 2a. Build ordered Bucket-`u` urgent farm & barn tasks (`harvest` -> `clear` -> `plant` -> hungry `feed` -> expiring `water`)
+    const urgentTasks = []
+    const harvestTasks = []
+    const clearTasks = []
+    const expiringWaterTasks = []
+    const plotWillBeEmptyAfterHC = new Uint8Array(Math.max(0, sInitU.plotN || 0))
+
+    const exactManualWaterGain = (cropId, curW, remLeftSec, plotRatePerSec) => {
+      const w0 = Math.max(0, Math.min(2, Number(curW || 0)))
+      const w1 = w0 + 1
+      const v0 = marginalItemValueFn(cropId, 0, b.atSec)
+      const v1 = marginalItemValueFn(cropId, 1, b.atSec)
+      const v2 = marginalItemValueFn(cropId, 2, b.atSec)
+      const expVal = (w) => {
+        const g = 0.05 + 0.1 * w
+        const sv = 0.2 + 0.08 * w
+        const q0 = Math.max(0, 1 - g - sv)
+        return (1.3 + 0.08 * w) * (q0 * v0 + sv * v1 + g * v2)
+      }
+      return Math.max(0, expVal(w1) - expVal(w0)) + Math.max(0, plotRatePerSec) * Math.floor(Math.max(0, Number(remLeftSec || 0)) * 0.25)
+    }
+
+    for (let i = 0; i < (sInitU.plotN || 0); i++) {
+      const p = sInitU.plots?.[i]
+      if (!p) {
+        plotWillBeEmptyAfterHC[i] = 1
+        continue
+      }
+      const isSpr = R.sprinkled(sInitU, i)
+      const auto = isSpr || weatherU === 1
+      const st = R.cropStage(p, b.atSec, auto)
+      const bestNextP = allowedSet.has('plant')
+        ? selectBestCropToPlant(adapter, {
+            state: sInitU,
+            plotIdx: i,
+            atSec: b.atSec,
+            tEnd: tH,
+            marginalItemValueFn,
+            staminaPointCost: baseStaminaShadowCost,
+            enforceHorizonCutoff: objectiveCfg.terminalSupplyMode === 'zero',
+          })
+        : null
+      const fallbackRate = p.c && graph.cropsById.has(p.c)
+        ? marginalItemValueFn(p.c, 0, b.atSec) / Math.max(1800, (graph.cropsById.get(p.c).grow || 120) * 60)
+        : 0.02
+      const rPlot = Math.max(0.01, bestNextP ? bestNextP.netRatePerSec : fallbackRate)
+
+      if (st.stage === 3 && allowedSet.has('harvest')) {
+        const cropDef = graph.cropsById.get(p.c)
+        const staysRegrow = !!(cropDef?.regrow && Number(p.h || 0) + 1 < Number(cropDef.times || 1))
+        if (!staysRegrow) plotWillBeEmptyAfterHC[i] = 1
+        const timing = adapter.exactPlotTimings(p, isSpr, b.atSec, startWorld.clockStart, { isAlreadyRipe: true })
+        const unlockAt = timing ? timing.unlockAt : b.atSec + 1800
+        const protectSec = Math.max(600, timing?.protectSec || 1800)
+        const wEff = auto ? 3 : Number(p.w || 0)
+        const unstolenExtra = !(p.sv && p.sv.length > 0) ? (0.3 + 0.08 * wEff) : 0
+        const stealLossCap = unstolenExtra * marginalItemValueFn(p.c, 0, b.atSec)
+        harvestTasks.push({
+          kind: 'harvest',
+          i,
+          costEn: R.WORLD?.cost?.harvest ?? 1,
+          ratePerSec: rPlot,
+          unlockAt,
+          protectSec,
+          stealLossCap,
+          sortPriority: rPlot + (b.atSec >= unlockAt ? stealLossCap / protectSec : (stealLossCap * 0.25) / protectSec),
+        })
+      } else if (st.stage === -1 && allowedSet.has('clear')) {
+        plotWillBeEmptyAfterHC[i] = 1
+        clearTasks.push({
+          kind: 'clear',
+          i,
+          costEn: R.WORLD?.cost?.clear ?? 1,
+          ratePerSec: rPlot,
+          sortPriority: rPlot,
+        })
+      } else if (st.stage >= 0 && st.stage < 3 && !auto && p.w <= st.stage && allowedSet.has('water')) {
+        const stageEndSec = Number(p.t || b.atSec) + Math.ceil((Number(st.total || 3600) * (st.stage + 1)) / 3)
+        if (stageEndSec <= nextOppSecU) {
+          const dw = exactManualWaterGain(p.c, p.w, st.left, rPlot)
+          if (dw > 1e-6) {
+            expiringWaterTasks.push({
+              kind: 'water-expiring',
+              i,
+              costEn: R.WORLD?.cost?.water ?? 1,
+              fixedLossIfUnfunded: dw,
+            })
+          }
+        }
+      }
+    }
+
+    harvestTasks.sort((a, b2) => b2.sortPriority - a.sortPriority || a.i - b2.i)
+    clearTasks.sort((a, b2) => b2.sortPriority - a.sortPriority || a.i - b2.i)
+    urgentTasks.push(...harvestTasks, ...clearTasks)
+
+    if (allowedSet.has('plant') && (u > 0 || enableFirstBucketPlant)) {
+      const plantCostEn = R.WORLD?.cost?.plant ?? 2
+      let simPlantCash = Math.max(0, Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0))
+      const freeSeedCounts = new Map()
+      const plantTasks = []
+      for (let i = 0; i < (sInitU.plotN || 0); i++) {
+        if (!plotWillBeEmptyAfterHC[i]) continue
+        const bestP = selectBestCropToPlant(adapter, {
+          state: sInitU,
+          plotIdx: i,
+          atSec: b.atSec,
+          tEnd: tH,
+          marginalItemValueFn,
+          staminaPointCost: baseStaminaShadowCost,
+          enforceHorizonCutoff: objectiveCfg.terminalSupplyMode === 'zero',
+        })
+        if (!bestP) continue
+        const sdId = `sd_${bestP.crop.id}`
+        if (!freeSeedCounts.has(sdId)) freeSeedCounts.set(sdId, adapter.availableInv(sInitU, sdId, 0))
+        const remFreeSd = freeSeedCounts.get(sdId) || 0
+        const costCash = remFreeSd > 0 ? 0 : Number(bestP.crop.seed || 0)
+        if (costCash > simPlantCash) continue
+        if (remFreeSd > 0) freeSeedCounts.set(sdId, remFreeSd - 1)
+        simPlantCash -= costCash
+        plantTasks.push({
+          kind: 'plant',
+          i,
+          crop: bestP.crop,
+          costEn: plantCostEn,
+          ratePerSec: Math.max(0.01, bestP.netRatePerSec),
+          npv: Math.max(0, bestP.netPresentValue),
+        })
+      }
+      plantTasks.sort((a, b2) => b2.ratePerSec - a.ratePerSec || a.i - b2.i)
+      urgentTasks.push(...plantTasks)
+    }
+
+    if (allowedSet.has('feed') && utilityTokens.feedId) {
+      let simFeedHave = adapter.availableInv(sInitU, utilityTokens.feedId, 0)
+      let simFeedCash = Math.max(0, Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0))
+      const feedPrice = Number(R.SHOP?.[utilityTokens.feedId]?.price || 150)
+      for (let i = 0; i < (sInitU.barn?.length || 0); i++) {
+        const pen = sInitU.barn[i]
+        if (!pen || R.b12AnimalStage(pen, b.atSec).retired) continue
+        const hungryAt = pen.f + 86400
+        if (b.atSec - pen.f >= 8 * 3600 && (hungryAt <= bucketEndSec || b.atSec >= hungryAt)) {
+          if (simFeedHave > 0) simFeedHave--
+          else if (allowedSet.has('buy') && simFeedCash >= feedPrice) simFeedCash -= feedPrice
+          else continue
+          const def = graph.animalsById.get(pen.k)
+          const prodVal = def ? marginalItemValueFn(def.product, 0, b.atSec) : 500
+          const periodSec = Math.max(3600, R.b12AnimalPeriod?.(pen.k, b.atSec) || 28800)
+          urgentTasks.push({
+            kind: 'feed',
+            i,
+            costEn: R.WORLD?.cost?.feed ?? 1,
+            hungryAt,
+            haltRatePerSec: Math.max(0.005, prodVal / periodSec),
+          })
+        }
+      }
+    }
+
+    expiringWaterTasks.sort((a, b2) => b2.fixedLossIfUnfunded - a.fixedLossIfUnfunded || a.i - b2.i)
+    urgentTasks.push(...expiringWaterTasks)
+
+    const urgentFarmEn = urgentTasks.reduce((sAcc, t) => sAcc + t.costEn, 0)
+    const evalUnfundedFarmLoss = (fundedEn) => {
+      let remEF = Math.max(0, Math.floor(fundedEn))
+      let idxT = 0
+      while (idxT < urgentTasks.length && remEF >= urgentTasks[idxT].costEn) {
+        remEF -= urgentTasks[idxT].costEn
+        idxT++
+      }
+      if (idxT >= urgentTasks.length) return 0
+      let cumRegenNeed = -remEF
+      let totalLoss = 0
+      for (let m = idxT; m < urgentTasks.length; m++) {
+        const t = urgentTasks[m]
+        cumRegenNeed += t.costEn
+        const readySec = Math.max(b.atSec + 1, baseEnTU + Math.max(1, cumRegenNeed) * regenStepU)
+        const waitSec = Math.max(1, readySec - b.atSec)
+        if (t.kind === 'harvest') {
+          const expBefore = Math.max(0, b.atSec - t.unlockAt)
+          const expAfter = Math.max(0, readySec - t.unlockAt)
+          const stealProbDelta = Math.max(0, Math.exp(-expBefore / t.protectSec) - Math.exp(-expAfter / t.protectSec))
+          totalLoss += t.ratePerSec * waitSec + t.stealLossCap * stealProbDelta
+        } else if (t.kind === 'clear') {
+          totalLoss += t.ratePerSec * waitSec
+        } else if (t.kind === 'plant') {
+          const futureSeason = R.seasonOf(R.isleDay(readySec))
+          const losesSeason = futureSeason !== R.seasonOf(b.isleDay) && !(t.crop?.seasons || []).includes(futureSeason)
+          totalLoss += Math.max(t.ratePerSec * waitSec, losesSeason ? t.npv : 0)
+        } else if (t.kind === 'feed') {
+          const haltSec = Math.max(regenStepU, readySec - Math.max(b.atSec, t.hungryAt))
+          totalLoss += t.haltRatePerSec * haltSec
+        } else if (t.kind === 'water-expiring') {
+          totalLoss += t.fixedLossIfUnfunded
+        }
+      }
+      return totalLoss
+    }
+
+    const V_farmCurve = new Float64Array(urgentFarmEn + 1)
+    if (urgentFarmEn > 0) {
+      const lossAtZero = evalUnfundedFarmLoss(0)
+      for (let eF = 1; eF <= urgentFarmEn; eF++) {
+        const gain = Math.max(0, lossAtZero - evalUnfundedFarmLoss(eF))
+        V_farmCurve[eF] = Math.max(V_farmCurve[eF - 1], gain)
+      }
+    }
+
+    // 2b. Compute remaining same-isle passive regen & future urgent farm demand across `[u+1, isleEnd]`
+    const sameIsleFutureIndices = []
+    let futureSameIsleRegenEn = 0
+    let estFutureSameIsleFarmEn = 0
+    let hasPostMidnightSameIsleReset = false
+    let firstPostMidSec = b.atSec
+    for (let fu = u + 1; fu < L; fu++) {
+      if (seqBuckets[fu].isleIndex !== b.isleIndex) break
+      sameIsleFutureIndices.push(fu)
+      if (seqBuckets[fu].naturalDay !== b.naturalDay) {
+        if (!hasPostMidnightSameIsleReset) firstPostMidSec = seqBuckets[fu].atSec
+        hasPostMidnightSameIsleReset = true
+      }
+    }
+    let curRawFishEvForGate = 0
+    let maxFutureSameIsleFishEv = 0
+    if (sameIsleFutureIndices.length > 0) {
+      const rawCapGate = Number(R.energyMax(execWorld.state))
+      const capEGate = Number.isFinite(rawCapGate) && rawCapGate > 0 ? rawCapGate : 100
+      let prevSecGate = baseEnTU
+      for (const fu of sameIsleFutureIndices) {
+        const fSec = seqBuckets[fu].atSec
+        const segRegen = Math.min(capEGate, Math.max(0, Math.floor((fSec - prevSecGate) / regenStepU)))
+        futureSameIsleRegenEn += segRegen
+        prevSecGate += segRegen * regenStepU
+        estFutureSameIsleFarmEn += estUrgentFarmEnByU[fu] || 0
+      }
+      if (allowedSet.has('fish')) {
+        const fyNow = expectedFishYieldPerCast(adapter, execWorld.state, b.atSec, true)
+        curRawFishEvForGate = Object.entries(fyNow.byFish).reduce(
+          (acc, [fId, qs]) => acc + qs[0] * marginalItemValueFn(fId, 0, b.atSec) + qs[1] * marginalItemValueFn(fId, 1, b.atSec) + qs[2] * marginalItemValueFn(fId, 2, b.atSec),
+          0
+        )
+        for (const fu of sameIsleFutureIndices) {
+          const fb = seqBuckets[fu]
+          const fyFut = expectedFishYieldPerCast(adapter, execWorld.state, fb.atSec, true)
+          const fEv = Object.entries(fyFut.byFish).reduce(
+            (acc, [fId, qs]) => acc + qs[0] * marginalItemValueFn(fId, 0, fb.atSec) + qs[1] * marginalItemValueFn(fId, 1, fb.atSec) + qs[2] * marginalItemValueFn(fId, 2, fb.atSec),
+            0
+          )
+          if (fEv > maxFutureSameIsleFishEv) maxFutureSameIsleFishEv = fEv
+        }
+      }
+    }
+
     if (u === 0) {
       const ksNonCraftCurve = solveBucketStaminaKnapsack(execWorld, 600, [], { fullIsleQuotas: true })
       const isleWindowEnd = Math.min(tH, adapter.nextIsleBoundary(b.atSec, startWorld.clockStart))
-      const regenStep = R.WORLD?.regen || 180
-      const regenInIsleWindow = Math.max(0, Math.floor((isleWindowEnd - Number(execWorld.state?.enT || b.atSec)) / regenStep))
-      const preEnSpent0 = Math.max(0, Number(startWorld.state?.en || 0) - Number(execWorld.state?.en || 0))
+      const rawRegenInIsleWindow = Math.max(0, Math.floor((isleWindowEnd - baseEnTU) / regenStepU))
+      const regenInIsleWindow = Math.max(0, rawRegenInIsleWindow - estFutureSameIsleFarmEn)
+      const preEnSpent0 = urgentFarmEn
       const topUpUnits = []
       const s0 = execWorld.state
       const rawCap0 = Number(R.energyMax(s0))
@@ -3956,66 +4657,186 @@ function optimizeAndSimulateSequence(adapter, {
       }
     }
 
-    // Compute remaining same-isle free natural regen & post-midnight coffee capacity across later same-isle buckets
-    // so expensive off-season crops are never eaten prematurely when free overnight regen + post-midnight coffee cover isle quotas!
-    const sameIsleFutureIndices = []
-    let futureSameIsleRegenEn = 0
-    let estFutureSameIslePreEn = 0
-    let hasPostMidnightSameIsleReset = false
-    for (let fu = u + 1; fu < L; fu++) {
-      if (seqBuckets[fu].isleIndex !== b.isleIndex) break
-      sameIsleFutureIndices.push(fu)
-      if (seqBuckets[fu].naturalDay !== b.naturalDay) hasPostMidnightSameIsleReset = true
-    }
-    let curRawFishEvForGate = 0
-    let maxFutureSameIsleFishEv = 0
-    if (sameIsleFutureIndices.length > 0) {
-      const rawCapGate = Number(R.energyMax(execWorld.state))
-      const capEGate = Number.isFinite(rawCapGate) && rawCapGate > 0 ? rawCapGate : 100
-      const regenStepGate = R.WORLD?.regen || 180
-      let prevSecGate = Math.max(b.atSec, Number(execWorld.state?.enT || b.atSec))
-      for (const fu of sameIsleFutureIndices) {
-        const fSec = seqBuckets[fu].atSec
-        const segRegen = Math.min(capEGate, Math.max(0, Math.floor((fSec - prevSecGate) / regenStepGate)))
-        futureSameIsleRegenEn += segRegen
-        prevSecGate += segRegen * regenStepGate
-        for (const pa of preActionsByU[fu] || []) {
-          estFutureSameIslePreEn += Number(R.WORLD?.cost?.[pa.a] || 0)
-        }
-      }
-      if (allowedSet.has('fish')) {
-        const fyNow = expectedFishYieldPerCast(adapter, execWorld.state, b.atSec, true)
-        curRawFishEvForGate = Object.entries(fyNow.byFish).reduce(
-          (acc, [fId, qs]) => acc + qs[0] * marginalItemValueFn(fId, 0, b.atSec) + qs[1] * marginalItemValueFn(fId, 1, b.atSec) + qs[2] * marginalItemValueFn(fId, 2, b.atSec),
-          0
-        )
-        for (const fu of sameIsleFutureIndices) {
-          const fb = seqBuckets[fu]
-          const fyFut = expectedFishYieldPerCast(adapter, execWorld.state, fb.atSec, true)
-          const fEv = Object.entries(fyFut.byFish).reduce(
-            (acc, [fId, qs]) => acc + qs[0] * marginalItemValueFn(fId, 0, fb.atSec) + qs[1] * marginalItemValueFn(fId, 1, fb.atSec) + qs[2] * marginalItemValueFn(fId, 2, fb.atSec),
-            0
-          )
-          if (fEv > maxFutureSameIsleFishEv) maxFutureSameIsleFishEv = fEv
-        }
-      }
-    }
-
     let planWorld = adapter.cloneWorld(execWorld)
     let planBundles = cachedCraftBundles
     const plannedTopUpActs = []
+    const baseSpendableEn = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor)
+    let addedCoffeeEn = 0
+    let addedExpiringSnackEn = 0
 
-    if (allowedSet.has('eat') || allowedSet.has('coffee')) {
-      const futureCraftNeedByItem = {}
-      for (let fu = u + 1; fu < jointCS.craftsByBucket.length; fu++) {
-        for (const ca of jointCS.craftsByBucket[fu] || []) {
-          const rec = graph.recipesById.get(ca.id)
-          for (const [inId, perU] of Object.entries(rec?.in || {})) {
-            futureCraftNeedByItem[inId] = (futureCraftNeedByItem[inId] || 0) + perU * Number(ca.n || 1)
+    const futureCraftNeedByItem = {}
+    for (let fu = u + 1; fu < jointCS.craftsByBucket.length; fu++) {
+      for (const ca of jointCS.craftsByBucket[fu] || []) {
+        const rec = graph.recipesById.get(ca.id)
+        for (const [inId, perU] of Object.entries(rec?.in || {})) {
+          futureCraftNeedByItem[inId] = (futureCraftNeedByItem[inId] || 0) + perU * Number(ca.n || 1)
+        }
+      }
+    }
+
+    const freeFutureSameIsleEn = Math.max(0, futureSameIsleRegenEn - estFutureSameIsleFarmEn)
+    const coffeePrice = R.WORLD?.coffee?.price || 15000
+    const coffeeEnGain = R.WORLD?.coffee?.energy || 60
+    const postMidDisc = discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, firstPostMidSec - t0))
+    const fishCostEnU = Math.max(1, R.WORLD?.cost?.fish ?? 4)
+    const usedFishU = sInitU.iq?.d === b.isleIndex ? Number(sInitU.iq.fish || 0) : 0
+    const remFishU = Math.max(0, (R.WORLD?.daily?.fish || 80) - usedFishU)
+
+    // Exact marginal value of lumpy stamina (`coffee` / expiring snack) carrying across `nextIsleBoundary`
+    let nextIsleCarryValuePerEn = 0
+    {
+      let nextIsleBucket = null
+      for (let fu = u + 1; fu < L; fu++) {
+        if (seqBuckets[fu].isleIndex > b.isleIndex) {
+          nextIsleBucket = seqBuckets[fu]
+          break
+        }
+      }
+      if (nextIsleBucket) {
+        const nextIsleDisc = discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, nextIsleBucket.atSec - t0))
+        let bestNextWorkPerEn = 0
+        if (allowedSet.has('mine') && Number(sInitU.mine?.max || 0) > 0) {
+          const mCost = Math.max(1, R.WORLD?.cost?.mine ?? 3)
+          const oy = expectedMineYieldPerHit(adapter, sInitU, nextIsleBucket.isleDay)
+          let oreEv = 0
+          for (const [oId, qty] of Object.entries(oy.byOre || {})) {
+            oreEv += qty * marginalItemValueFn(oId, 0, nextIsleBucket.atSec)
+          }
+          bestNextWorkPerEn = Math.max(bestNextWorkPerEn, oreEv / mCost)
+        }
+        if (allowedSet.has('fish')) {
+          const fCost = Math.max(1, R.WORLD?.cost?.fish ?? 4)
+          const fyN = expectedFishYieldPerCast(adapter, sInitU, nextIsleBucket.atSec, true)
+          let fishEv = 0
+          for (const [fId, qs] of Object.entries(fyN.byFish || {})) {
+            fishEv += qs[0] * marginalItemValueFn(fId, 0, nextIsleBucket.atSec)
+              + qs[1] * marginalItemValueFn(fId, 1, nextIsleBucket.atSec)
+              + qs[2] * marginalItemValueFn(fId, 2, nextIsleBucket.atSec)
+          }
+          const baitPrice = Number(R.SHOP?.[utilityTokens.baitId]?.price || 80) * nextIsleDisc
+          bestNextWorkPerEn = Math.max(bestNextWorkPerEn, Math.max(0, fishEv - baitPrice) / fCost)
+        }
+        const nextCoffeeCpe = allowedSet.has('coffee')
+          ? (coffeePrice * nextIsleDisc) / Math.max(1, coffeeEnGain)
+          : Infinity
+        nextIsleCarryValuePerEn = Math.min(bestNextWorkPerEn, nextCoffeeCpe)
+      } else if (objectiveCfg.terminalSupplyMode !== 'zero') {
+        const termDisc = discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, tH - t0))
+        nextIsleCarryValuePerEn = Math.max(0, Number(objectiveCfg.energyTerminalCreditPerPoint || 0)) * termDisc
+      }
+    }
+
+    let sameIsleScheduledSaleCash = 0
+    if (hasPostMidnightSameIsleReset && allowedSet.has('sell') && jointCS?.salePortfolio?.perItemSchedules) {
+      const sameIsleSlotSet = new Set(sameIsleFutureIndices)
+      for (const [id, sched] of jointCS.salePortfolio.perItemSchedules.entries()) {
+        for (const fu of sameIsleSlotSet) {
+          const row = sched.sellsBySlot?.[fu]
+          if (!row) continue
+          const pQuote = Number(slots[fu]?.prices?.[id] || 0)
+          if (!(pQuote > 0)) continue
+          const cropMult = graph.cropsById.has(id) ? 0.85 : 1.0
+          for (let q = 0; q < 3; q++) {
+            if (row[q] > 0) {
+              sameIsleScheduledSaleCash += row[q] * Math.round(pQuote * (R.QUALITY?.[q] ?? 1)) * cropMult
+            }
           }
         }
       }
+    }
 
+    const evalWholeIsleObjective = (
+      ksLocal,
+      ksIsle,
+      enMaxVal,
+      curCoinsVal,
+      candTotalUEn,
+      candCoffeeEn,
+      candExpiringSnackEn = 0
+    ) => {
+      const freeOvernightWorkCash = (allowedSet.has('sell') && ksIsle && freeFutureSameIsleEn > 0)
+        ? ksIsle.bestAtMost[Math.min(ksIsle.E, freeFutureSameIsleEn)]
+        : 0
+      const postMidCashAvail = curCoinsVal + sameIsleScheduledSaleCash + freeOvernightWorkCash
+      const postMidCoffeeCap = (hasPostMidnightSameIsleReset && allowedSet.has('coffee'))
+        ? Math.min(
+            R.WORLD?.daily?.coffee || 3,
+            Math.floor(Math.max(0, postMidCashAvail - Number(constraints.cashReserveFloor || 0)) / coffeePrice)
+          )
+        : 0
+      const maxEF = Math.min(urgentFarmEn, Math.max(0, Math.floor(candTotalUEn)))
+      let bestVal = -1e18
+      let bestEF = 0
+      for (let eF = 0; eF <= maxEF; eF++) {
+        const remAfterFarm = Math.max(0, candTotalUEn - eF)
+        let shiftVal = 0
+        if (sameIsleFutureIndices.length === 0 || !ksIsle) {
+          const usedLocal = Math.min(ksLocal.E, remAfterFarm)
+          const lumpySpillCap = Math.min(enMaxVal, candCoffeeEn + candExpiringSnackEn)
+          const carryNext = Math.min(lumpySpillCap, Math.max(0, remAfterFarm - usedLocal))
+          shiftVal = ksLocal.bestAtMost[usedLocal] + carryNext * nextIsleCarryValuePerEn
+        } else {
+          const eLocal = Math.min(ksLocal.E, remAfterFarm)
+          const maxCarryOut = Math.max(
+            Math.max(0, baseSpendableEn - eF - eLocal),
+            Math.max(0, enMaxVal - bucketEnFloor)
+          ) + candCoffeeEn
+          const eShiftIsle = eLocal + Math.min(Math.max(0, remAfterFarm - eLocal), maxCarryOut)
+          let wIsle = -1e18
+          for (let kC = 0; kC <= postMidCoffeeCap; kC++) {
+            const cov = eShiftIsle + freeFutureSameIsleEn + kC * coffeeEnGain
+            const lumpySpillCap = Math.min(enMaxVal, candCoffeeEn + kC * coffeeEnGain + candExpiringSnackEn)
+            const carryNext = Math.min(lumpySpillCap, Math.max(0, cov - ksIsle.E))
+            const candW = ksIsle.bestAtMost[Math.min(ksIsle.E, cov)]
+              - kC * coffeePrice * postMidDisc
+              + carryNext * nextIsleCarryValuePerEn
+            if (candW > wIsle) wIsle = candW
+          }
+          if (allowedSet.has('fish') && curRawFishEvForGate > maxFutureSameIsleFishEv + 1e-6 && remFishU > 0) {
+            const castsNow = Math.min(remFishU, Math.floor(eShiftIsle / fishCostEnU))
+            wIsle += castsNow * (curRawFishEvForGate - maxFutureSameIsleFishEv)
+          }
+          shiftVal = Math.max(0, wIsle)
+        }
+        const tot = V_farmCurve[eF] + shiftVal
+        if (tot > bestVal + 1e-9) {
+          bestVal = tot
+          bestEF = eF
+        }
+      }
+      return { bestVal: Math.max(0, bestVal), bestEF }
+    }
+
+    const computeIsleWorkCapEn = (st) => {
+      const iq = st?.iq?.d === b.isleIndex ? st.iq : {}
+      const mLeft = allowedSet.has('mine') ? Math.max(0, (R.WORLD?.daily?.mine || 100) - Number(iq.mine || 0)) : 0
+      const fLeft = allowedSet.has('fish') ? Math.max(0, (R.WORLD?.daily?.fish || 80) - Number(iq.fish || 0)) : 0
+      const bLeft = allowedSet.has('bomb') ? Math.max(0, (R.WORLD?.daily?.bomb || 10) - Number(iq.bomb || 0)) : 0
+      const cLeft = allowedSet.has('craft') ? Math.max(0, (R.WORLD?.daily?.craft || 80) - Number(iq.craft || 0)) : 0
+      return Math.min(
+        900,
+        Math.max(
+          1,
+          mLeft * (R.WORLD?.cost?.mine ?? 3)
+            + fLeft * (R.WORLD?.cost?.fish ?? 4)
+            + bLeft * (R.WORLD?.cost?.bomb ?? 6)
+            + cLeft * (R.WORLD?.cost?.craft ?? 1)
+        )
+      )
+    }
+
+    const computeLocalReachCapEn = (st, enMaxVal) => {
+      const curE = Math.max(0, Math.floor(Number(st?.en || 0)))
+      const cLeft = allowedSet.has('coffee')
+        ? Math.max(0, (R.WORLD?.daily?.coffee || 3) - Number(st?.cnt?.coffee || 0))
+        : 0
+      return Math.min(
+        900,
+        Math.max(1, Math.max(curE, enMaxVal) - bucketEnFloor + cLeft * coffeeEnGain)
+      )
+    }
+
+    if (allowedSet.has('eat') || allowedSet.has('coffee')) {
       const rawPoolAfterCraftReserve = (qCounts, craftReserve) => {
         const rem = [qCounts[0], qCounts[1], qCounts[2]]
         let keep = craftReserve
@@ -4027,65 +4848,49 @@ function optimizeAndSimulateSequence(adapter, {
         return rem
       }
 
-      const nextBucketChangesNatDay = u + 1 < L && seqBuckets[u + 1].naturalDay !== b.naturalDay
+      let cachedKsLocal = null
       let cachedKsIsleFull = null
-      let cachedKsIsleCoins = -1
-      let cachedKsIsleBundles = null
+      let cachedKsCoins = -1
+      let cachedKsBundles = null
+      let cachedLocalCap = 0
 
-      for (let topStep = 0; topStep < 24 && bucketActs.length + plannedTopUpActs.length < maxBucketActions - 4; topStep++) {
+      for (let topStep = 0; topStep < 32 && bucketActs.length + plannedTopUpActs.length < maxBucketActions - 4; topStep++) {
         const s = planWorld.state
         const curEn = Math.max(0, Math.floor(Number(s.en || 0)))
-        const spendableCurEn = Math.max(0, curEn - bucketEnFloor)
         const rawEnMax = Number(R.energyMax(s))
         const enMax = Number.isFinite(rawEnMax) && rawEnMax > 0 ? rawEnMax : 100
-        const ksEatBase = solveBucketStaminaKnapsack(
-          planWorld,
-          Math.max(spendableCurEn, Math.max(0, enMax - bucketEnFloor), Math.max(0, curEn + (R.WORLD?.coffee?.energy || 60) - bucketEnFloor)),
-          planBundles
-        )
-        const baseVal = ksEatBase.bestAtMost[Math.min(ksEatBase.E, spendableCurEn)]
+        const curTotalUEn = Math.max(0, curEn - bucketEnFloor)
+        const curCoinsNow = Number(planWorld.coins || 0)
+        const reqLocalCap = computeLocalReachCapEn(s, enMax)
 
-        if (sameIsleFutureIndices.length > 0) {
-          const curCoinsNow = Number(planWorld.coins || 0)
-          if (!cachedKsIsleFull || curCoinsNow !== cachedKsIsleCoins || planBundles !== cachedKsIsleBundles) {
-            cachedKsIsleFull = solveBucketStaminaKnapsack(planWorld, 800, planBundles, {
+        if (!cachedKsLocal || curCoinsNow !== cachedKsCoins || planBundles !== cachedKsBundles || reqLocalCap > cachedLocalCap) {
+          cachedKsLocal = solveBucketStaminaKnapsack(planWorld, reqLocalCap, planBundles)
+          cachedLocalCap = reqLocalCap
+          if (sameIsleFutureIndices.length > 0) {
+            cachedKsIsleFull = solveBucketStaminaKnapsack(planWorld, computeIsleWorkCapEn(s), planBundles, {
               fullIsleQuotas: true,
               fishEvOverride: allowedSet.has('fish') ? maxFutureSameIsleFishEv : null,
             })
-            cachedKsIsleCoins = curCoinsNow
-            cachedKsIsleBundles = planBundles
           }
+          cachedKsCoins = curCoinsNow
+          cachedKsBundles = planBundles
         }
-        const ksIsleFull = cachedKsIsleFull
-        const freeFutureEn = Math.max(0, futureSameIsleRegenEn - estFutureSameIslePreEn)
-        const coffeePrice = R.WORLD?.coffee?.price || 15000
-        const coffeeEnGain = R.WORLD?.coffee?.energy || 60
-        const coffeeCpe = (coffeePrice * bucketDisc) / Math.max(1, coffeeEnGain)
-        const cheaperPostMidCoffeeEn = (hasPostMidnightSameIsleReset && allowedSet.has('coffee'))
-          ? Math.min(
-              R.WORLD?.daily?.coffee || 3,
-              Math.floor(Math.max(0, Number(planWorld.coins || 0) - Number(constraints.cashReserveFloor || 0)) / coffeePrice)
-            ) * coffeeEnGain
-          : 0
 
-        const capWithIsleWindow = (localDelta, addedEn, avgCpe, isZeroCostExpiringSnack = false) => {
-          if (!ksIsleFull || (isZeroCostExpiringSnack && avgCpe <= 1e-6)) return localDelta
-          const coveredEn = spendableCurEn + freeFutureEn + (avgCpe > coffeeCpe + 1e-6 ? cheaperPostMidCoffeeEn : 0)
-          let isleDelta =
-            ksIsleFull.bestAtMost[Math.min(ksIsleFull.E, coveredEn + addedEn)] -
-            ksIsleFull.bestAtMost[Math.min(ksIsleFull.E, coveredEn)]
-          if (allowedSet.has('fish') && curRawFishEvForGate > maxFutureSameIsleFishEv + 1e-6) {
-            const fishCostEn = Math.max(1, R.WORLD?.cost?.fish ?? 4)
-            const usedFishNow = s.iq?.d === b.isleIndex ? Number(s.iq.fish || 0) : 0
-            const remFishNow = Math.max(0, (R.WORLD?.daily?.fish || 80) - usedFishNow)
-            const alreadyFundedNow = Math.floor(spendableCurEn / fishCostEn)
-            if (remFishNow > alreadyFundedNow) {
-              const extraCasts = Math.min(remFishNow - alreadyFundedNow, Math.ceil(addedEn / fishCostEn))
-              isleDelta += extraCasts * (curRawFishEvForGate - maxFutureSameIsleFishEv)
-            }
-          }
-          return Math.min(localDelta, Math.max(0, isleDelta))
-        }
+        const ksEatBase = cachedKsLocal
+        const ksIsleFull = cachedKsIsleFull
+        const maxUsefulUEn = urgentFarmEn + Math.max(ksEatBase.E, ksIsleFull ? ksIsleFull.E : 0)
+        if (curTotalUEn >= maxUsefulUEn && !allowedSet.has('coffee')) break
+
+        const baseEval = evalWholeIsleObjective(
+          ksEatBase,
+          ksIsleFull,
+          enMax,
+          curCoinsNow,
+          curTotalUEn,
+          addedCoffeeEn,
+          addedExpiringSnackEn
+        )
+        const baseVal = baseEval.bestVal
 
         const curBucketCraftNeedByItem = {}
         for (const cb of planBundles || []) {
@@ -4099,13 +4904,12 @@ function optimizeAndSimulateSequence(adapter, {
 
         let bestFoodAct = null
         let bestFoodBatchCount = 1
+        let bestFoodIsExpiringSnack = false
         let bestAfterBundles = planBundles
         let bestRatio = 1.0
         let bestOppCost = Infinity
 
-        if (allowedSet.has('eat') && curEn < enMax && ksEatBase.E > curEn) {
-          // Build the available non-craft-cannibalizing food pool sorted by unit cost-per-energy (`cpe`),
-          // breaking ties strictly by lower `oppCost` (`q=0` BEFORE `q=1` BEFORE `q=2`!)
+        if (allowedSet.has('eat') && curEn < enMax && curTotalUEn < maxUsefulUEn) {
           const poolEntries = []
           const deferredCraftCutSpecs = []
           for (const spec of edibleSpecs) {
@@ -4116,8 +4920,8 @@ function optimizeAndSimulateSequence(adapter, {
                 )
               : adapter.availableInv(s, spec.id, spec.q)
             if (!(haveQty > 0)) continue
-            const gainEn = Math.min(enMax - curEn, spec.energyGain)
-            if (!(gainEn > 0)) continue
+            const firstGain = Math.min(enMax - curEn, spec.energyGain)
+            if (!(firstGain > 0)) continue
 
             const candAct = spec.kind === 'snack'
               ? { a: 'eat', id: spec.id }
@@ -4139,7 +4943,7 @@ function optimizeAndSimulateSequence(adapter, {
               && totalHold > futNeed
 
             if (cutsIntoCurrentCraft) {
-              deferredCraftCutSpecs.push({ spec, candAct, gainEn })
+              deferredCraftCutSpecs.push({ spec, candAct, stepGain: firstGain })
               continue
             }
 
@@ -4160,15 +4964,15 @@ function optimizeAndSimulateSequence(adapter, {
                 unitOppCost = edibleOpportunityUnitValue(s, spec.id, spec.q)
               }
             }
+            const isExpiringSnack = spec.kind === 'snack' && unitOppCost <= 1e-6
             poolEntries.push({
               spec,
               candAct,
-              count: Math.max(1, Math.min(24, surplusCount)),
+              count: Math.max(1, Math.min(60, surplusCount)),
               rawGain: spec.energyGain,
-              firstGain: gainEn,
               unitOppCost,
-              cpe: unitOppCost / Math.max(1, gainEn),
-              isExpiringSnack: spec.kind === 'snack' && nextBucketChangesNatDay,
+              isExpiringSnack,
+              cpe: unitOppCost / Math.max(1, firstGain),
             })
           }
 
@@ -4178,23 +4982,27 @@ function optimizeAndSimulateSequence(adapter, {
               (a.unitOppCost - b2.unitOppCost) ||
               ((a.spec.q ?? 0) - (b2.spec.q ?? 0))
             )
-            let reachEn = curEn
+            let simEn = curEn
             let cumCost = 0
+            let simExpSnackEn = addedExpiringSnackEn
             for (const pe of poolEntries) {
-              for (let k = 0; k < pe.count && reachEn < enMax; k++) {
-                const stepGain = Math.min(enMax - reachEn, pe.rawGain)
-                if (!(stepGain > 0)) break
-                reachEn += stepGain
+              for (let k = 0; k < pe.count && simEn < enMax; k++) {
+                const unitGain = Math.min(enMax - simEn, pe.rawGain)
+                if (!(unitGain > 0)) break
+                simEn += unitGain
+                const reachTotalUEn = Math.max(0, simEn - bucketEnFloor)
                 cumCost += pe.unitOppCost
-                const addedEn = Math.max(1, reachEn - curEn)
-                const workAtReach = ksEatBase.bestAtMost[Math.min(ksEatBase.E, Math.max(0, reachEn - bucketEnFloor))]
-                const rawDeltaWork = workAtReach - baseVal
-                const deltaWork = capWithIsleWindow(
-                  rawDeltaWork,
-                  addedEn,
-                  cumCost / addedEn,
-                  poolEntries[0].isExpiringSnack
+                if (pe.isExpiringSnack) simExpSnackEn += unitGain
+                const candEval = evalWholeIsleObjective(
+                  ksEatBase,
+                  ksIsleFull,
+                  enMax,
+                  curCoinsNow,
+                  reachTotalUEn,
+                  addedCoffeeEn,
+                  simExpSnackEn
                 )
+                const deltaWork = candEval.bestVal - baseVal
                 const netImp = deltaWork - cumCost
                 if (netImp > 1e-6) {
                   const firstEntry = poolEntries[0]
@@ -4203,6 +5011,7 @@ function optimizeAndSimulateSequence(adapter, {
                     bestRatio = ratio
                     bestOppCost = firstEntry.unitOppCost
                     bestFoodAct = firstEntry.candAct
+                    bestFoodIsExpiringSnack = firstEntry.isExpiringSnack
                     const maxRoom = Math.max(
                       1,
                       Math.min(R.WORLD?.maxActions || 40, maxBucketActions - 4 - bucketActs.length - plannedTopUpActs.length)
@@ -4211,16 +5020,25 @@ function optimizeAndSimulateSequence(adapter, {
                     bestAfterBundles = planBundles
                   }
                 }
+                if (reachTotalUEn >= maxUsefulUEn && !pe.isExpiringSnack) break
               }
             }
           }
 
           // Evaluate craft-cannibalizing candidates ONLY if their exact weak-dominance upper bound beats `oppCost` and `bestRatio`
-          for (const { spec, candAct, gainEn } of deferredCraftCutSpecs) {
+          for (const { spec, candAct, stepGain } of deferredCraftCutSpecs) {
             const oppCost = edibleOpportunityUnitValue(s, spec.id, spec.q)
-            const optimisticAfterEn = Math.max(0, Math.min(enMax, curEn + gainEn) - bucketEnFloor)
-            const rawOptimisticDelta = ksEatBase.bestAtMost[Math.min(ksEatBase.E, optimisticAfterEn)] - baseVal
-            const optimisticDelta = capWithIsleWindow(rawOptimisticDelta, gainEn, oppCost / Math.max(1, gainEn), false)
+            const nextTotalUEn = Math.max(0, Math.min(enMax, curEn + stepGain) - bucketEnFloor)
+            const optEval = evalWholeIsleObjective(
+              ksEatBase,
+              ksIsleFull,
+              enMax,
+              curCoinsNow,
+              nextTotalUEn,
+              addedCoffeeEn,
+              addedExpiringSnackEn
+            )
+            const optimisticDelta = optEval.bestVal - baseVal
             if (optimisticDelta - oppCost <= 1e-6) continue
             const optimisticRatio = oppCost <= 1e-6 ? 1e12 + (optimisticDelta - oppCost) : optimisticDelta / oppCost
             if (
@@ -4233,14 +5051,25 @@ function optimizeAndSimulateSequence(adapter, {
             const simFood = adapter.simulateBatch(planWorld, [candAct], { t: b.atSec, prices: dynamicPrices })
             if (!simFood.allOk) continue
             const afterW = simFood.afterWorld
-            const afterEn = Math.max(0, Math.floor(Number(afterW.state?.en || 0)))
-            if (afterEn <= curEn) continue
-            const spendableAfterEn = Math.max(0, afterEn - bucketEnFloor)
             const afterBundles = computeBucketCraftBundles(afterW)
-            const ksAfter = solveBucketStaminaKnapsack(afterW, spendableAfterEn, afterBundles)
-            const newVal = ksAfter.bestAtMost[Math.min(ksAfter.E, spendableAfterEn)]
-            const rawDeltaWorkVal = newVal - baseVal
-            const deltaWorkVal = capWithIsleWindow(rawDeltaWorkVal, afterEn - curEn, oppCost / Math.max(1, afterEn - curEn), false)
+            const ksAfterLocal = solveBucketStaminaKnapsack(afterW, computeLocalReachCapEn(afterW.state, enMax), afterBundles)
+            const ksAfterIsle = sameIsleFutureIndices.length > 0
+              ? solveBucketStaminaKnapsack(afterW, computeIsleWorkCapEn(afterW.state), afterBundles, {
+                  fullIsleQuotas: true,
+                  fishEvOverride: allowedSet.has('fish') ? maxFutureSameIsleFishEv : null,
+                })
+              : null
+            const afterTotalUEn = Math.max(0, Math.floor(Number(afterW.state?.en || 0)) - bucketEnFloor)
+            const afterEval = evalWholeIsleObjective(
+              ksAfterLocal,
+              ksAfterIsle,
+              enMax,
+              Number(afterW.coins || 0),
+              afterTotalUEn,
+              addedCoffeeEn,
+              addedExpiringSnackEn
+            )
+            const deltaWorkVal = afterEval.bestVal - baseVal
             const netImprovement = deltaWorkVal - oppCost
             if (netImprovement > 1e-6) {
               const ratio = oppCost <= 1e-6 ? 1e12 + netImprovement : deltaWorkVal / oppCost
@@ -4248,6 +5077,7 @@ function optimizeAndSimulateSequence(adapter, {
                 bestRatio = ratio
                 bestOppCost = oppCost
                 bestFoodAct = candAct
+                bestFoodIsExpiringSnack = false
                 bestFoodBatchCount = 1
                 bestAfterBundles = afterBundles
               }
@@ -4258,12 +5088,20 @@ function optimizeAndSimulateSequence(adapter, {
         if (
           allowedSet.has('coffee') &&
           Number(s.cnt?.coffee || 0) < (R.WORLD?.daily?.coffee || 3) &&
-          Number(planWorld.coins || 0) - Number(constraints.cashReserveFloor || 0) >= coffeePrice
+          curCoinsNow - Number(constraints.cashReserveFloor || 0) >= coffeePrice
         ) {
           const oppCost = coffeePrice * bucketDisc
-          const optimisticCoffeeEn = Math.max(0, curEn + coffeeEnGain - bucketEnFloor)
-          const rawOptCoffeeDelta = ksEatBase.bestAtMost[Math.min(ksEatBase.E, optimisticCoffeeEn)] - baseVal
-          const optimisticCoffeeDelta = capWithIsleWindow(rawOptCoffeeDelta, coffeeEnGain, oppCost / Math.max(1, coffeeEnGain), false)
+          const nextCoffeeTotalUEn = Math.max(0, curEn + coffeeEnGain - bucketEnFloor)
+          const optCoffeeEval = evalWholeIsleObjective(
+            ksEatBase,
+            ksIsleFull,
+            enMax,
+            curCoinsNow - coffeePrice,
+            nextCoffeeTotalUEn,
+            addedCoffeeEn + coffeeEnGain,
+            addedExpiringSnackEn
+          )
+          const optimisticCoffeeDelta = optCoffeeEval.bestVal - baseVal
           const optimisticCoffeeRatio = optimisticCoffeeDelta / Math.max(1e-9, oppCost)
           if (
             optimisticCoffeeDelta - oppCost > 1e-6 &&
@@ -4273,12 +5111,24 @@ function optimizeAndSimulateSequence(adapter, {
             const simFood = adapter.simulateBatch(planWorld, [candAct], { t: b.atSec, prices: dynamicPrices })
             if (simFood.allOk) {
               const afterW = simFood.afterWorld
-              const afterEn = Math.max(0, Math.floor(Number(afterW.state?.en || 0)))
-              const spendableCoffeeEn = Math.max(0, afterEn - bucketEnFloor)
-              const ksAfter = solveBucketStaminaKnapsack(afterW, spendableCoffeeEn, planBundles)
-              const newVal = ksAfter.bestAtMost[Math.min(ksAfter.E, spendableCoffeeEn)]
-              const rawDeltaWorkVal = newVal - baseVal
-              const deltaWorkVal = capWithIsleWindow(rawDeltaWorkVal, afterEn - curEn, oppCost / Math.max(1, afterEn - curEn), false)
+              const ksAfterLocal = solveBucketStaminaKnapsack(afterW, computeLocalReachCapEn(afterW.state, enMax), planBundles)
+              const ksAfterIsle = sameIsleFutureIndices.length > 0
+                ? solveBucketStaminaKnapsack(afterW, computeIsleWorkCapEn(afterW.state), planBundles, {
+                    fullIsleQuotas: true,
+                    fishEvOverride: allowedSet.has('fish') ? maxFutureSameIsleFishEv : null,
+                  })
+                : null
+              const afterCoffeeUEn = Math.max(0, Math.floor(Number(afterW.state?.en || 0)) - bucketEnFloor)
+              const afterEval = evalWholeIsleObjective(
+                ksAfterLocal,
+                ksAfterIsle,
+                enMax,
+                Number(afterW.coins || 0),
+                afterCoffeeUEn,
+                addedCoffeeEn + coffeeEnGain,
+                addedExpiringSnackEn
+              )
+              const deltaWorkVal = afterEval.bestVal - baseVal
               const netImprovement = deltaWorkVal - oppCost
               if (netImprovement > 1e-6) {
                 const ratio = deltaWorkVal / oppCost
@@ -4286,6 +5136,7 @@ function optimizeAndSimulateSequence(adapter, {
                   bestRatio = ratio
                   bestOppCost = oppCost
                   bestFoodAct = candAct
+                  bestFoodIsExpiringSnack = false
                   bestFoodBatchCount = 1
                   bestAfterBundles = planBundles
                 }
@@ -4295,29 +5146,83 @@ function optimizeAndSimulateSequence(adapter, {
         }
 
         if (!bestFoodAct) break
-        const chosenFoodBatch = bestFoodBatchCount > 1
-          ? Array.from({ length: bestFoodBatchCount }, () => bestFoodAct)
-          : [bestFoodAct]
-        const simChosen = adapter.simulateBatch(planWorld, chosenFoodBatch, { t: b.atSec, prices: dynamicPrices })
-        if (!simChosen.allOk) {
-          if (bestFoodBatchCount > 1) {
-            const simOne = adapter.simulateBatch(planWorld, [bestFoodAct], { t: b.atSec, prices: dynamicPrices })
-            if (!simOne.allOk) break
-            planWorld = simOne.afterWorld
-            plannedTopUpActs.push(bestFoodAct)
-            planBundles = bestAfterBundles
-            continue
+        if (bestFoodAct.a === 'coffee') {
+          const simC = adapter.simulateBatch(planWorld, [bestFoodAct], { t: b.atSec, prices: dynamicPrices })
+          if (!simC.allOk) break
+          planWorld = simC.afterWorld
+          addedCoffeeEn += coffeeEnGain
+          plannedTopUpActs.push(bestFoodAct)
+          planBundles = bestAfterBundles
+        } else {
+          const prevEn = Math.max(0, Math.floor(Number(planWorld.state?.en || 0)))
+          const subBatch = Array.from({ length: Math.min(bestFoodBatchCount, R.WORLD?.maxActions || 40) }, () => bestFoodAct)
+          const simSub = simulateValidBatch(adapter, planWorld, subBatch, { t: b.atSec, prices: dynamicPrices })
+          if (simSub.validActions.length === 0) break
+          planWorld = simSub.afterWorld
+          const newEn = Math.max(0, Math.floor(Number(planWorld.state?.en || 0)))
+          if (bestFoodIsExpiringSnack && newEn > prevEn) {
+            addedExpiringSnackEn += newEn - prevEn
           }
-          break
+          for (const va of simSub.validActions) plannedTopUpActs.push(va)
+          planBundles = bestAfterBundles
         }
-        planWorld = simChosen.afterWorld
-        plannedTopUpActs.push(...chosenFoodBatch)
-        planBundles = bestAfterBundles
       }
     }
 
-    // 3. Solve Exact Bucket Stamina Knapsack on `planWorld` and emit `eat` / `coffee` JUST-IN-TIME
-    //    right before the exact action whose stamina cost exceeds `execWorld.state.en - bucketEnFloor`!
+    // Determine exact funded urgent farm budget `fundedUrgentEn` & upcoming maturity reserve `effectiveShiftableFloor`
+    const rawCapFinalU = Number(R.energyMax(planWorld.state))
+    const enMaxFinalU = Number.isFinite(rawCapFinalU) && rawCapFinalU > 0 ? rawCapFinalU : 100
+    const ksFinalPlanLocal = solveBucketStaminaKnapsack(planWorld, computeLocalReachCapEn(planWorld.state, enMaxFinalU), planBundles)
+    const ksFinalPlanIsle = sameIsleFutureIndices.length > 0
+      ? solveBucketStaminaKnapsack(planWorld, computeIsleWorkCapEn(planWorld.state), planBundles, {
+          fullIsleQuotas: true,
+          fishEvOverride: allowedSet.has('fish') ? maxFutureSameIsleFishEv : null,
+        })
+      : null
+    const finalPlanTotalUEn = Math.max(0, Math.floor(Number(planWorld.state?.en || 0)) - bucketEnFloor)
+    const finalAlloc = evalWholeIsleObjective(
+      ksFinalPlanLocal,
+      ksFinalPlanIsle,
+      enMaxFinalU,
+      Number(planWorld.coins || 0),
+      finalPlanTotalUEn,
+      addedCoffeeEn,
+      addedExpiringSnackEn
+    )
+    const fundedUrgentEn = finalAlloc.bestEF
+
+    let farmReserveFloor = 0
+    if (sameIsleFutureIndices.length > 0) {
+      let remUntouchedTopUpEn = 0
+      const sRemP = planWorld.state
+      if (allowedSet.has('eat')) {
+        for (const sp of edibleSpecs) {
+          const qty = sp.kind === 'snack'
+            ? Math.min(adapter.availableInv(sRemP, sp.id, 0), sp.dailyCap != null ? Math.max(0, sp.dailyCap - Number(sRemP.cnt?.[sp.id] || 0)) : 999)
+            : Math.max(0, adapter.availableInv(sRemP, sp.id, sp.q) - Number(futureCraftNeedByItem[sp.id] || 0))
+          if (qty > 0 && sp.energyGain > 0) remUntouchedTopUpEn += qty * sp.energyGain
+        }
+      }
+      if (allowedSet.has('coffee')) {
+        const cLeft = Math.max(0, (R.WORLD?.daily?.coffee || 3) - Number(sRemP.cnt?.coffee || 0))
+        const freeC = Math.max(0, Number(planWorld.coins || 0) - Number(constraints.cashReserveFloor || 0))
+        remUntouchedTopUpEn += Math.min(cLeft, Math.floor(freeC / coffeePrice)) * coffeeEnGain
+      }
+      let cumFutFarm = 0
+      for (const fu of sameIsleFutureIndices) {
+        cumFutFarm += estUrgentFarmEnByU[fu] || 0
+        if (!(cumFutFarm > 0)) continue
+        const regenToFu = Math.max(0, Math.floor((seqBuckets[fu].atSec - baseEnTU) / regenStepU))
+        const noOverflowCap = Math.max(0, enMaxFinalU - Math.min(enMaxFinalU, regenToFu))
+        const needHold = Math.max(0, cumFutFarm - regenToFu - remUntouchedTopUpEn)
+        farmReserveFloor = Math.max(farmReserveFloor, Math.min(noOverflowCap, needHold))
+      }
+    }
+    const effectiveShiftableFloor = sameIsleFutureIndices.length > 0
+      ? Math.max(bucketEnFloor, farmReserveFloor)
+      : bucketEnFloor
+
+    // 3. Interleaved Execution: Urgent Farm Care -> Post-Harvest Craft & Shiftable Work -> Non-Expiring Water -> Goals & Sells
     {
       let topUpCursor = 0
       const edibleGainByKey = new Map()
@@ -4337,24 +5242,37 @@ function optimizeAndSimulateSequence(adapter, {
       }
       const getPendingCoffeeCash = () => {
         let c = 0
-        const cPrice = R.WORLD?.coffee?.price || 15000
         for (let idx = topUpCursor; idx < plannedTopUpActs.length; idx++) {
-          if (plannedTopUpActs[idx].a === 'coffee') c += cPrice
+          if (plannedTopUpActs[idx].a === 'coffee') c += coffeePrice
         }
         return c
       }
-      const ensureExecStamina = (neededSpendableEn) => {
+      const getPendingTopUpEn = (maxEatStepCap) => {
+        let enSum = 0
+        for (let idx = topUpCursor; idx < plannedTopUpActs.length; idx++) {
+          const ta = plannedTopUpActs[idx]
+          if (ta.a === 'coffee') {
+            enSum += coffeeEnGain
+          } else {
+            const g = ta.q != null
+              ? (edibleGainByKey.get(`${ta.id}:${ta.q}`) || 0)
+              : (edibleGainByKey.get(`${ta.id}:snack`) || edibleGainByKey.get(`${ta.id}:0`) || 0)
+            enSum += Math.min(maxEatStepCap, g)
+          }
+        }
+        return enSum
+      }
+      const ensureExecStamina = (neededSpendableEn, activeFloor = bucketEnFloor) => {
         while (topUpCursor < plannedTopUpActs.length) {
           let curExecEn = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)))
-          if (curExecEn - bucketEnFloor >= neededSpendableEn) return
+          if (curExecEn - activeFloor >= neededSpendableEn) return
           const rawCapExec = Number(R.energyMax(execWorld.state))
           const capExec = Number.isFinite(rawCapExec) && rawCapExec > 0 ? rawCapExec : 100
-          const coffeeEnStep = R.WORLD?.coffee?.energy || 60
           const startIdx = topUpCursor
-          while (topUpCursor < plannedTopUpActs.length && curExecEn - bucketEnFloor < neededSpendableEn) {
+          while (topUpCursor < plannedTopUpActs.length && curExecEn - activeFloor < neededSpendableEn) {
             const ta = plannedTopUpActs[topUpCursor]
             if (ta.a === 'coffee') {
-              curExecEn += coffeeEnStep
+              curExecEn += coffeeEnGain
             } else {
               const g = ta.q != null
                 ? (edibleGainByKey.get(`${ta.id}:${ta.q}`) || 0)
@@ -4369,10 +5287,136 @@ function optimizeAndSimulateSequence(adapter, {
         }
       }
 
-      const planSpendableEn = Math.max(0, Math.floor(Number(planWorld.state?.en || 0)) - bucketEnFloor)
-      if (planSpendableEn > 0) {
-        const ksFinal = solveBucketStaminaKnapsack(planWorld, planSpendableEn, planBundles)
-        const chosenItems = ksFinal.reconstructAt(planSpendableEn)
+      // 3.1) Execute Urgent Farm & Barn Care (`harvest` -> `clear` -> `plant` -> hungry `feed` -> expiring `water`)
+      let urgentSpentSoFar = 0
+      for (const hcTask of [...harvestTasks, ...clearTasks]) {
+        if (bucketActs.length >= maxBucketActions) break
+        const cEn = hcTask.costEn
+        if (urgentSpentSoFar + cEn <= fundedUrgentEn) {
+          ensureExecStamina(cEn, bucketEnFloor)
+        }
+        if (Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor < cEn) break
+        pushAndSim([{ a: hcTask.kind, i: hcTask.i }])
+        urgentSpentSoFar += cEn
+      }
+
+      let unplantedProfitablePlots = 0
+      if (allowedSet.has('plant') && (u > 0 || enableFirstBucketPlant) && (execWorld.state?.plotN || 0) > 0) {
+        const pCostEn = R.WORLD?.cost?.plant ?? 2
+        const emptyIndices = []
+        for (let i = 0; i < (execWorld.state.plotN || 0); i++) {
+          if (!execWorld.state.plots?.[i]) emptyIndices.push(i)
+        }
+        for (const i of emptyIndices) {
+          if (bucketActs.length >= maxBucketActions) break
+          const ps = execWorld.state
+          if (ps.plots?.[i]) continue
+          const bestP = selectBestCropToPlant(adapter, {
+            state: ps,
+            plotIdx: i,
+            atSec: b.atSec,
+            tEnd: tH,
+            marginalItemValueFn,
+            staminaPointCost: baseStaminaShadowCost,
+            enforceHorizonCutoff: objectiveCfg.terminalSupplyMode === 'zero',
+          })
+          if (!bestP) continue
+          const hasFreeSeed = adapter.availableInv(ps, `sd_${bestP.crop.id}`, 0) > 0
+          const costCash = hasFreeSeed ? 0 : Number(bestP.crop.seed || 0)
+          const availPlantCash = Math.max(
+            0,
+            Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0) - getPendingCoffeeCash()
+          )
+          if (costCash > availPlantCash) continue
+          if (urgentSpentSoFar + pCostEn <= fundedUrgentEn) {
+            ensureExecStamina(pCostEn, bucketEnFloor)
+          }
+          if (Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor < pCostEn) {
+            unplantedProfitablePlots++
+            continue
+          }
+          marginalItemValueFn(bestP.crop.id, 0, b.atSec, {
+            reserveUnits: Math.max(1, Math.round(bestP.totalExpectedUnits || 2)),
+          })
+          pushAndSim([{ a: 'plant', i, c: bestP.crop.id }])
+          urgentSpentSoFar += pCostEn
+        }
+      }
+
+      if (allowedSet.has('feed') && utilityTokens.feedId) {
+        const hungryNow = []
+        for (let i = 0; i < (execWorld.state?.barn?.length || 0); i++) {
+          const pen = execWorld.state.barn[i]
+          if (!pen || R.b12AnimalStage(pen, b.atSec).retired) continue
+          const hungryAt = pen.f + 86400
+          if (b.atSec - pen.f >= 8 * 3600 && (hungryAt <= bucketEndSec || b.atSec >= hungryAt)) {
+            hungryNow.push(i)
+          }
+        }
+        if (hungryNow.length > 0) {
+          const haveFeed = adapter.availableInv(execWorld.state, utilityTokens.feedId, 0)
+          const needBuy = Math.max(0, hungryNow.length - haveFeed)
+          const feedPrice = Number(R.SHOP?.[utilityTokens.feedId]?.price || 150)
+          const availFeedCash = Math.max(
+            0,
+            Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0) - getPendingCoffeeCash()
+          )
+          if (needBuy > 0 && allowedSet.has('buy') && availFeedCash >= needBuy * feedPrice) {
+            pushAndSim([{ a: 'buy', id: utilityTokens.feedId, n: Math.min(99, Math.floor(availFeedCash / feedPrice), needBuy) }])
+          }
+          const fCostEn = R.WORLD?.cost?.feed ?? 1
+          for (const idx of hungryNow) {
+            if (adapter.availableInv(execWorld.state, utilityTokens.feedId, 0) <= 0) break
+            if (urgentSpentSoFar + fCostEn <= fundedUrgentEn) {
+              ensureExecStamina(fCostEn, bucketEnFloor)
+            }
+            if (Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor < fCostEn) break
+            pushAndSim([{ a: 'feed', i: idx }])
+            urgentSpentSoFar += fCostEn
+          }
+        }
+      }
+
+      for (const ewTask of expiringWaterTasks) {
+        if (bucketActs.length >= maxBucketActions) break
+        const pNow = execWorld.state?.plots?.[ewTask.i]
+        if (!pNow) continue
+        const autoNow = R.sprinkled(execWorld.state, ewTask.i) || weatherU === 1
+        const stNow = R.cropStage(pNow, b.atSec, autoNow)
+        if (!(stNow.stage >= 0 && stNow.stage < 3 && !autoNow && pNow.w <= stNow.stage)) continue
+        const wCostEn = ewTask.costEn
+        if (urgentSpentSoFar + wCostEn <= fundedUrgentEn) {
+          ensureExecStamina(wCostEn, bucketEnFloor)
+        }
+        if (Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor < wCostEn) break
+        pushAndSim([{ a: 'water', i: ewTask.i }])
+        urgentSpentSoFar += wCostEn
+      }
+
+      // 3.2) Recompute post-harvest craft bundles & shiftable Stamina × Cash Knapsack (protecting pending `eat` & `coffee`)
+      const rawCapPost = Number(R.energyMax(execWorld.state))
+      const capExecPost = Number.isFinite(rawCapPost) && rawCapPost > 0 ? rawCapPost : 100
+      const pendingTopUpEnRem = getPendingTopUpEn(Math.max(0, capExecPost - effectiveShiftableFloor))
+      const shiftableSpendableEn = Math.max(
+        0,
+        Math.floor(Number(execWorld.state?.en || 0)) + pendingTopUpEnRem - effectiveShiftableFloor
+      )
+
+      if (shiftableSpendableEn > 0) {
+        const postUrgentPlanW = adapter.cloneWorld(execWorld)
+        const pendingEatRes = getPendingEatReserve()
+        for (const [eId, qArr] of Object.entries(pendingEatRes)) {
+          const invRow = postUrgentPlanW.state?.inv?.[eId]
+          if (!invRow) continue
+          for (let q = 0; q < 3; q++) {
+            invRow[q] = Math.max(0, Number(invRow[q] || 0) - Number(qArr[q] || 0))
+          }
+        }
+        postUrgentPlanW.coins = Math.max(0, Number(postUrgentPlanW.coins || 0) - getPendingCoffeeCash())
+
+        const postHarvestBundles = computeBucketCraftBundles(postUrgentPlanW)
+        const ksFinal = solveBucketStaminaKnapsack(postUrgentPlanW, shiftableSpendableEn, postHarvestBundles)
+        const chosenItems = ksFinal.reconstructAt(shiftableSpendableEn)
         if (chosenItems.length > 0) {
           const rawCraftList = []
           let nBombInv = 0
@@ -4395,15 +5439,16 @@ function optimizeAndSimulateSequence(adapter, {
             else if (it.kind === 'mine') nMine++
           }
 
-          // 3a) Deterministic crafts first (pulling top-up stamina just-in-time per craft chunk!)
+          // 3.3a) Deterministic crafts first (pulling top-up stamina just-in-time per craft chunk!)
           if (rawCraftList.length > 0) {
             const craftEnUnit = R.WORLD?.cost?.craft ?? 1
             const mergedCrafts = mergeCraftActionsPreserveTopo(rawCraftList)
             let cIdx = 0
             while (cIdx < mergedCrafts.length) {
               const firstNeed = Math.max(1, Number(mergedCrafts[cIdx].n || 1)) * craftEnUnit
-              ensureExecStamina(firstNeed)
-              const availEn = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor)
+              ensureExecStamina(firstNeed, effectiveShiftableFloor)
+              const availEn = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - effectiveShiftableFloor)
+              if (availEn < firstNeed) break
               const craftChunk = []
               let usedEn = 0
               while (cIdx < mergedCrafts.length) {
@@ -4417,7 +5462,7 @@ function optimizeAndSimulateSequence(adapter, {
             }
           }
 
-          // 3b) Shop purchases for bombs/bait (preserving cash reserved for any pending just-in-time `coffee`!)
+          // 3.3b) Shop purchases for bombs/bait (preserving cash reserved for any pending just-in-time `coffee`!)
           let freeCashNow = Math.max(
             0,
             Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0) - getPendingCoffeeCash()
@@ -4456,7 +5501,7 @@ function optimizeAndSimulateSequence(adapter, {
             emitOptimalBucketSells(u, b, dynamicPrices, pushAndSim, getPendingEatReserve())
           }
 
-          // 3c) Stochastic extraction actions ordered by highest marginal gain per stamina
+          // 3.3c) Stochastic extraction actions ordered by highest marginal gain per stamina
           const stochGroups = []
           const totalBombs = nBombInv + nBombBuy
           if (totalBombs > 0) {
@@ -4487,54 +5532,6 @@ function optimizeAndSimulateSequence(adapter, {
           }
           stochGroups.sort((a, b2) => b2.perEn - a.perEn)
 
-          // 3b-post) Post-turnover empty-plot planting (preserving cash reserved for pending `coffee`!)
-          if (allowedSet.has('plant') && (execWorld.state?.plotN || 0) > 0) {
-            const ps = execWorld.state
-            const weatherNow = R.weatherOf(b.isleDay)
-            const totalStochEn = totalBombs * (R.WORLD?.cost?.bomb ?? 6)
-              + (totalBaitedFish + totalUnbaitedFish) * (R.WORLD?.cost?.fish ?? 4)
-              + nMine * (R.WORLD?.cost?.mine ?? 3)
-            const lowestStochPerEn = stochGroups.length > 0 ? stochGroups[stochGroups.length - 1].perEn : 0
-            let simCashP = Math.max(
-              0,
-              Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0) - getPendingCoffeeCash()
-            )
-            let simEnP = Math.max(0, Math.floor(Number(ps.en || 0)))
-            const postPlants = []
-            for (let i = 0; i < ps.plotN; i++) {
-              if (ps.plots?.[i]) continue
-              const pCostEn = R.WORLD?.cost?.plant ?? 2
-              if (simEnP < pCostEn) break
-              const oppPerEn = simEnP - pCostEn < totalStochEn ? lowestStochPerEn : 0
-              const bestP = selectBestCropToPlant(adapter, {
-                state: ps,
-                plotIdx: i,
-                atSec: b.atSec,
-                tEnd: tH,
-                marginalItemValueFn,
-                staminaPointCost: oppPerEn,
-                enforceHorizonCutoff: objectiveCfg.terminalSupplyMode === 'zero',
-              })
-              if (!bestP) continue
-              const hasFreeSeed = adapter.availableInv(ps, `sd_${bestP.crop.id}`, 0) > 0
-              const costCash = hasFreeSeed ? 0 : bestP.crop.seed
-              if (costCash > simCashP) continue
-              marginalItemValueFn(bestP.crop.id, 0, b.atSec, {
-                reserveUnits: Math.max(1, Math.round(bestP.totalExpectedUnits || 2)),
-              })
-              postPlants.push({ a: 'plant', i, c: bestP.crop.id })
-              simCashP -= costCash
-              simEnP -= pCostEn
-              if (!R.sprinkled(ps, i) && weatherNow !== 1 && simEnP >= (R.WORLD?.cost?.water ?? 1)) {
-                postPlants.push({ a: 'water', i })
-                simEnP -= R.WORLD?.cost?.water ?? 1
-              }
-            }
-            if (postPlants.length > 0) {
-              pushAndSim(postPlants)
-            }
-          }
-
           let seenFirstStochInBucket = false
           for (const grp of stochGroups) {
             if (!grp.acts || grp.acts.length === 0) continue
@@ -4547,23 +5544,21 @@ function optimizeAndSimulateSequence(adapter, {
             )
             let cursorAct = 0
             while (cursorAct < grp.acts.length && bucketActs.length < maxBucketActions) {
-              let remEnForStoch = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor)
+              let remEnForStoch = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - effectiveShiftableFloor)
               if (remEnForStoch < unitCost) {
                 const rawCapExec = Number(R.energyMax(execWorld.state))
                 const capExec = Number.isFinite(rawCapExec) && rawCapExec > 0 ? rawCapExec : 100
                 const wantEn = (u === 0 && !seenFirstStochInBucket)
                   ? unitCost
                   : Math.min(
-                      Math.max(unitCost, Math.max(0, capExec - bucketEnFloor)),
+                      Math.max(unitCost, Math.max(0, capExec - effectiveShiftableFloor)),
                       (grp.acts.length - cursorAct) * unitCost
                     )
-                ensureExecStamina(wantEn)
-                remEnForStoch = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor)
+                ensureExecStamina(wantEn, effectiveShiftableFloor)
+                remEnForStoch = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - effectiveShiftableFloor)
               }
               if (remEnForStoch < unitCost) break
-              const maxAffordEn = (u === 0 && !seenFirstStochInBucket && topUpCursor < plannedTopUpActs.length)
-                ? Math.min(grp.acts.length - cursorAct, Math.floor(remEnForStoch / unitCost))
-                : Math.min(grp.acts.length - cursorAct, Math.floor(remEnForStoch / unitCost))
+              const maxAffordEn = Math.min(grp.acts.length - cursorAct, Math.floor(remEnForStoch / unitCost))
               if (maxAffordEn <= 0) break
               pushAndSim(grp.acts.slice(cursorAct, cursorAct + maxAffordEn))
               cursorAct += maxAffordEn
@@ -4572,6 +5567,41 @@ function optimizeAndSimulateSequence(adapter, {
           }
         }
       }
+
+      // 3.4) Non-expiring manual `water`: executes ONLY when 0 profitable empty plots remain unplanted
+      //      and spare stamina above `effectiveShiftableFloor` is available (never starving `plant`!)
+      if (unplantedProfitablePlots === 0 && allowedSet.has('water')) {
+        const wUnit = R.WORLD?.cost?.water ?? 1
+        let spareWaterEn = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - effectiveShiftableFloor)
+        if (spareWaterEn >= wUnit) {
+          const nonExpWaters = []
+          for (let i = 0; i < (execWorld.state?.plotN || 0) && nonExpWaters.length * wUnit < spareWaterEn; i++) {
+            const p = execWorld.state.plots?.[i]
+            if (!p) continue
+            const auto = R.sprinkled(execWorld.state, i) || weatherU === 1
+            const st = R.cropStage(p, b.atSec, auto)
+            if (st.stage >= 0 && st.stage < 3 && !auto && p.w <= st.stage) {
+              nonExpWaters.push({ a: 'water', i })
+            }
+          }
+          if (nonExpWaters.length > 0) {
+            pushAndSim(nonExpWaters)
+          }
+        }
+      }
+
+      // 3.5) Claim any newly completed daily goals (`0` stamina) before optimal multi-bucket `sell`
+      if (allowedSet.has('goal') && typeof R.dailyGoals === 'function') {
+        const goalsNow = R.dailyGoals(b.naturalDay, execWorld.state)
+        const goalActsNow = []
+        for (let k = 0; k < 4; k++) {
+          if (goalsNow[k] && !execWorld.state.cnt?.['goal' + k] && (execWorld.state.cnt?.[goalsNow[k].id] || 0) >= goalsNow[k].n) {
+            goalActsNow.push({ a: 'goal', k })
+          }
+        }
+        if (goalActsNow.length > 0) pushAndSim(goalActsNow)
+      }
+
       cachedCraftBundles = computeBucketCraftBundles(execWorld)
     }
 
@@ -4671,17 +5701,20 @@ function optimizeAndSimulateSequence(adapter, {
     ? {}
     : buildTerminalPrices(adapter, { ...execWorld, now: tH }, initialWorldForObjective, objectiveCfg, scenarioSupplyFactor, actualTermPrevSold)
   const finalWorldAtHorizon = adapter.advanceTimeOnly(execWorld, tH, { futurePrices: actualTermPrices })
-  const objEval = evaluateTrajectoryObjective(adapter, {
-    initialWorld: initialWorldForObjective,
-    finalWorld: finalWorldAtHorizon,
-    cashEvents,
-    objectiveCfg,
-    scenarioSupplyFactor,
-    explicitTerminalPrices: hasExplicitPriceOverride ? actualTermPrices : null,
-    prevIsleSoldMap: actualTermPrevSold,
-    allowTerminalCraft: allowedSet.has('craft'),
-    allowTerminalHarvest: allowedSet.has('harvest'),
-  })
+  const objEval = skipObjectiveEval
+    ? { totalObjectiveValue: 0 }
+    : evaluateTrajectoryObjective(adapter, {
+        initialWorld: initialWorldForObjective,
+        finalWorld: finalWorldAtHorizon,
+        cashEvents,
+        objectiveCfg,
+        scenarioSupplyFactor,
+        explicitTerminalPrices: hasExplicitPriceOverride ? actualTermPrices : null,
+        prevIsleSoldMap: actualTermPrevSold,
+        allowTerminalCraft: allowedSet.has('craft'),
+        allowTerminalHarvest: allowedSet.has('harvest'),
+        allowTerminalPlant: allowedSet.has('plant'),
+      })
 
   const marginalContext = {
     sourceWorldRev: startWorld?.rev ?? null,
@@ -5084,20 +6117,28 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
   }
 
   // Pre-select any CapEx actions at `t0` strictly via counterfactual rule-trajectory delta (zero magic constants!)
-  const preselectedCapexActions = selectCapexByTrajectoryDelta(adapter, {
-    world0,
-    constraints,
-    objectiveCfg,
-    allowedSet,
-    utilityTokens,
-    makePricesFnForScenario0: makePricesFn(scenarios[0]),
-    baseSoldByIsle,
-    scenarioSupplyFactor: scenarios[0]?.externalSupplyFactor ?? null,
-    maxCraftHoldIsleDays,
-    isPastDeadlineFn: isPastDeadline,
-  })
+  const preselectedCapexActions = Array.isArray(options.preselectedCapexActionsOverride)
+    ? options.preselectedCapexActionsOverride
+    : selectCapexByTrajectoryDelta(adapter, {
+        world0,
+        constraints,
+        objectiveCfg,
+        allowedSet,
+        utilityTokens,
+        makePricesFnForScenario0: makePricesFn(scenarios[0]),
+        baseSoldByIsle,
+        scenarioSupplyFactor: scenarios[0]?.externalSupplyFactor ?? null,
+        maxCraftHoldIsleDays,
+        isPastDeadlineFn: isPastDeadline,
+      })
 
-  const hasExplicitPriceOverride = Boolean(options.explicitPricesByBucket || options.explicitPricesByIsleIndex)
+  const hasExplicitPriceOverride = Boolean(
+    options.explicitPricesByBucket ||
+    options.explicitPricesByIsleIndex ||
+    (world0.prices && adapter.graph.sellableIds.some(
+      (id) => Object.prototype.hasOwnProperty.call(world0.prices, id) && Number(world0.prices[id]) <= 0 && Number(adapter.R.BASE_PRICE?.[id]) > 0
+    ))
+  )
 
   // Evaluate a trunk policy candidate by running conditional recourse across all scenarios ω in Ω!
   const evaluateTrunkPolicy = (
@@ -5149,6 +6190,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
           prevIsleSoldMap: termPrev,
           allowTerminalCraft: allowedSet.has('craft'),
           allowTerminalHarvest: allowedSet.has('harvest'),
+          allowTerminalPlant: allowedSet.has('plant'),
         })
         return {
           expectedValue: ev.totalObjectiveValue,
@@ -5262,6 +6304,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       initialCashEvents: autoInitCashEvents,
       maxCraftHoldIsleDays,
       hasExplicitPriceOverride,
+      skipObjectiveEval: true,
     })
 
     // Replay ONLY the shared trunk actions `0..K-1` identically to obtain the exact common `worldAtBranchStart`!
@@ -5324,6 +6367,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         initialCashEvents: [],
         maxCraftHoldIsleDays,
         hasExplicitPriceOverride,
+        skipObjectiveEval: true,
       })
       if (branchRes.discretizationMeta) {
         mergedDisc.maxDpCells = Math.max(mergedDisc.maxDpCells, branchRes.discretizationMeta.maxDpCells || 0)
@@ -5350,6 +6394,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         prevIsleSoldMap: termPrevSold,
         allowTerminalCraft: allowedSet.has('craft'),
         allowTerminalHarvest: allowedSet.has('harvest'),
+        allowTerminalPlant: allowedSet.has('plant'),
       })
       expectedVal += sc.weight * fullEval.totalObjectiveValue
       scenarioBranches[sc.id] = {
@@ -5649,8 +6694,38 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
   const hasImmediatePrefixStochastic = (cand) =>
     (cand.trunkActionsByBucket?.[0] || []).some((a) => adapter.isStochasticAction(a))
 
+  const freeCashAtT0 = Math.max(0, Number(world0.coins || 0) - Number(constraints.cashReserveFloor || 0))
+  const maxSeedPriceAtT0 = Math.max(0, ...(adapter.R.CROPS || []).map((c) => Number(c.seed || 0)))
+  const maxCargoCostAtT0 = typeof adapter.R.b12Stock === 'function'
+    ? adapter.R.b12Stock(world0.now, world0.prices || {}).reduce(
+        (sumC, it) => sumC + Math.max(0, adapter.R.b12StockLeft(world0.state, it, world0.now)) * Math.max(0, Number(it.price || 0)),
+        0
+      )
+    : 0
+  const shopBombPriceAtT0 = utilityTokens.bombId
+    ? Math.max(0, Number(adapter.R.SHOP?.[utilityTokens.bombId]?.price || 0))
+    : 0
+  const remCoffeeAtT0 = allowedSet.has('coffee')
+    ? Math.max(0, (adapter.R.WORLD?.daily?.coffee || 3) - Number(world0.state?.cnt?.coffee || 0))
+    : 0
+  const remBombAtT0 = allowedSet.has('bomb')
+    ? Math.max(
+        0,
+        (adapter.R.WORLD?.daily?.bomb || 10) -
+          (world0.state?.iq?.d === buckets[0]?.isleIndex ? Number(world0.state?.iq?.bomb || 0) : 0)
+      )
+    : 0
+  const maxFirstBucketCashDemand =
+    (world0.state?.plotN || 0) * maxSeedPriceAtT0 +
+    maxCargoCostAtT0 +
+    remCoffeeAtT0 * (adapter.R.WORLD?.coffee?.price || 15000) +
+    remBombAtT0 * shopBombPriceAtT0
+  const isFirstBucketCashBindingPossible = freeCashAtT0 < maxFirstBucketCashDemand
+
   const candidateModes = buckets.length > 1 && allowedSet.has('sell')
-    ? ['optimal', 'hold-in-first-bucket', 'sell-all-now']
+    ? (isFirstBucketCashBindingPossible
+        ? ['optimal', 'hold-in-first-bucket', 'sell-all-now']
+        : ['optimal', 'hold-in-first-bucket'])
     : ['optimal']
 
   const sellableIdSet = new Set(adapter.graph.sellableIds)
@@ -5679,21 +6754,29 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
   const firstBucketActs0 = bestDomestic.trunkActionsByBucket[0] || []
   const usedPlant0 = firstBucketActs0.some((a) => a.a === 'plant')
   const usedStockBuy0 = firstBucketActs0.some((a) => a.a === 'stockBuy')
+  const sameIsleNextBucket = buckets.length <= 1 || buckets[1]?.isleIndex === buckets[0]?.isleIndex
+  const canUpstreamBind = isFirstBucketCashBindingPossible || !sameIsleNextBucket
+
   const upstreamVariants = []
-  if (usedPlant0) upstreamVariants.push({ enableFirstBucketPlant: false, enableFirstBucketStockBuy: true })
-  if (usedStockBuy0) upstreamVariants.push({ enableFirstBucketPlant: true, enableFirstBucketStockBuy: false })
-  if (usedPlant0 && usedStockBuy0) upstreamVariants.push({ enableFirstBucketPlant: false, enableFirstBucketStockBuy: false })
+  if (canUpstreamBind) {
+    if (usedPlant0) upstreamVariants.push({ enableFirstBucketPlant: false, enableFirstBucketStockBuy: true })
+    if (usedStockBuy0) upstreamVariants.push({ enableFirstBucketPlant: true, enableFirstBucketStockBuy: false })
+    if (usedPlant0 && usedStockBuy0) upstreamVariants.push({ enableFirstBucketPlant: false, enableFirstBucketStockBuy: false })
+  }
   for (const uv of upstreamVariants) {
     if (isPastDeadline()) break
+    if (bestDomestic && bestDomestic.valueInterpretation == null) {
+      scoreDomesticCandidate(bestDomestic)
+    }
     const rawCand = evaluateTrunkPolicy('optimal', world0, world0, uv)
-    const cand = hasImmediatePrefixStochastic(rawCand) ? scoreDomesticCandidate(rawCand) : rawCand
+    const cand = scoreDomesticCandidate(rawCand)
     if (cand.policyExpectedValue > bestDomestic.policyExpectedValue + 1e-6) {
       bestDomestic = cand
     }
   }
 
   // Ensure the selected winning domestic candidate ALWAYS carries full stochastic policy expectation & SE metadata!
-  if (bestDomestic && bestDomestic.valueInterpretation == null) {
+  if (bestDomestic && bestDomestic.valueInterpretation == null && !options.skipPostSelectionScoring) {
     scoreDomesticCandidate(bestDomestic)
   }
 
@@ -5850,10 +6933,12 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     }
   }
 
-  // Determine exact livelock-proof `nextWakeSec`
-  const minWakeFloorSec = world0.now + Math.max(5, minGapSec)
+  // Determine exact event-driven & `minActionableEn`-driven `nextWakeSec` (zero `+5s` delay on deterministic events)
+  const fallbackWakeFloorSec = world0.now + Math.max(5, minGapSec)
+  const bucket0Empty = (trunkBuckets[0]?.domesticActions?.length || 0) === 0 && (trunkBuckets[0]?.visitActions?.length || 0) === 0
   let nextWakeIdx = 1
-  if (trunkBuckets[0]?.domesticActions.length === 0 && trunkBuckets[0]?.visitActions.length === 0) {
+  let hasExactBucketTarget = false
+  if (bucket0Empty) {
     for (let idx = 1; idx < buckets.length; idx++) {
       const bMeta = buckets[idx]
       const tb = trunkBuckets[idx]
@@ -5862,24 +6947,87 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       const beyondTrunkEvent = idx >= trunkBuckets.length
       if (hasPlannedWork || revealsNewInfo || beyondTrunkEvent) {
         nextWakeIdx = idx
+        hasExactBucketTarget = true
         break
       }
     }
+  } else if (buckets.length > 1) {
+    hasExactBucketTarget = true
   }
   let nextWakeSec = buckets.length > nextWakeIdx
-    ? buckets[nextWakeIdx].atSec
-    : world0.now + Math.min(300, Math.max(60, objectiveCfg.horizonSec || 300))
-  const nextRegenSec = Number(world0.state?.en || 0) < adapter.R.energyMax(world0.state)
-    ? Math.max(minWakeFloorSec, Number(world0.state?.enT || world0.now) + (adapter.R.WORLD?.regen || 180))
-    : Infinity
-  if (Number.isFinite(nextRegenSec) && nextRegenSec < nextWakeSec && nextRegenSec > world0.now) {
-    if (Number(world0.state?.en || 0) < 4) nextWakeSec = nextRegenSec
+    ? Math.max(world0.now + (bucket0Empty ? 1 : minGapSec), buckets[nextWakeIdx].atSec)
+    : Math.max(fallbackWakeFloorSec, world0.now + Math.min(300, Math.max(60, objectiveCfg.horizonSec || 300)))
+
+  const sWake = world0.state || {}
+  const curEnWake = Math.max(0, Math.floor(Number(sWake.en || 0)))
+  const rawMaxWake = Number(adapter.R.energyMax(sWake))
+  const enMaxWake = Number.isFinite(rawMaxWake) && rawMaxWake > 0 ? rawMaxWake : 100
+  if (curEnWake < enMaxWake) {
+    const activeFloorWake = Number(constraints.staminaReserveFloor || 0) > 0 && world0.now < Number(constraints.staminaReserveUntilSec || 0)
+      ? Math.max(0, Math.floor(Number(constraints.staminaReserveFloor || 0)))
+      : 0
+    const iDayWake = adapter.R.isleDay(world0.now)
+    const iIdxWake = adapter.R.isleIndex(world0.now)
+    const weatherWake = adapter.R.weatherOf(iDayWake)
+    let minActionableEn = Infinity
+    let hasEmptyPlotWake = false
+    let hasManualWaterPlotWake = false
+    for (let i = 0; i < (sWake.plotN || 0); i++) {
+      const p = sWake.plots?.[i]
+      if (!p) {
+        if (allowedSet.has('plant')) {
+          hasEmptyPlotWake = true
+          minActionableEn = Math.min(minActionableEn, activeFloorWake + (adapter.R.WORLD?.cost?.plant ?? 2))
+        }
+        continue
+      }
+      const auto = adapter.R.sprinkled(sWake, i) || weatherWake === 1
+      const st = adapter.R.cropStage(p, world0.now, auto)
+      if (st.stage === 3 && allowedSet.has('harvest')) {
+        minActionableEn = Math.min(minActionableEn, activeFloorWake + (adapter.R.WORLD?.cost?.harvest ?? 1))
+      } else if (st.stage === -1 && allowedSet.has('clear')) {
+        minActionableEn = Math.min(minActionableEn, activeFloorWake + (adapter.R.WORLD?.cost?.clear ?? 1))
+      } else if (st.stage >= 0 && st.stage < 3 && !auto && p.w <= st.stage && allowedSet.has('water')) {
+        hasManualWaterPlotWake = true
+      }
+    }
+    if (!hasEmptyPlotWake && hasManualWaterPlotWake) {
+      minActionableEn = Math.min(minActionableEn, activeFloorWake + (adapter.R.WORLD?.cost?.water ?? 1))
+    }
+    if (allowedSet.has('feed')) {
+      for (let i = 0; i < (sWake.barn?.length || 0); i++) {
+        const pen = sWake.barn[i]
+        if (pen && !adapter.R.b12AnimalStage(pen, world0.now).retired && world0.now >= pen.f + 86400) {
+          minActionableEn = Math.min(minActionableEn, activeFloorWake + (adapter.R.WORLD?.cost?.feed ?? 1))
+        }
+      }
+    }
+    const iqWake = sWake.iq?.d === iIdxWake ? sWake.iq : {}
+    if (allowedSet.has('mine') && Number(iqWake.mine || 0) < (adapter.R.WORLD?.daily?.mine || 100)) {
+      minActionableEn = Math.min(minActionableEn, activeFloorWake + (adapter.R.WORLD?.cost?.mine ?? 3))
+    }
+    if (allowedSet.has('fish') && Number(iqWake.fish || 0) < (adapter.R.WORLD?.daily?.fish || 80)) {
+      minActionableEn = Math.min(minActionableEn, activeFloorWake + (adapter.R.WORLD?.cost?.fish ?? 4))
+    }
+    if (curEnWake < minActionableEn && minActionableEn <= enMaxWake) {
+      const regenEvery = adapter.R.WORLD?.regen || 180
+      const baseEnTWake = Math.max(world0.now - regenEvery, Number(sWake.enT || world0.now))
+      const regenWakeSec = Math.max(world0.now + 1, baseEnTWake + (minActionableEn - curEnWake) * regenEvery)
+      if (regenWakeSec < nextWakeSec) {
+        nextWakeSec = regenWakeSec
+        hasExactBucketTarget = true
+      }
+    }
   }
-  nextWakeSec = Math.max(minWakeFloorSec, nextWakeSec)
+  if (!hasExactBucketTarget) {
+    nextWakeSec = Math.max(fallbackWakeFloorSec, nextWakeSec)
+  } else {
+    nextWakeSec = Math.max(world0.now + 1, nextWakeSec)
+  }
 
   const elapsedMs = performance.now() - startMs
 
-  return {
+  const planOut = {
     planId: crypto.randomUUID(),
     account: envelope.account,
     rulesHash: adapter.rulesHash,
@@ -5928,6 +7076,46 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       elapsedMs,
     },
   }
+
+  if (options._exposeCapexForStability) {
+    planOut._selectedCapexActions = preselectedCapexActions
+  }
+  if (options.skipPostSelectionScoring) {
+    planOut._finalizePostSelectionQuality = () => {
+      if (!bestDomestic || bestDomestic.valueInterpretation != null) return
+      const tFin0 = performance.now()
+      scoreDomesticCandidate(bestDomestic)
+      const q = planOut.quality
+      const nextIncumbent = selectedVisits.length > 0
+        ? bestDomestic.policyExpectedValue + netRaidDeltaOverBase0
+        : bestDomestic.policyExpectedValue
+      q.feasibleIncumbentValue = nextIncumbent
+      if (selectedVisits.length === 0) {
+        q.standardError = bestDomestic.standardError || 0
+        q.confidenceInterval95 = bestDomestic.confidenceInterval95 || null
+        q.policySampleCount = bestDomestic.policySampleCount || null
+        q.valueInterpretation = bestDomestic.valueInterpretation || q.valueInterpretation
+      }
+      if (boundRes.validUpperBound != null) {
+        if (boundRes.validUpperBound + 1e-6 < nextIncumbent) {
+          q.solverStatus = 'bound-violation-error'
+          q.boundViolationDelta = boundRes.validUpperBound - nextIncumbent
+          q.upperBoundStatus = 'invalid-bound-below-incumbent'
+          q.validUpperBound = null
+          q.gap = null
+        } else {
+          q.validUpperBound = boundRes.validUpperBound
+          q.upperBoundStatus = boundRes.status
+          q.boundViolationDelta = null
+          q.gap = Math.max(0, boundRes.validUpperBound - nextIncumbent)
+          q.solverStatus = q.gap <= 1e-6 ? 'certified-optimal' : 'feasible-incumbent'
+        }
+      }
+      q.elapsedMs += performance.now() - tFin0
+    }
+  }
+
+  return planOut
 }
 
 /**
@@ -5954,7 +7142,10 @@ export function solveWithHorizonStability(adapter, envelope, objectiveCfgInput =
     ...options,
     nowMsFn,
     deadlineAtMs,
+    _exposeCapexForStability: true,
   })
+  const reusedCapex = basePlan._selectedCapexActions
+  delete basePlan._selectedCapexActions
 
   if (Number.isFinite(deadlineAtMs)) {
     const minExtBudgetMs = Math.max(50, Number(basePlan.quality?.elapsedMs || 0) * 0.7)
@@ -5968,6 +7159,10 @@ export function solveWithHorizonStability(adapter, envelope, objectiveCfgInput =
     }
   }
 
+  const maxCapexCapSec = Math.min(72 * 3600, Number(envelope?.constraints?.maxCapexPaybackSec || 72 * 3600))
+  const basePaybackSec = Math.max(baseCfg.horizonSec || 3600, maxCapexCapSec)
+  const extPaybackSec = Math.max(extCfg.horizonSec || 3600, maxCapexCapSec)
+
   const extScale = extCfg.horizonSec / Math.max(1, baseCfg.horizonSec)
   const extMaxBuckets = Math.max(baseMaxBuckets + 4, Math.ceil(baseMaxBuckets * extScale))
   const t0 = Number(envelope.observed?.world?.now || 0)
@@ -5978,6 +7173,8 @@ export function solveWithHorizonStability(adapter, envelope, objectiveCfgInput =
     maxBuckets: extMaxBuckets,
     preservePrefixThroughSec: t0 + Math.max(0, Math.floor(baseCfg.horizonSec || 0)),
     prefixMaxBuckets: baseMaxBuckets,
+    preselectedCapexActionsOverride: extPaybackSec === basePaybackSec ? reusedCapex : undefined,
+    skipPostSelectionScoring: true,
   })
 
   const sig0 = JSON.stringify({
@@ -5988,9 +7185,14 @@ export function solveWithHorizonStability(adapter, envelope, objectiveCfgInput =
     dom: extendedPlan.trunkBuckets[0]?.domesticActions || [],
     vis: (extendedPlan.trunkBuckets[0]?.visitActions || []).map((v) => v.targetId),
   })
+  const isStable = sig0 === sig1
+  if (!isStable && typeof extendedPlan._finalizePostSelectionQuality === 'function') {
+    extendedPlan._finalizePostSelectionQuality()
+  }
+  delete extendedPlan._finalizePostSelectionQuality
 
   return {
-    prefixStable: sig0 === sig1,
+    prefixStable: isStable,
     skippedByDeadline: false,
     basePlan,
     extendedPlan,
@@ -6129,44 +7331,293 @@ export function evaluateMarginalRaidDelta(adapter, marginalCtx, {
 
   const baseCraftEn0 = countIsle0CraftEn(jointCS.craftsByBucket)
   const craftEnTightened = meta0 && maxReachableIsle0En < baseCraftEn0
+  const baseCraftTouchedIds = new Set()
+  if (Array.isArray(jointCS.executionOrderMoves)) {
+    for (const em of jointCS.executionOrderMoves) {
+      for (const cId of em.changedIds) baseCraftTouchedIds.add(cId)
+    }
+  }
+  const canChangedItemTouchCraft = (id) => {
+    const d = invDeltaById?.[id] || [0, 0, 0]
+    const hasNeg = (d[0] || 0) < 0 || (d[1] || 0) < 0 || (d[2] || 0) < 0
+    if (hasNeg) return recipeInputSet.has(id) || adapter.graph.recipesById.has(id)
+    if (!recipeInputSet.has(id)) return false
+    if (baseCraftTouchedIds.has(id)) return true
+    const recs = adapter.graph.consumedByRecipes.get(id)
+    if (!recs || recs.length === 0) return false
+    let minReq = Infinity
+    for (const r of recs) {
+      const req = Number(r.in?.[id] || 0)
+      if (req > 0 && req < minReq) minReq = req
+    }
+    if (!Number.isFinite(minReq)) return false
+    let totalQty = (d[0] || 0) + (d[1] || 0) + (d[2] || 0)
+    for (let u = 0; u < seqBuckets.length && totalQty < minReq; u++) {
+      const row = supplyByBucket[u]?.[id]
+      if (row) totalQty += (row[0] || 0) + (row[1] || 0) + (row[2] || 0)
+    }
+    return totalQty >= minReq
+  }
   const touchesCraft = allowCraft && (
     craftEnTightened ||
-    changedIds.some((id) => recipeInputSet.has(id) || adapter.graph.recipesById.has(id))
+    changedIds.some(canChangedItemTouchCraft)
   )
 
   let invAndCraftDelta = 0
   let nextCraftEn0 = baseCraftEn0
 
   if (touchesCraft) {
-    const nextSupply = applyInvDeltaToSupplyTable(supplyByBucket, invDeltaById)
-    const nextRawEval = changedIds.length > 0
-      ? evaluateSupplyPortfolioIncremental(adapter, {
-          baseEval: jointCS.baseRawPortfolio,
-          supplyByBucket: nextSupply,
-          changedItemIds: changedIds,
-          slots,
-          initialNatDay,
-          initialCnt,
-        })
-      : jointCS.baseRawPortfolio
-    const nextJointCS = solveJointCraftAndSell(adapter, {
-      initialSupplyByBucket: nextSupply,
-      buckets: seqBuckets,
-      slots,
-      initialNatDay,
-      initialCnt,
-      craftCapByIsle,
-      enCapByBucket: nextEnCapByBucket,
-      staminaShadowCost: 0,
-      allowCraft,
-      maxCraftHoldIsleDays,
-      baseEvalOverride: nextRawEval,
-    })
-    invAndCraftDelta = nextJointCS.netPortfolioScore - jointCS.netPortfolioScore
-    nextCraftEn0 = countIsle0CraftEn(nextJointCS.craftsByBucket)
+    let hasNegativeRecipeItem = false
+    let totalAddedRecipeUnits = 0
+    for (const id of changedIds) {
+      if (!canChangedItemTouchCraft(id)) continue
+      const d = invDeltaById[id] || [0, 0, 0]
+      if ((d[0] || 0) < 0 || (d[1] || 0) < 0 || (d[2] || 0) < 0) {
+        hasNegativeRecipeItem = true
+        break
+      }
+      totalAddedRecipeUnits += (d[0] || 0) + (d[1] || 0) + (d[2] || 0)
+    }
+
+    let warmSolved = false
+    if (!craftEnTightened && !hasNegativeRecipeItem && Array.isArray(jointCS.executionOrderMoves)) {
+      const baseFreeCraftCap = new Map(craftCapByIsle)
+      const baseFreeEnCap = Float64Array.from(nextEnCapByBucket)
+      for (const em of jointCS.executionOrderMoves) {
+        const usedSlots = em.tpl.craftSlots * em.count
+        const usedEn = usedSlots * craftEnCost
+        baseFreeCraftCap.set(em.isleIdx, Math.max(0, (baseFreeCraftCap.get(em.isleIdx) || 0) - usedSlots))
+        for (let fb = em.u; fb < seqBuckets.length && seqBuckets[fb].isleIndex === em.isleIdx; fb++) {
+          baseFreeEnCap[fb] = Math.max(0, baseFreeEnCap[fb] - usedEn)
+        }
+      }
+
+      // 1) Exact Keep-All-Existing-Crafts feasible baseline (preserves all base crafts + low-star substitution + free slots)
+      let keepAllBestScore = -Infinity
+      let keepAllCraftEn0 = baseCraftEn0
+      {
+        const touchesExistingRawIn = changedIds.some((id) => baseCraftTouchedIds.has(id))
+        let keepSupply = null
+        if (!touchesExistingRawIn) {
+          keepSupply = applyInvDeltaToSupplyTable(jointCS.supplyAfterCrafts, invDeltaById)
+        } else {
+          keepSupply = applyInvDeltaToSupplyTable(supplyByBucket, invDeltaById)
+          for (let idx = 0; idx < jointCS.executionOrderMoves.length; idx++) {
+            const em = jointCS.executionOrderMoves[idx]
+            if (!(em.count > 0)) continue
+            const nextSup = deductFromPrefixSupply(keepSupply, em.u, em.tpl.rawIn, em.count, em.tpl.outId)
+            if (!nextSup) { keepSupply = null; break }
+            keepSupply = nextSup
+          }
+        }
+        if (keepSupply) {
+          const keepBaseEval = changedIds.length > 0
+            ? evaluateSupplyPortfolioIncremental(adapter, {
+                baseEval: jointCS.salePortfolio,
+                supplyByBucket: keepSupply,
+                changedItemIds: changedIds,
+                slots,
+                initialNatDay,
+                initialCnt,
+                revenueOnly: true,
+              })
+            : jointCS.salePortfolio
+          const keepJointCS = solveJointCraftAndSell(adapter, {
+            initialSupplyByBucket: keepSupply,
+            buckets: seqBuckets,
+            slots,
+            initialNatDay,
+            initialCnt,
+            craftCapByIsle: new Map(baseFreeCraftCap),
+            enCapByBucket: Float64Array.from(baseFreeEnCap),
+            staminaShadowCost: 0,
+            allowCraft,
+            maxCraftHoldIsleDays,
+            baseEvalOverride: keepBaseEval,
+            onlyTouchItemIds: new Set(changedIds),
+            revenueOnly: true,
+          })
+          keepAllBestScore = keepJointCS.netPortfolioScore
+          keepAllCraftEn0 = baseCraftEn0 + countIsle0CraftEn(keepJointCS.craftsByBucket)
+        }
+      }
+
+      // 2) Marginal-slot unroll with transitive later-bucket raw-input release (prevents prefix cannibalization)
+      const kUnrollSlots = Math.max(2, totalAddedRecipeUnits * 2)
+      const remCraftCap = new Map(baseFreeCraftCap)
+      const remEnCap = Float64Array.from(baseFreeEnCap)
+      const keptCounts = new Int32Array(jointCS.executionOrderMoves.length)
+      const activeTouchSet = new Set(changedIds)
+      const earliestUnrolledByRawIn = new Map()
+      let unrolledAny = false
+
+      for (let idx = jointCS.executionOrderMoves.length - 1; idx >= 0; idx--) {
+        const em = jointCS.executionOrderMoves[idx]
+        const freeSlotsIsle = remCraftCap.get(em.isleIdx) || 0
+        let minFreeEnIsle = Infinity
+        for (let fb = em.u; fb < seqBuckets.length && seqBuckets[fb].isleIndex === em.isleIdx; fb++) {
+          minFreeEnIsle = Math.min(minFreeEnIsle, remEnCap[fb] || 0)
+        }
+        const needSlotRelease = Math.max(0, kUnrollSlots - freeSlotsIsle)
+        const needEnRelease = Math.max(0, kUnrollSlots * craftEnCost - minFreeEnIsle)
+        const releaseSlotsTarget = Math.max(needSlotRelease, Math.ceil(needEnRelease / Math.max(1, craftEnCost)))
+        if (releaseSlotsTarget > 0) {
+          const unrollCnt = Math.min(em.count, Math.ceil(releaseSlotsTarget / em.tpl.craftSlots))
+          keptCounts[idx] = em.count - unrollCnt
+          if (unrollCnt > 0) {
+            unrolledAny = true
+            const relSlots = unrollCnt * em.tpl.craftSlots
+            const relEn = relSlots * craftEnCost
+            remCraftCap.set(em.isleIdx, (remCraftCap.get(em.isleIdx) || 0) + relSlots)
+            for (let fb = em.u; fb < seqBuckets.length && seqBuckets[fb].isleIndex === em.isleIdx; fb++) {
+              remEnCap[fb] += relEn
+            }
+            for (const cId of em.changedIds) activeTouchSet.add(cId)
+            for (const inId of Object.keys(em.tpl.rawIn)) {
+              const prevU = earliestUnrolledByRawIn.get(inId)
+              if (prevU == null || em.u < prevU) earliestUnrolledByRawIn.set(inId, em.u)
+            }
+          }
+        } else {
+          keptCounts[idx] = em.count
+        }
+      }
+
+      if (unrolledAny && earliestUnrolledByRawIn.size > 0) {
+        let changedPass = true
+        while (changedPass) {
+          changedPass = false
+          for (let idx = 0; idx < jointCS.executionOrderMoves.length; idx++) {
+            const kCnt = keptCounts[idx]
+            if (kCnt <= 0) continue
+            const em = jointCS.executionOrderMoves[idx]
+            let mustRelease = false
+            for (const inId of Object.keys(em.tpl.rawIn)) {
+              const u0Unrolled = earliestUnrolledByRawIn.get(inId)
+              if (u0Unrolled != null && em.u > u0Unrolled) {
+                mustRelease = true
+                break
+              }
+            }
+            if (mustRelease) {
+              keptCounts[idx] = 0
+              const relSlots = kCnt * em.tpl.craftSlots
+              const relEn = relSlots * craftEnCost
+              remCraftCap.set(em.isleIdx, (remCraftCap.get(em.isleIdx) || 0) + relSlots)
+              for (let fb = em.u; fb < seqBuckets.length && seqBuckets[fb].isleIndex === em.isleIdx; fb++) {
+                remEnCap[fb] += relEn
+              }
+              for (const cId of em.changedIds) activeTouchSet.add(cId)
+              for (const inId of Object.keys(em.tpl.rawIn)) {
+                const prevU = earliestUnrolledByRawIn.get(inId)
+                if (prevU == null || em.u < prevU) earliestUnrolledByRawIn.set(inId, em.u)
+              }
+              changedPass = true
+            }
+          }
+        }
+      }
+
+      if (!unrolledAny && Number.isFinite(keepAllBestScore)) {
+        invAndCraftDelta = keepAllBestScore - jointCS.netPortfolioScore
+        nextCraftEn0 = keepAllCraftEn0
+        warmSolved = true
+      } else if (unrolledAny) {
+        let warmSupply = applyInvDeltaToSupplyTable(supplyByBucket, invDeltaById)
+        let keptIsle0CraftEn = 0
+        let replayOk = true
+        for (let idx = 0; idx < jointCS.executionOrderMoves.length; idx++) {
+          const kCnt = keptCounts[idx]
+          if (kCnt <= 0) continue
+          const em = jointCS.executionOrderMoves[idx]
+          const nextSup = deductFromPrefixSupply(warmSupply, em.u, em.tpl.rawIn, kCnt, em.tpl.outId)
+          if (!nextSup) {
+            replayOk = false
+            break
+          }
+          warmSupply = nextSup
+          if (meta0 && em.isleIdx === meta0.isleIndex0) {
+            keptIsle0CraftEn += kCnt * em.tpl.craftSlots * craftEnCost
+          }
+        }
+
+        if (replayOk && warmSupply) {
+          const diffIds = [...activeTouchSet]
+          const warmBaseEval = diffIds.length > 0
+            ? evaluateSupplyPortfolioIncremental(adapter, {
+                baseEval: jointCS.salePortfolio,
+                supplyByBucket: warmSupply,
+                changedItemIds: diffIds,
+                slots,
+                initialNatDay,
+                initialCnt,
+                revenueOnly: true,
+              })
+            : jointCS.salePortfolio
+          const incJointCS = solveJointCraftAndSell(adapter, {
+            initialSupplyByBucket: warmSupply,
+            buckets: seqBuckets,
+            slots,
+            initialNatDay,
+            initialCnt,
+            craftCapByIsle: remCraftCap,
+            enCapByBucket: remEnCap,
+            staminaShadowCost: 0,
+            allowCraft,
+            maxCraftHoldIsleDays,
+            baseEvalOverride: warmBaseEval,
+            onlyTouchItemIds: activeTouchSet,
+            revenueOnly: true,
+          })
+          if (Number.isFinite(keepAllBestScore) && keepAllBestScore >= incJointCS.netPortfolioScore) {
+            invAndCraftDelta = keepAllBestScore - jointCS.netPortfolioScore
+            nextCraftEn0 = keepAllCraftEn0
+          } else {
+            invAndCraftDelta = incJointCS.netPortfolioScore - jointCS.netPortfolioScore
+            nextCraftEn0 = keptIsle0CraftEn + countIsle0CraftEn(incJointCS.craftsByBucket)
+          }
+          warmSolved = true
+        } else if (Number.isFinite(keepAllBestScore)) {
+          invAndCraftDelta = keepAllBestScore - jointCS.netPortfolioScore
+          nextCraftEn0 = keepAllCraftEn0
+          warmSolved = true
+        }
+      }
+    }
+
+    if (!warmSolved) {
+      const nextSupply = applyInvDeltaToSupplyTable(supplyByBucket, invDeltaById)
+      const nextRawEval = changedIds.length > 0
+        ? evaluateSupplyPortfolioIncremental(adapter, {
+            baseEval: jointCS.baseRawPortfolio,
+            supplyByBucket: nextSupply,
+            changedItemIds: changedIds,
+            slots,
+            initialNatDay,
+            initialCnt,
+            revenueOnly: true,
+          })
+        : jointCS.baseRawPortfolio
+      const nextJointCS = solveJointCraftAndSell(adapter, {
+        initialSupplyByBucket: nextSupply,
+        buckets: seqBuckets,
+        slots,
+        initialNatDay,
+        initialCnt,
+        craftCapByIsle,
+        enCapByBucket: nextEnCapByBucket,
+        staminaShadowCost: 0,
+        allowCraft,
+        maxCraftHoldIsleDays,
+        baseEvalOverride: nextRawEval,
+        revenueOnly: true,
+      })
+      invAndCraftDelta = nextJointCS.netPortfolioScore - jointCS.netPortfolioScore
+      nextCraftEn0 = countIsle0CraftEn(nextJointCS.craftsByBucket)
+    }
   } else if (changedIds.length > 0) {
     const nextAfterCraftSupply = applyInvDeltaToSupplyTable(jointCS.supplyAfterCrafts, invDeltaById)
-    const nextSaleEval = evaluateSupplyPortfolioIncremental(adapter, {
+    const nextSaleTotal = evaluateSupplyPortfolioValueOnly(adapter, {
       baseEval: jointCS.salePortfolio,
       supplyByBucket: nextAfterCraftSupply,
       changedItemIds: changedIds,
@@ -6174,7 +7625,7 @@ export function evaluateMarginalRaidDelta(adapter, marginalCtx, {
       initialNatDay,
       initialCnt,
     })
-    invAndCraftDelta = nextSaleEval.totalValue - jointCS.salePortfolio.totalValue
+    invAndCraftDelta = nextSaleTotal - jointCS.salePortfolio.totalValue
   }
 
   let staminaDelta = 0
@@ -6249,6 +7700,7 @@ export function packRaidsOnMarginalContext(adapter, {
 
   let bestOption = null
   let bestNoRaidPrepFloor = 0
+  const crossBuffStateMemo = new Map()
 
   for (const buffCombo of buffCombos) {
     if (isPastDeadlineFn?.()) break
@@ -6291,20 +7743,19 @@ export function packRaidsOnMarginalContext(adapter, {
       }
     }
 
-    const stateMemo = new Map()
     const evalStateDelta = (enVal, invDeltaMap) => {
-      const mKey = `${enVal}:${JSON.stringify(invDeltaMap)}`
-      let hit = stateMemo.get(mKey)
-      if (hit === undefined) {
-        hit = evaluateMarginalRaidDelta(adapter, marginalCtx, {
+      const mKey = `${enVal}:${coffeeUsedInPrep}:${JSON.stringify(invDeltaMap)}`
+      let baseHit = crossBuffStateMemo.get(mKey)
+      if (baseHit === undefined) {
+        baseHit = evaluateMarginalRaidDelta(adapter, marginalCtx, {
           invDeltaById: invDeltaMap,
           postRaidEn: enVal,
-          cashSpent,
+          cashSpent: 0,
           coffeeUsedInPrep,
         })
-        stateMemo.set(mKey, hit)
+        crossBuffStateMemo.set(mKey, baseHit)
       }
-      return hit
+      return baseHit - Number(cashSpent || 0)
     }
 
     const startEn = Number(prepRes.afterWorld.state?.en || 0)
@@ -6548,6 +7999,7 @@ export function createUnifiedRaidEvaluator(adapter, world, {
       utilityTokens,
       initialSoldByIsle: baseSoldByIsle,
       scenarioSupplyFactor: scenarios.reduce((s, x) => s + x.weight * x.externalSupplyFactor, 0),
+      skipObjectiveEval: true,
     })
     marginalCtx = baseRun.marginalContext
   }

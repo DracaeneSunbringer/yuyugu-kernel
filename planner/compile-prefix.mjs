@@ -115,6 +115,76 @@ export function computeCausalStochasticPrefix(adapter, worldBefore, rawDomestic 
     stochasticTriggerAction,
   }
 }
+
+/**
+ * Computes the earliest wall-clock timestamp `> atSec` at which a domestic physical event
+ * transitions without `world.rev` advancing (plot maturity, manual-water stage end, steal unlock,
+ * barn production/hunger/feed cooldown, trap ready, natural-day or isle-day reset, or planned wake).
+ */
+export function computeEarliestDomesticTransitionSec(adapter, world, plannedWakeSec = null) {
+  const { R } = adapter
+  const atSec = Math.floor(Number(world?.now || 0))
+  const cs = world?.clockStart ?? null
+  adapter.syncClock?.(cs)
+
+  let earliest = Infinity
+  const consider = (t) => {
+    if (Number.isFinite(t)) {
+      const ft = Math.floor(t)
+      if (ft > atSec && ft < earliest) earliest = ft
+    }
+  }
+
+  consider(adapter.nextIsleBoundary?.(atSec, cs))
+  consider(adapter.nextNaturalDayBoundary?.(atSec))
+  if (Number.isFinite(plannedWakeSec)) consider(plannedWakeSec)
+
+  const s = world?.state
+  if (!s) return earliest
+
+  const iDay = R.isleDay(atSec)
+  const weather = R.weatherOf(iDay)
+
+  for (let i = 0; i < (s.plotN || s.plots?.length || 0); i++) {
+    const p = s.plots?.[i]
+    if (!p) continue
+    const isSpr = R.sprinkled(s, i)
+    const auto = isSpr || weather === 1
+    const st = R.cropStage(p, atSec, auto)
+    if (st.stage >= 0 && st.stage < 3) {
+      const timing = adapter.exactPlotTimings?.(p, isSpr, atSec, cs)
+      if (timing?.matureAt) consider(timing.matureAt)
+      if (!auto && p.w <= st.stage) {
+        const stageEndSec = Number(p.t || atSec) + Math.ceil((Number(st.total || 3600) * (st.stage + 1)) / 3)
+        consider(stageEndSec)
+      }
+    } else if (st.stage === 3) {
+      const timing = adapter.exactPlotTimings?.(p, isSpr, atSec, cs, { isAlreadyRipe: true })
+      if (timing?.unlockAt) consider(timing.unlockAt)
+    }
+  }
+
+  for (let i = 0; i < (s.barn?.length || 0); i++) {
+    const pen = s.barn[i]
+    if (!pen) continue
+    const age = R.b12AnimalStage(pen, atSec)
+    if (age?.retired) continue
+    const bt = adapter.exactBarnTimings?.(pen, atSec, cs)
+    if (bt?.nextOwnUnitAt) consider(bt.nextOwnUnitAt)
+    consider(Number(pen.f || 0) + 8 * 3600)
+    consider(Number(pen.f || 0) + 86400)
+  }
+
+  for (let i = 0; i < (s.traps?.length || 0); i++) {
+    const tr = R.trapReady(s.traps[i], atSec, weather === 2)
+    if (!(tr?.n > 0) && Number(tr?.left) > 0) {
+      consider(atSec + Math.ceil(tr.left))
+    }
+  }
+
+  return earliest
+}
+
 export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}) {
   if (!plan || !Array.isArray(plan.trunkBuckets) || plan.trunkBuckets.length === 0) {
     return {
@@ -161,6 +231,25 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
 
   const rawDomestic = Array.isArray(bucket0.domesticActions) ? bucket0.domesticActions : []
   const rawVisits = Array.isArray(bucket0.visitActions) ? bucket0.visitActions : []
+  if (clockDrift > 0) {
+    const isWaitBucket0 = rawDomestic.length === 0 && rawVisits.length === 0
+    const earliestTransition = computeEarliestDomesticTransitionSec(
+      adapter,
+      { ...worldBefore, now: at0 },
+      isWaitBucket0 ? plan.nextWakeSec : null
+    )
+    if (nowW >= earliestTransition) {
+      return {
+        status: 'plan-invalid',
+        failedIndex: -1,
+        failedAction: null,
+        failedReason: `bucket0-domestic-transition-crossed:${at0}->${nowW}>=${earliestTransition}`,
+        domesticBatch: [],
+        visitOperations: [],
+        truncatedAfterStochastic: false,
+      }
+    }
+  }
   const maxBatch = adapter.R.WORLD?.maxActions || 40
 
   // Validate visit actions fail-closed before anything else

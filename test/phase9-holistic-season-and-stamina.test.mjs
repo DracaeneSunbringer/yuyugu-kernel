@@ -71,8 +71,7 @@ test('Phase 9.1 (Pillar 1 + Pillar 2): Multi-season continuation scarcity + Rene
     state: {
       plotN: 24,
       plots: Array(24).fill(null),
-      spr: 3,
-      house: 2,
+      tools: { pick: 4, rod: 4, can: 4, spr: 3, house: 2 },
       en: 100,
       enT: tSummerMid,
       enDay: R.worldDay(tSummerMid),
@@ -111,15 +110,16 @@ test('Phase 9.1 (Pillar 1 + Pillar 2): Multi-season continuation scarcity + Rene
     `Must hold 0.58x Summer tomato for multi-season ketchup/off-season premium instead of dumping raw (got ${JSON.stringify(rawTomatoSells0)})`
   )
 
-  // Case B: Final <=2 hours of Summer right before Autumn (`seasonOf(d) === 1`, `seasonOf(nextB) === 2`):
-  // Tomato (`g = 86400`, sprinkled `43200s = 12h` to first maturity) will 100% wither at Autumn boundary (`0` harvests),
-  // so physical Renewal NPV Rate naturally switches to cross-season `corn` (`seasons: [1, 2]`)!
+  // Case B: Final <=1 hour of Summer right before Autumn (`seasonOf(d) === 1`, `seasonOf(nextB) === 2`, `< 5184s` sprinkled tomato grow time):
+  // Tomato (`grow = 180` min -> sprinkled `5184s`) will 100% wither at Autumn boundary (`0` harvests),
+  // so physical Renewal NPV Rate naturally switches to a cross-season crop (`seasons` includes `AUTUMN`)!
   let tLateSummer = tSummerMid
   for (let step = 0; step < 2000; step++, tLateSummer += 1800) {
     const dNow = R.isleDay(tLateSummer)
     const nextB = adapter.nextIsleBoundary(tLateSummer, CLOCK_START)
     const dNext = R.isleDay(nextB)
-    if (R.seasonOf(dNow) === SUMMER && R.seasonOf(dNext) === AUTUMN && nextB - tLateSummer <= 7200) {
+    const tmTom = adapter.exactPlotTimings({ c: 'tomato', t: tLateSummer, w: 0, g: 0, h: 0 }, true, tLateSummer, CLOCK_START)
+    if (R.seasonOf(dNow) === SUMMER && R.seasonOf(dNext) === AUTUMN && tmTom && tmTom.matureAt > nextB) {
       break
     }
   }
@@ -131,8 +131,7 @@ test('Phase 9.1 (Pillar 1 + Pillar 2): Multi-season continuation scarcity + Rene
     state: {
       plotN: 12,
       plots: Array(12).fill(null),
-      spr: 3,
-      house: 2,
+      tools: { pick: 4, rod: 4, can: 4, spr: 3, house: 2 },
       en: 80,
       enT: tLateSummer,
       enDay: R.worldDay(tLateSummer),
@@ -191,9 +190,7 @@ test('Phase 9.2 (Pillar 3): Overnight 22:04 CST reproduction — overnight free 
     state: {
       plotN: 24,
       plots: Array.from({ length: 24 }, () => ({ c: 'corn', t: t2204 - 600, g: 0, w: 3, h: 0 })),
-      spr: 3,
-      house: 2, // enMax = 140
-      tools: { pick: 4, rod: 4, can: 4 },
+      tools: { pick: 4, rod: 4, can: 4, spr: 3, house: 2 }, // enMax = 140
       en: 61,
       enT: t2204,
       enDay: R.worldDay(t2204),
