@@ -13,6 +13,8 @@ import { executeTransaction, reconcileUnknownWithFreshWorld } from '../execution
 import { auditTransactionReplay } from '../audit/replay.mjs'
 import { buildAuditDecisionReport } from '../audit/report.mjs'
 import { runControllerStep } from '../cli/controller.mjs'
+import { KernelHttpClient } from '../execution/http-client.mjs'
+import { SnipeScheduler } from '../execution/snipe-scheduler.mjs'
 
 const RULES_PATH = path.resolve('rules/pet-world-rules.js')
 const CLOCK_START = 1794212939
@@ -500,4 +502,145 @@ test('Phase 5.8 (Codex P1-5 & P2): In-lock stale pre-state abort, honest unattri
   })
   assert.equal(autoAudit.identifiable, true)
   assert.equal(autoAudit.verdict, 'ex-ante-consistent')
+})
+
+test('Phase 5.9: CapEx rejects coarse-bucket house upgrade illusion & staged snipe skips stale eat prep when stamina is already full', async () => {
+  const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: CLOCK_START })
+  const t0 = 1794340000
+
+  // 1) Continuous-daemon default locks houseMax=0, and even explicit houseMax=5 rejects 250k house upgrade
+  const richWorld = makeWorld(adapter, t0, {
+    coins: 300000,
+    state: {
+      en: 2,
+      enT: t0,
+      plotN: 24,
+      plots: Array(24).fill(null),
+      barnN: 6,
+      barn: Array.from({ length: 6 }, () => ({ k: 'cow', f: t0, p: t0, m: 80, born: t0 - 86400 * 10 })),
+      traps: Array.from({ length: 4 }, () => ({ p: t0 })),
+      tools: { rod: 4, pick: 4, spr: 3, house: 1 },
+      mine: { max: 30 },
+      iq: { d: adapter.R.isleIndex(t0), craft: 80, mine: 0, fish: 0, bomb: 10 },
+      inv: { tomato: [50, 0, 0], feed: [20, 0, 0] },
+    },
+  })
+
+  const defaultEnv = buildObservationEnvelope(adapter, {
+    world: richWorld,
+    account: 'secondary',
+    userConstraints: { allowCapex: true },
+  })
+  assert.equal(defaultEnv.constraints.capexTargets.houseMax, 0)
+
+  const houseOverrideEnv = buildObservationEnvelope(adapter, {
+    world: richWorld,
+    account: 'secondary',
+    userConstraints: {
+      allowCapex: true,
+      maxCapexPaybackSec: 14400,
+      capexTargets: { houseMax: 5 },
+    },
+  })
+  const planHouse = solveUnifiedPlan(adapter, houseOverrideEnv, buildObjectiveConfig({ horizonSec: 14400 }), {
+    scenarios: [{ id: 'det', weight: 1, externalSupplyFactor: 1.0 }],
+  })
+  const houseActs = (planHouse.trunkBuckets[0]?.domesticActions || []).filter(
+    (a) => a.a === 'upgrade' && a.k === 'house'
+  )
+  assert.equal(houseActs.length, 0, 'Must NOT hallucinate payback for 250k house upgrade from coarse bucket eat ceilings!')
+
+  // 2) Cold-cache staged snipe (<2s lead) with stale `plannedPrepActs: [{ a: 'eat', id: 'tomato', q: 0 }]` when `en = 102` (`> enMax = 100`)
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ukernel-p58-'))
+  const journal = new ContentAddressedJournal({ rootDir: path.join(tmpDir, 'journal'), account: 'main' })
+  const lockDir = path.join(tmpDir, 'locks')
+  const scheduler = new SnipeScheduler({
+    accountKey: 'main',
+    scheduleFilePath: path.join(tmpDir, 'sched.json'),
+    gearLockRoot: lockDir,
+  })
+
+  const unlockAt = t0 + 1
+  const targetId = 9099
+  scheduler.data.targets[String(targetId)] = {
+    id: targetId,
+    name: 'FullStamTarget',
+    level: 10,
+    guard: false,
+    readyEligible: false,
+    stealableCount: 0,
+    upcomingEligible: true,
+    exactUnlockKnown: true,
+    expectedUnlockAt: unlockAt,
+    upcomingSpots: 3,
+    projectedEnergyCost: 6,
+    projectedScore: 18000,
+    plannedPrepActs: [{ a: 'eat', id: 'tomato', q: 0 }],
+    numGearChanges: 0,
+    updatedAt: t0 - 120,
+  }
+
+  let curWorld = makeWorld(adapter, t0, {
+    rev: 50,
+    coins: 100000,
+    state: {
+      en: 102,
+      enT: t0,
+      tools: { rod: 4, pick: 4, spr: 3, house: 0 },
+      inv: { tomato: [10, 0, 0] },
+    },
+  })
+  let virtMs = t0 * 1000
+  const actPosts = []
+  const client = new KernelHttpClient({
+    baseUrl: 'https://mock.local',
+    cookieHeader: 'sid=test_token',
+    nowMsFn: () => virtMs,
+    sleepMsFn: async (ms) => { virtMs += Math.max(0, ms) },
+    fetchImpl: async (url, init = {}) => {
+      const u = new URL(url)
+      virtMs += 10
+      const nowSec = Math.floor(virtMs / 1000)
+      if (init.method === 'GET' && u.pathname === '/api/pet/world') {
+        return { status: 200, headers: new Map(), text: async () => JSON.stringify({ ...curWorld, now: nowSec }) }
+      }
+      if (init.method === 'POST' && u.pathname === '/api/pet/world/act') {
+        const body = JSON.parse(init.body)
+        actPosts.push(body)
+        const sim = adapter.simulateBatch(curWorld, body.actions, { t: nowSec, prices: curWorld.prices })
+        curWorld = { ...sim.afterWorld, rev: curWorld.rev + 1 }
+        return { status: 200, headers: new Map(), text: async () => JSON.stringify({ ok: true, out: sim.result.out, world: curWorld }) }
+      }
+      if (init.method === 'GET' && u.pathname === '/api/pet/battle/gear') {
+        return {
+          status: 200,
+          headers: new Map(),
+          text: async () => JSON.stringify({ gear: { weapon: null, armor: null, charm: null }, bag: [] }),
+        }
+      }
+      if (init.method === 'POST' && u.pathname === `/api/pet/world/visit/${targetId}`) {
+        curWorld = { ...curWorld, rev: curWorld.rev + 1, state: { ...curWorld.state, en: curWorld.state.en - 6 } }
+        return {
+          status: 200,
+          headers: new Map(),
+          text: async () => JSON.stringify({ ok: true, result: { outcome: 'steal', spots: 3, n: 3, items: [['corn', 3]] }, world: curWorld }),
+        }
+      }
+      throw new Error(`Unexpected HTTP call: ${init.method} ${u.pathname}`)
+    },
+  })
+  client.observeServerTimestampSec(t0)
+
+  const snipeRes = await scheduler.executeStagedSnipe({
+    adapter,
+    httpClient: client,
+    journal,
+    lockRootDir: lockDir,
+    fetchWorldFn: () => client.getJson('/api/pet/world'),
+    stageWindowSec: 10,
+    postUnlockOffsetMs: 25,
+  })
+
+  assert.equal(snipeRes.status, 'confirmed')
+  assert.equal(actPosts.length, 0, 'Must skip stale eat(tomato) prep completely when en=102 >= neededEn=6!')
 })

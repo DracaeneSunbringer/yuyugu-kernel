@@ -124,12 +124,23 @@ export function normalizeUserConstraints(raw = {}, account = 'main') {
   const defaultMinStealSpots = isDomesticSecondary
     ? 999999
     : (Number.isFinite(raw.minStealSpots) ? Math.max(0, Math.floor(raw.minStealSpots)) : 0)
+  const baseCapexTargets = isDomesticSecondary
+    ? { plotsMax: 24, barnMax: 8, trapsMax: 4, houseMax: 0, toolsMax: { rod: 4, pick: 4, spr: 3 } }
+    : { plotsMax: 0, barnMax: 0, trapsMax: 0, houseMax: 0, toolsMax: { rod: 0, pick: 0, spr: 0 } }
+  const mergedCapexTargets = raw.capexTargets
+    ? {
+        ...baseCapexTargets,
+        ...raw.capexTargets,
+        toolsMax: {
+          ...baseCapexTargets.toolsMax,
+          ...(raw.capexTargets.toolsMax || {}),
+        },
+      }
+    : baseCapexTargets
   const out = {
     account,
     allowCapex: raw.allowCapex !== undefined ? !!raw.allowCapex : defaultAllowCapex,
-    capexTargets: raw.capexTargets || (isDomesticSecondary
-      ? { plotsMax: 24, barnMax: 8, trapsMax: 4, houseMax: 5, toolsMax: { rod: 4, pick: 4, spr: 3 } }
-      : { plotsMax: 0, barnMax: 0, trapsMax: 0, houseMax: 0, toolsMax: { rod: 0, pick: 0, spr: 0 } }),
+    capexTargets: mergedCapexTargets,
     maxCapexPaybackSec: Number.isFinite(raw.maxCapexPaybackSec) ? raw.maxCapexPaybackSec : 72 * 3600,
     maxStealsPerIsleDay: defaultMaxSteals,
     minStealSpots: defaultMinStealSpots,

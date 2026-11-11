@@ -940,19 +940,19 @@ function enumerateLegalCapexCandidates(adapter, world, constraints) {
   const maxPlots = Math.min(R.WORLD.plotsMax, targets.plotsMax ?? R.WORLD.plotsMax)
   if ((s.plotN || 0) < maxPlots) {
     const price = R.WORLD.plotPrice((s.plotN || 0) + 1)
-    if (price <= freeCash) candidates.push({ action: { a: 'expand', k: 'plot' }, price })
+    if (price <= freeCash) candidates.push({ actions: [{ a: 'expand', k: 'plot' }], price })
   }
 
   const maxTraps = Math.min(R.WORLD.trapMax, targets.trapsMax ?? R.WORLD.trapMax)
   if ((s.traps?.length || 0) < maxTraps) {
     const price = R.WORLD.trapPrice((s.traps?.length || 0) + 1)
-    if (price <= freeCash) candidates.push({ action: { a: 'buyTrap' }, price })
+    if (price <= freeCash) candidates.push({ actions: [{ a: 'buyTrap' }], price })
   }
 
   if ((s.barn?.length || 0) < (s.barnN || 0)) {
     for (const a of R.ANIMALS || []) {
       if (a.price <= freeCash) {
-        candidates.push({ action: { a: 'buyAnimal', k: a.id }, price: a.price })
+        candidates.push({ actions: [{ a: 'buyAnimal', k: a.id }], price: a.price })
       }
     }
   }
@@ -965,7 +965,7 @@ function enumerateLegalCapexCandidates(adapter, world, constraints) {
     if (curLv >= maxLv) continue
     const price = R.upgradePrice(s, tool)
     if (price != null && price <= freeCash) {
-      candidates.push({ action: { a: 'upgrade', k: tool }, price })
+      candidates.push({ actions: [{ a: 'upgrade', k: tool }], price })
     }
   }
 
@@ -1012,7 +1012,10 @@ function selectCapexByTrajectoryDelta(adapter, {
   const innerAllowed = new Set([...allowedSet].filter((a) => a !== 'capex' && a !== 'visit'))
 
   const evalRolloutMean = (startW) => {
-    const tl = buildEventBuckets(adapter, startW, { horizonSec: paybackSec, maxBuckets: 8 })
+    const tl = buildEventBuckets(adapter, startW, {
+      horizonSec: paybackSec,
+      maxBuckets: 8,
+    })
     const initDelta = Number(startW.coins || 0) - Number(world0.coins || 0)
     const runWithStream = (streamIdx) => optimizeAndSimulateSequence(adapter, {
       startWorld: startW,
@@ -1051,22 +1054,38 @@ function selectCapexByTrajectoryDelta(adapter, {
     if (isPastDeadlineFn?.()) break
     const cands = enumerateLegalCapexCandidates(adapter, curWorld, constraints)
     if (cands.length === 0) break
-    let bestAct = null
+    let bestActs = null
     let bestVal = curBaseline
     let bestAfterW = null
     for (const c of cands) {
       if (isPastDeadlineFn?.()) break
-      const sim = adapter.simulateBatch(curWorld, [c.action], { t: curWorld.now, prices: curWorld.prices })
+      const candActs = c.actions || (c.action ? [c.action] : [])
+      if (candActs.length === 0) continue
+      const sim = adapter.simulateBatch(curWorld, candActs, { t: curWorld.now, prices: curWorld.prices })
       if (!sim.allOk) continue
-      const val = evalRolloutMean(sim.afterWorld)
+      let evalWorld = sim.afterWorld
+      if (candActs.length === 1 && candActs[0].a === 'upgrade' && candActs[0].k === 'house') {
+        evalWorld = adapter.cloneWorld(sim.afterWorld)
+        evalWorld.state.tools.house = Number(curWorld.state?.tools?.house || 0)
+        let lnProbe = curWorld.now
+        let nightCount = 0
+        for (let g = 0; g < 16; g++) {
+          const ev = adapter.nextLongNightEvent(lnProbe)
+          if (!ev || ev.at > curWorld.now + paybackSec || ev.at <= lnProbe) break
+          if (ev.kind === 'long-night-end') nightCount++
+          lnProbe = ev.at
+        }
+        evalWorld.state.en = Number(sim.afterWorld.state?.en || 0) + nightCount * Number(adapter.R.WORLD?.energyPerHouse || 20)
+      }
+      const val = evalRolloutMean(evalWorld)
       if (val > bestVal + 1e-6) {
         bestVal = val
-        bestAct = c.action
+        bestActs = candActs
         bestAfterW = sim.afterWorld
       }
     }
-    if (!bestAct) break
-    chosen.push(bestAct)
+    if (!bestActs) break
+    chosen.push(...bestActs)
     curWorld = bestAfterW
     curBaseline = bestVal
   }

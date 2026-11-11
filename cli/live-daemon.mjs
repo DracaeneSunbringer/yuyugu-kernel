@@ -492,6 +492,7 @@ if (isDirectMain) {
     : {
         domesticOnly: true,
         allowCapex: effectiveAllowCapex,
+        capexTargets: { plotsMax: 24, barnMax: 8, trapsMax: 4, houseMax: 0, toolsMax: { rod: 4, pick: 4, spr: 3 } },
         maxStealsPerIsleDay: 0,
         minStealSpots: 999999,
         allowThiefBuffPurchase: false,

@@ -5,6 +5,8 @@ import {
 } from '../model/observations.mjs'
 import {
   createUnifiedRaidEvaluator,
+  discoverRuleUtilityTokens,
+  findCheapestRaidStaminaPrep,
 } from '../planner/solve.mjs'
 import {
   computeGuardPosteriorForTarget,
@@ -912,7 +914,48 @@ export class SnipeScheduler {
         neededEn = liveEval.neededEn || neededEn
         precomputedDecision = liveEval.tacticalDecision || livePosterior?.decision || precomputedDecision
       } else {
-        fullPrepBatch = entry.plannedPrepActs || []
+        let curSimW = adapter.advanceTimeOnly(liveWorld, liveWorld.now)
+        const rebuiltPrep = []
+        for (const act of entry.plannedPrepActs || []) {
+          const buffDef = act?.a === 'buy' ? adapter.R.THIEF_ITEMS?.[act.id] : null
+          if (!buffDef || constraints.allowThiefBuffPurchase === false) continue
+          const curEff = adapter.R.b12Effect?.(curSimW.state, buffDef.slot, curSimW.now)
+          if (curEff?.legacy || (curEff && curEff.id !== act.id)) continue
+          if (curEff && curEff.id === act.id && curEff.until > curSimW.now + 60) continue
+          const step = adapter.simulateBatch(curSimW, [act], { t: curSimW.now, prices: curSimW.prices })
+          if (step.allOk) {
+            rebuiltPrep.push(act)
+            curSimW = step.afterWorld
+          }
+        }
+        if (Number(curSimW.state?.en || 0) < neededEn) {
+          const prepRes = findCheapestRaidStaminaPrep(
+            adapter,
+            curSimW,
+            neededEn,
+            new Set(['eat', 'coffee', 'stockBuy']),
+            discoverRuleUtilityTokens(adapter),
+            constraints
+          )
+          if (prepRes.feasible) {
+            rebuiltPrep.push(...prepRes.prepActs)
+          }
+        }
+        fullPrepBatch = rebuiltPrep
+      }
+
+      if (fullPrepBatch.length > 0) {
+        const verifiedPrep = []
+        let simW = adapter.advanceTimeOnly(liveWorld, liveWorld.now)
+        for (const act of fullPrepBatch) {
+          if (act.a === 'eat' && Number(simW.state?.en || 0) >= neededEn) continue
+          const step = adapter.simulateBatch(simW, [act], { t: simW.now, prices: simW.prices })
+          if (step.allOk) {
+            verifiedPrep.push(act)
+            simW = step.afterWorld
+          }
+        }
+        fullPrepBatch = verifiedPrep
       }
 
       if (fullPrepBatch.length === 0 && Number(liveWorld.state?.en || 0) < neededEn) {
