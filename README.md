@@ -24,13 +24,15 @@ npm test
 
 ### 2. 配置 Cookie
 
-浏览器登录 `https://52dmeme.com/pets`，按 `F12` 打开 `Network` 面板，任选一个 `/api/pet/world` 请求并复制请求头中的完整 `Cookie`。
+浏览器登录 `https://52dmeme.com/pets`，按 `F12` 打开开发者工具获取登录 `sid`：
+- **方式 A（Network）**：打开 `Network` 面板，任选一个 `/api/pet/world` 请求，复制请求头中的 `Cookie`（形如 `sid=xxxx`）；
+- **方式 B（Application）**：打开 `Application -> Cookies -> https://52dmeme.com`，复制 `sid` 对应的 `Value`（程序会自动补全 `sid=` 前缀）。
 
 将 `.session.example.json` 复制为 `.session.json` 并填入（`.gitignore` 已默认忽略所有 `.session*.json`）：
 
 ```json
 {
-  "cookie": "粘贴完整 Cookie 字符串"
+  "cookie": "sid=粘贴你的sid值"
 }
 ```
 

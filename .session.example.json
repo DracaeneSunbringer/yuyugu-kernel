@@ -1,4 +1,4 @@
 {
-  "_comment": "复制为 .session.json 并填入浏览器登录后的完整 Cookie 字符串即可：",
-  "cookie": "session=YOUR_SESSION_COOKIE_VALUE"
+  "_comment": "复制为 .session.json 并填入浏览器登录后的 sid Cookie（如 sid=xxxx，或直接填等号后的值）：",
+  "cookie": "sid=YOUR_SID_COOKIE_VALUE"
 }

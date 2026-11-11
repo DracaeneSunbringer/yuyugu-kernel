@@ -26,20 +26,85 @@ const OPERATION_IDEMPOTENT_POST_PATHS = new Set([
   '/api/pet/state',
 ])
 
+const PLACEHOLDER_COOKIE_RE = /^(YOUR_SID_COOKIE_VALUE|YOUR_SESSION_COOKIE_VALUE|粘贴.*Cookie.*|粘贴你的sid值)$/i
+
+export function normalizeCookieHeaderString(rawInput, sourceLabel = 'cookie') {
+  let s = String(rawInput ?? '').replace(/[\r\n]+/g, ' ').trim()
+  // Strip accidental surrounding quotes or copied `Cookie:` header prefix (even if repeated)
+  while (/^cookie\s*:/i.test(s)) {
+    s = s.replace(/^cookie\s*:\s*/i, '').trim()
+  }
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim()
+    while (/^cookie\s*:/i.test(s)) {
+      s = s.replace(/^cookie\s*:\s*/i, '').trim()
+    }
+  }
+  if (!s) {
+    throw new Error(`Empty cookie value in ${sourceLabel}`)
+  }
+
+  // Bare token copied from DevTools `Application -> Cookies -> sid -> Value` (no `=`)
+  if (!s.includes('=')) {
+    if (PLACEHOLDER_COOKIE_RE.test(s)) {
+      throw new Error(`Unreplaced placeholder cookie in ${sourceLabel}; please paste your real 'sid' cookie`)
+    }
+    return `sid=${s}`
+  }
+
+  const parts = s.split(';').map((p) => p.trim()).filter(Boolean)
+  const parsed = parts.map((part) => {
+    const eqIdx = part.indexOf('=')
+    if (eqIdx < 0) return { key: '', val: part, raw: part }
+    return {
+      key: part.slice(0, eqIdx).trim(),
+      val: part.slice(eqIdx + 1).trim(),
+      raw: part,
+    }
+  })
+
+  const hasSid = parsed.some((p) => p.key.toLowerCase() === 'sid')
+  const normalized = parsed.map((p) => {
+    if (!p.key) return p.raw
+    let key = p.key
+    if (key.toLowerCase() === 'sid') {
+      key = 'sid'
+    } else if (!hasSid && key.toLowerCase() === 'session') {
+      // Tolerate legacy `.session.example.json` prefix `session=<real_sid_value>`
+      key = 'sid'
+    }
+    if (key === 'sid' && (!p.val || PLACEHOLDER_COOKIE_RE.test(p.val))) {
+      throw new Error(`Unreplaced placeholder cookie in ${sourceLabel}; please paste your real 'sid' cookie`)
+    }
+    return `${key}=${p.val}`
+  })
+
+  return normalized.join('; ')
+}
+
 export function parseSessionCookieHeader(sessionFilePath) {
   const raw = JSON.parse(fs.readFileSync(sessionFilePath, 'utf8').replace(/^\uFEFF/, ''))
-  if (typeof raw === 'string') return raw.trim()
-  if (typeof raw?.cookie === 'string' && raw.cookie.trim()) return raw.cookie.trim()
-  if (typeof raw?.cookieHeader === 'string' && raw.cookieHeader.trim()) return raw.cookieHeader.trim()
+  if (typeof raw === 'string') return normalizeCookieHeaderString(raw, sessionFilePath)
+  if (typeof raw?.sid === 'string' && raw.sid.trim()) {
+    return normalizeCookieHeaderString(raw.sid, sessionFilePath)
+  }
+  if (typeof raw?.cookie === 'string' && raw.cookie.trim()) {
+    return normalizeCookieHeaderString(raw.cookie, sessionFilePath)
+  }
+  if (typeof raw?.cookieHeader === 'string' && raw.cookieHeader.trim()) {
+    return normalizeCookieHeaderString(raw.cookieHeader, sessionFilePath)
+  }
   if (raw?.cookies && typeof raw.cookies === 'object' && !Array.isArray(raw.cookies)) {
-    return Object.entries(raw.cookies)
+    const joined = Object.entries(raw.cookies)
       .map(([k, v]) => `${k}=${typeof v === 'object' && v !== null ? (v.value ?? '') : v}`)
       .join('; ')
+    return normalizeCookieHeaderString(joined, sessionFilePath)
   }
   if (Array.isArray(raw?.cookies)) {
-    return raw.cookies
+    const joined = raw.cookies
       .map((c) => (typeof c === 'string' ? c.split(';')[0] : `${c.name}=${c.value}`))
       .join('; ')
+    return normalizeCookieHeaderString(joined, sessionFilePath)
   }
   throw new Error(`Unrecognized session format in ${sessionFilePath}`)
 }
@@ -112,7 +177,7 @@ export class KernelHttpClient {
   }
 
   getCookieHeader() {
-    if (this._staticCookieHeader) return this._staticCookieHeader
+    if (this._staticCookieHeader) return normalizeCookieHeaderString(this._staticCookieHeader, 'cookieHeader')
     if (this.sessionFilePath) return parseSessionCookieHeader(this.sessionFilePath)
     throw new Error('KernelHttpClient requires cookieHeader or sessionFilePath')
   }
@@ -353,7 +418,10 @@ export class KernelHttpClient {
     const r = await this.request(apiPath, { ...opts, method: 'GET' })
     if (!r.ok) {
       const msg = r.body?.error || r.body?.msg || r.error || `HTTP ${r.status}`
-      const err = new Error(`GET ${apiPath} failed: ${msg}`)
+      const hint = r.status === 401
+        ? ' (请检查 .session.json 中是否填入了登录后的 sid Cookie，且未在浏览器点击退出登录)'
+        : ''
+      const err = new Error(`GET ${apiPath} failed: ${msg}${hint}`)
       err.status = r.status
       err.response = r
       throw err

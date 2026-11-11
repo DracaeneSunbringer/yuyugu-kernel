@@ -12,7 +12,7 @@ import { compileExecutablePrefix } from '../planner/compile-prefix.mjs'
 import { ContentAddressedJournal } from '../audit/journal.mjs'
 import { buildAuditDecisionReport } from '../audit/report.mjs'
 import { executeTransaction, reconcileUnknownWithFreshWorld } from '../execution/reconcile.mjs'
-import { KernelHttpClient } from '../execution/http-client.mjs'
+import { KernelHttpClient, normalizeCookieHeaderString, parseSessionCookieHeader } from '../execution/http-client.mjs'
 import {
   executeWithTacticalLoadout,
   loadProfileStore,
@@ -138,6 +138,19 @@ test('Phase 7.1: KernelHttpClient strictly forbids network/5xx retries on non-id
     () => dryClient.postJson('/api/pet/world/visit/9002', { kind: 'all', i: 0 }),
     /DRY_RUN_WRITE_FIREWALL/
   )
+
+  // 5) Session cookie parser normalizes common user copy-paste formats & rejects unreplaced placeholders
+  assert.equal(normalizeCookieHeaderString('abc123token'), 'sid=abc123token')
+  assert.equal(normalizeCookieHeaderString('Sid=abc123token'), 'sid=abc123token')
+  assert.equal(normalizeCookieHeaderString('Cookie: sid=abc123token; cf_clearance=xyz'), 'sid=abc123token; cf_clearance=xyz')
+  assert.equal(normalizeCookieHeaderString('session=abc123token'), 'sid=abc123token')
+  assert.throws(() => normalizeCookieHeaderString('sid=YOUR_SID_COOKIE_VALUE'), /Unreplaced placeholder cookie/)
+  assert.throws(() => normalizeCookieHeaderString('session=YOUR_SESSION_COOKIE_VALUE'), /Unreplaced placeholder cookie/)
+
+  const sessTmp = makeTempDir('p7-sess-')
+  const bareSessFile = path.join(sessTmp, '.session.json')
+  fs.writeFileSync(bareSessFile, JSON.stringify({ cookie: 'raw_sid_val_99' }), 'utf8')
+  assert.equal(parseSessionCookieHeader(bareSessFile), 'sid=raw_sid_val_99')
 })
 
 test('Phase 7.2: Deterministic same-day visit:unknown reconciliation via cnt["st"+id] + rev guard & cross-midnight safety', async () => {

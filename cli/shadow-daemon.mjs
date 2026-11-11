@@ -6,6 +6,7 @@ import { buildObjectiveConfig, evaluateTerminalLiquidationTail } from '../model/
 import { runControllerStep } from './controller.mjs'
 import { buildAuditDecisionReport } from '../audit/report.mjs'
 import { computeGuardPosteriorForTarget } from '../execution/combat-engine.mjs'
+import { parseSessionCookieHeader } from '../execution/http-client.mjs'
 
 /**
  * Strictly Read-Only Shadow Parallel Observer (`cli/shadow-daemon.mjs`)
@@ -18,24 +19,6 @@ import { computeGuardPosteriorForTarget } from '../execution/combat-engine.mjs'
  * 4. Independent Layer-3 Self-Audit: Every shadow tick records both `controller.mjs` (`dryRun: true`)
  *    output and `audit/report.mjs` independent reference check + live `rev` transition tracking.
  */
-
-function parseSessionCookieHeader(sessionFilePath) {
-  const raw = JSON.parse(fs.readFileSync(sessionFilePath, 'utf8').replace(/^\uFEFF/, ''))
-  if (typeof raw === 'string') return raw
-  if (typeof raw?.cookie === 'string' && raw.cookie.trim()) return raw.cookie.trim()
-  if (typeof raw?.cookieHeader === 'string' && raw.cookieHeader.trim()) return raw.cookieHeader.trim()
-  if (raw?.cookies && typeof raw.cookies === 'object' && !Array.isArray(raw.cookies)) {
-    return Object.entries(raw.cookies)
-      .map(([k, v]) => `${k}=${typeof v === 'object' && v !== null ? (v.value ?? '') : v}`)
-      .join('; ')
-  }
-  if (Array.isArray(raw?.cookies)) {
-    return raw.cookies
-      .map((c) => (typeof c === 'string' ? c.split(';')[0] : `${c.name}=${c.value}`))
-      .join('; ')
-  }
-  throw new Error(`Unrecognized session format in ${sessionFilePath}`)
-}
 
 async function readOnlyGetJson(baseUrl, apiPath, cookieHeader, stats) {
   if (!apiPath.startsWith('/api/')) {
