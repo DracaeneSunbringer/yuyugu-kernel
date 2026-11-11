@@ -1,17 +1,25 @@
 {
   "name": "yuyugu-unified-kernel",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "license": "MIT",
   "type": "module",
+  "repository": "https://github.com/DracaeneSunbringer/yuyugu-kernel",
   "description": "Zero-hardcoded-ID unified rolling-horizon economic decision kernel, staged raid scheduler, CRN combat optimizer, and counterfactual audit engine for 52dmeme Pet World (鱼鱼谷)",
+  "releaseNotes": {
+    "date": "2026-11-12",
+    "severity": "important",
+    "summary": "上线跨季节延续稀缺估值、单位占田时间净现值率选种、岛日体力按需补给与自动版本更新提醒（修复提前换茬与误吃高星反季作物问题）",
+    "upgradeCommand": "git pull"
+  },
   "engines": {
     "node": ">=22.0.0"
   },
   "scripts": {
     "start": "node cli/live-daemon.mjs",
     "start:domestic": "node cli/live-daemon.mjs --domestic-only",
+    "check-update": "node cli/live-daemon.mjs --check-update",
     "preflight": "node cli/live-daemon.mjs --dry-run --once",
     "shadow": "node cli/shadow-daemon.mjs --once",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test --test-concurrency=4 test/*.test.mjs"
   }
 }

@@ -1,4 +1,5 @@
 import {
+  buildContinuationTimeline,
   buildObjectiveConfig,
   buildTerminalPrices,
   discountFactor,
@@ -489,13 +490,16 @@ export function auditDecisionAgainstReference(adapter, {
   let nodesVisited = 0
   let hitNodeCap = false
 
+  const allowedRefSet = new Set(allowedActionTypes)
+
   // Recursive best-continuation evaluator for a single scenario from `stepIdx` onwards
   const evalBestContinuationSingleScenario = (curWorld, subSteps, idx, sc, cashEvents, soldByIsle) => {
     if (idx >= subSteps.length) {
+      const prevSoldAtEnd = soldByIsle.get(adapter.R.isleIndex(tEnd) - 1) || null
       const termPrices = sc.explicitTerminalPrices
         || (objectiveCfg.terminalSupplyMode === 'zero'
             ? {}
-            : buildTerminalPrices(adapter, { ...curWorld, now: tEnd }, worldBefore, objectiveCfg, sc.externalSupplyFactor))
+            : buildTerminalPrices(adapter, { ...curWorld, now: tEnd }, worldBefore, objectiveCfg, sc.externalSupplyFactor, prevSoldAtEnd))
       const finalW = adapter.advanceTimeOnly(curWorld, tEnd, { futurePrices: termPrices })
       const ev = evaluateTrajectoryObjective(adapter, {
         initialWorld: worldBefore,
@@ -503,7 +507,10 @@ export function auditDecisionAgainstReference(adapter, {
         cashEvents,
         objectiveCfg,
         scenarioSupplyFactor: sc.externalSupplyFactor,
-        explicitTerminalPrices: objectiveCfg.terminalSupplyMode === 'zero' ? {} : termPrices,
+        explicitTerminalPrices: sc.explicitTerminalPrices || (objectiveCfg.terminalSupplyMode === 'zero' ? {} : null),
+        prevIsleSoldMap: prevSoldAtEnd,
+        allowTerminalCraft: allowedRefSet.has('craft'),
+        allowTerminalHarvest: allowedRefSet.has('harvest'),
       })
       return { bestVal: ev.totalObjectiveValue, bestTrace: [] }
     }
@@ -517,6 +524,8 @@ export function auditDecisionAgainstReference(adapter, {
         cashEvents,
         objectiveCfg,
         scenarioSupplyFactor: sc.externalSupplyFactor,
+        allowTerminalCraft: allowedRefSet.has('craft'),
+        allowTerminalHarvest: allowedRefSet.has('harvest'),
       })
       return { bestVal: ev.totalObjectiveValue, bestTrace: [] }
     }
@@ -537,6 +546,7 @@ export function auditDecisionAgainstReference(adapter, {
     let bestTrace = []
 
     for (const c of cands) {
+      if (hitNodeCap && bestVal > -Infinity) break
       const nextCash = [...cashEvents]
       const deltaC = Number(c.simAfterWorld.coins || 0) - Number(wAtStep.coins || 0)
       if (deltaC !== 0) nextCash.push({ atSec: st.atSec, netCashDelta: deltaC })
@@ -600,6 +610,7 @@ export function auditDecisionAgainstReference(adapter, {
     let bestScen = {}
 
     for (const c of cands) {
+      if (hitNodeCap && bestVal > -Infinity) break
       const nextCash = [...cashEvents]
       const deltaC = Number(c.simAfterWorld.coins || 0) - Number(wAtStep.coins || 0)
       if (deltaC !== 0) nextCash.push({ atSec: st.atSec, netCashDelta: deltaC })
@@ -864,10 +875,11 @@ function computeIndependentContinuationUpperBound(adapter, {
   if (tContStart >= tEnd) {
     let expTerm = 0
     for (const sc of scenarios) {
+      const prevSoldTerm = sold0.get(R.isleIndex(tEnd) - 1) || null
       const termPrices = sc.explicitTerminalPrices
         || (objectiveCfg.terminalSupplyMode === 'zero'
             ? {}
-            : buildTerminalPrices(adapter, { ...afterStep0World, now: tEnd }, worldBefore, objectiveCfg, sc.externalSupplyFactor, sold0.get(R.isleIndex(tEnd) - 1) || null))
+            : buildTerminalPrices(adapter, { ...afterStep0World, now: tEnd }, worldBefore, objectiveCfg, sc.externalSupplyFactor, prevSoldTerm))
       let wFinal = adapter.advanceTimeOnly(afterStep0World, tEnd, { futurePrices: termPrices })
       for (const [arrSec, items] of timeline.arrMap.entries()) {
         if (arrSec > step0.atSec && arrSec <= tEnd) {
@@ -880,7 +892,10 @@ function computeIndependentContinuationUpperBound(adapter, {
         cashEvents: cash0,
         objectiveCfg,
         scenarioSupplyFactor: sc.externalSupplyFactor,
-        explicitTerminalPrices: objectiveCfg.terminalSupplyMode === 'zero' ? {} : termPrices,
+        explicitTerminalPrices: sc.explicitTerminalPrices || (objectiveCfg.terminalSupplyMode === 'zero' ? {} : null),
+        prevIsleSoldMap: prevSoldTerm,
+        allowTerminalCraft: allowed.has('craft'),
+        allowTerminalHarvest: allowed.has('harvest'),
       })
       expTerm += sc.weight * ev.totalObjectiveValue
     }
@@ -925,22 +940,27 @@ function computeIndependentContinuationUpperBound(adapter, {
       arrivals: sec > tContStart ? (timeline.arrMap.get(sec) || []) : [],
     }))
 
+    const prevSoldForTerm = R.isleIndex(tEnd) - 1 === step0.isleIndex ? (sold0.get(step0.isleIndex) || null) : null
+    const contSlots = (sc.explicitTerminalPrices || objectiveCfg.terminalSupplyMode === 'zero')
+      ? []
+      : buildContinuationTimeline(adapter, { ...wStart, now: tEnd }, worldBefore, objectiveCfg, sc.externalSupplyFactor, prevSoldForTerm)
     const termPrices = sc.explicitTerminalPrices
       || (objectiveCfg.terminalSupplyMode === 'zero'
           ? {}
-          : buildTerminalPrices(
+          : (contSlots[0]?.prices ?? buildTerminalPrices(
               adapter,
               { ...wStart, now: tEnd },
               worldBefore,
               objectiveCfg,
               sc.externalSupplyFactor,
-              R.isleIndex(tEnd) - 1 === step0.isleIndex ? (sold0.get(step0.isleIndex) || null) : null
-            ))
+              prevSoldForTerm
+            )))
 
     const allSlots = [
       ...buckets.map((b, idx) => ({
         slotIdx: idx,
         atSec: b.atSec,
+        nextAtSec: b.nextAtSec,
         naturalDay: b.naturalDay,
         isleIndex: b.isleIndex,
         isleDay: b.isleDay,
@@ -950,18 +970,32 @@ function computeIndependentContinuationUpperBound(adapter, {
       })),
       ...(objectiveCfg.terminalSupplyMode === 'zero'
         ? []
-        : [{
-            slotIdx: B,
-            atSec: tEnd,
-            naturalDay: R.worldDay(tEnd),
-            isleIndex: R.isleIndex(tEnd),
-            isleDay: R.isleDay(tEnd),
-            prices: termPrices,
-            isTerminal: true,
-            disc: discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, tEnd - t0)),
-          }]),
+        : contSlots.length > 1
+          ? contSlots.map((cs, idx) => ({
+              slotIdx: B + idx,
+              atSec: cs.atSec,
+              nextAtSec: cs.nextAtSec,
+              naturalDay: cs.naturalDay,
+              isleIndex: cs.isleIndex,
+              isleDay: cs.isleDay,
+              prices: cs.prices,
+              isTerminal: true,
+              disc: discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, cs.atSec - t0)),
+            }))
+          : [{
+              slotIdx: B,
+              atSec: tEnd,
+              nextAtSec: tEnd,
+              naturalDay: R.worldDay(tEnd),
+              isleIndex: R.isleIndex(tEnd),
+              isleDay: R.isleDay(tEnd),
+              prices: termPrices,
+              isTerminal: true,
+              disc: discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, tEnd - t0)),
+            }]),
     ]
     const S = allSlots.length
+    const craftBoundSlots = contSlots.length > 1 ? S : B
     const avail0 = adapter.availableInvSnapshot(wStart.state)
 
     const itemSet = new Set([
@@ -978,7 +1012,7 @@ function computeIndependentContinuationUpperBound(adapter, {
     }
     const items = [...itemSet]
 
-    const isleIndices = [...new Set(buckets.map((b) => b.isleIndex))]
+    const isleIndices = [...new Set(allSlots.slice(0, craftBoundSlots).map((s) => s.isleIndex))]
     const naturalDays = [...new Set(allSlots.map((s) => s.naturalDay))]
     const startIsleIdx = R.isleIndex(tContStart)
     const startNatDay = R.worldDay(tContStart)
@@ -1046,7 +1080,7 @@ function computeIndependentContinuationUpperBound(adapter, {
     for (const idx of isleIndices) cCraftIsle.set(idx, addC(craftCapByIsle.get(idx)))
 
     const cPrefixEn = []
-    for (let b = 0; b < B; b++) cPrefixEn.push(addC(initEn + maxRegenTo(buckets[b].nextAtSec)))
+    for (let b = 0; b < craftBoundSlots; b++) cPrefixEn.push(addC(initEn + maxRegenTo(allSlots[b].nextAtSec)))
 
     const cCropTier = new Map()
     for (const id of items) {
@@ -1100,13 +1134,13 @@ function computeIndependentContinuationUpperBound(adapter, {
 
     if (allowed.has('craft')) {
       const craftEnCost = R.WORLD?.cost?.craft ?? 1
-      for (let b = 0; b < B; b++) {
+      for (let b = 0; b < craftBoundSlots; b++) {
         const slot = allSlots[b]
         const cap = craftCapByIsle.get(slot.isleIndex) || 0
         if (cap <= 0) continue
         for (const r of R.RECIPES || []) {
           const terms = [[cCraftIsle.get(slot.isleIndex), 1]]
-          for (let fb = b; fb < B; fb++) terms.push([cPrefixEn[fb], craftEnCost])
+          for (let fb = b; fb < craftBoundSlots; fb++) terms.push([cPrefixEn[fb], craftEnCost])
           for (let fs = b; fs < S; fs++) {
             for (const [inId, qty] of Object.entries(r.in || {})) {
               terms.push([cPrefixItem.get(`${inId}@${fs}`), qty])
@@ -1146,7 +1180,7 @@ function computeIndependentContinuationUpperBound(adapter, {
         const left = Math.max(0, (R.WORLD?.daily?.coffee || 3) - used)
         if (left <= 0) continue
         const terms = []
-        for (let fb = b; fb < B; fb++) terms.push([cPrefixEn[fb], -(R.WORLD?.coffee?.energy || 60)])
+        for (let fb = b; fb < craftBoundSlots; fb++) terms.push([cPrefixEn[fb], -(R.WORLD?.coffee?.energy || 60)])
         vars.push({ ub: left, obj: -(R.WORLD?.coffee?.price || 15000) * slot.disc, terms })
       }
     }
@@ -1183,7 +1217,7 @@ function computeIndependentContinuationUpperBound(adapter, {
           if (spec.q >= 1) terms.push([cQ12.get(spec.id), 1])
           if (spec.dailyCap != null) terms.push([cEdibleDaily.get(`${spec.id}:${slot.naturalDay}`), 1])
           for (let fs = b; fs < S; fs++) terms.push([cPrefixItem.get(`${spec.id}@${fs}`), 1])
-          for (let fb = b; fb < B; fb++) terms.push([cPrefixEn[fb], -spec.energyGain])
+          for (let fb = b; fb < craftBoundSlots; fb++) terms.push([cPrefixEn[fb], -spec.energyGain])
           vars.push({ ub, obj: 0, terms })
         }
       }

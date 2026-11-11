@@ -41,15 +41,22 @@ export function buildEventBuckets(adapter, world, {
   for (let i = 0; i < 32; i++) {
     const nextId = adapter.nextIsleBoundary(idCursor, world?.clockStart)
     if (nextId > tEnd || nextId <= idCursor) break
+    if (i === 0 && nextId - t0 >= 5400) {
+      addPoint(nextId - 60, 'pre-isle-regen-flush', false)
+    }
     addPoint(nextId, 'isle-day-reset', true)
     idCursor = nextId
   }
 
   // 3. Long-night transitions
+  const startIsleIndex = R.isleIndex(t0)
   let lnCursor = t0
   for (let i = 0; i < 16; i++) {
     const ev = adapter.nextLongNightEvent(lnCursor)
     if (!ev || ev.at > tEnd || ev.at <= lnCursor) break
+    if (ev.kind === 'long-night-end' && R.isleIndex(ev.at - 1) === startIsleIndex && ev.at - lnCursor >= 5 * 3600) {
+      addPoint(Math.floor(0.5 * (lnCursor + ev.at)), 'long-night-mid-regen', false)
+    }
     addPoint(ev.at, ev.kind, true)
     lnCursor = ev.at
   }

@@ -99,6 +99,14 @@ export function computeCausalStochasticPrefix(adapter, worldBefore, rawDomestic 
 
   const prefix = capped.slice(0, endIdx)
   const truncatedAfterStochastic = containsStochasticAction && endIdx < rawDomestic.length
+  if (truncatedAfterStochastic) {
+    while (
+      prefix.length > 0 &&
+      (prefix[prefix.length - 1].a === 'eat' || prefix[prefix.length - 1].a === 'coffee')
+    ) {
+      prefix.pop()
+    }
+  }
   return {
     prefix,
     containsStochasticAction,

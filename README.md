@@ -108,15 +108,21 @@ Start-Process node `
 | `--allow-capex` | 关 | 回本周期合理时自动买地与升级建筑、工具 |
 | `--no-capex` | 关 | 强制关闭自动买地与基建升级 |
 | `--data-dir <dir>` | `./logs/live` | 日志、排期表、对手面板与文件锁目录 |
+| `--check-update` | 关 | 立即检查远端仓库是否有新版本并输出更新摘要后退出 |
+| `--no-update-check` | 关 | 关闭后台自动版本更新检查（也可设环境变量 `MEME_NO_UPDATE_CHECK=1`） |
+| `--update-webhook <url>` | 空 | 发现新版本时自动推送通知 Webhook（兼容飞书/企微/钉钉/通用 JSON，同版本自动去重，也可设 `MEME_UPDATE_WEBHOOK_URL`） |
 | `--dry-run` | 关 | 只读模式，拦截一切 `POST` 请求 |
 | `--once` | 关 | 执行单轮后打印结果并退出 |
 
-查看日志与优雅停止：
+查看日志、检查更新与优雅停止：
 
 ```bash
 tail -f logs/live/live-daemon.main.out
+npm run check-update
 kill -TERM $(cat logs/live/live-daemon.main.pid)
 ```
+
+> **自动更新提醒**：常驻运行时，程序每 2 小时在非出访窗口静默检查 GitHub 主分支 `package.json`。一旦发现新版本（如问题修复或策略改进），会在日志中打印醒目更新横幅、在每轮状态行末尾附带 `[有新版本 vX.Y.Z -> git pull]` 提示，并在检测到本地已 `git pull` 但尚未重启时提醒重启进程生效；网络不可达时静默跳过，不影响托管运行。
 
 ## 收益来源
 
@@ -148,7 +154,7 @@ execution/         HTTP 限流与时钟校准、事务对账、出访调度、�
 model/             规则解析与资产估值
 audit/             本地事务流水记录与复盘工具
 rules/             游戏前端规则文件
-test/              自动化测试集（52 项）
+test/              自动化测试集（58 项）
 architecture.html  交互式系统架构与时序图谱（浏览器直接打开）
 ```
 

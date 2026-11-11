@@ -14,6 +14,7 @@ import {
   syncPetCareFirst,
 } from '../execution/pet-and-battle.mjs'
 import { SnipeScheduler } from '../execution/snipe-scheduler.mjs'
+import { UpdateNotifier } from '../execution/update-notifier.mjs'
 import { runControllerStep } from './controller.mjs'
 
 /**
@@ -418,192 +419,221 @@ export async function runLiveAccountTick({
 
 const isDirectMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
 if (isDirectMain) {
-  const args = process.argv.slice(2)
-  const hasFlag = (f) => args.includes(f)
-  const getArg = (flag, defVal) => {
-    const idx = args.indexOf(flag)
-    return idx >= 0 && idx + 1 < args.length ? args[idx + 1] : defVal
-  }
+  await (async () => {
+    const args = process.argv.slice(2)
+    const hasFlag = (f) => args.includes(f)
+    const getArg = (flag, defVal) => {
+      const idx = args.indexOf(flag)
+      return idx >= 0 && idx + 1 < args.length ? args[idx + 1] : defVal
+    }
 
-  const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-  const account = getArg('--account', 'main')
-  const baseUrl = getArg('--base-url', process.env.MEME_BASE_URL || 'https://52dmeme.com')
-  const sessionDir = getArg('--session-dir', rootDir)
-  const defaultSessionName = account === 'main' ? '.session.json' : `.session.${account}.json`
-  const sessionPath = getArg('--session', process.env.SESSION_PATH || path.join(sessionDir, defaultSessionName))
-  const partnerAccount = getArg('--partner-account', account === 'main' ? 'secondary' : 'main')
-  const defaultPartnerSessionName = partnerAccount === 'main' ? '.session.json' : `.session.${partnerAccount}.json`
-  const partnerSessionPath = getArg('--partner-session', path.join(sessionDir, defaultPartnerSessionName))
-  const rulesPath = getArg('--rules', path.join(rootDir, 'rules/pet-world-rules.js'))
-  const dataRootDir = getArg('--data-dir', path.join(rootDir, 'logs/live'))
-  const selfIdsRaw = getArg('--self-ids', process.env.MEME_SELF_IDS || '')
-  const selfIds = selfIdsRaw
-    .split(',')
-    .map((s) => Number(s.trim()))
-    .filter((n) => Number.isFinite(n) && n > 0)
-  const domesticOnly = hasFlag('--domestic-only') || hasFlag('--no-steal') || account === 'secondary'
-  const allowCapexFlag = hasFlag('--allow-capex')
-  const noCapexFlag = hasFlag('--no-capex')
-  const maxTickSolveMs = Math.max(1000, Number(getArg('--max-tick-solve-ms', '45000')) || 45000)
-  const dryRun = hasFlag('--dry-run')
-  const once = hasFlag('--once')
+    const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+    const account = getArg('--account', 'main')
+    const baseUrl = getArg('--base-url', process.env.MEME_BASE_URL || 'https://52dmeme.com')
+    const sessionDir = getArg('--session-dir', rootDir)
+    const defaultSessionName = account === 'main' ? '.session.json' : `.session.${account}.json`
+    const sessionPath = getArg('--session', process.env.SESSION_PATH || path.join(sessionDir, defaultSessionName))
+    const partnerAccount = getArg('--partner-account', account === 'main' ? 'secondary' : 'main')
+    const defaultPartnerSessionName = partnerAccount === 'main' ? '.session.json' : `.session.${partnerAccount}.json`
+    const partnerSessionPath = getArg('--partner-session', path.join(sessionDir, defaultPartnerSessionName))
+    const rulesPath = getArg('--rules', path.join(rootDir, 'rules/pet-world-rules.js'))
+    const dataRootDir = getArg('--data-dir', path.join(rootDir, 'logs/live'))
+    const selfIdsRaw = getArg('--self-ids', process.env.MEME_SELF_IDS || '')
+    const selfIds = selfIdsRaw
+      .split(',')
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isFinite(n) && n > 0)
+    const domesticOnly = hasFlag('--domestic-only') || hasFlag('--no-steal') || account === 'secondary'
+    const allowCapexFlag = hasFlag('--allow-capex')
+    const noCapexFlag = hasFlag('--no-capex')
+    const maxTickSolveMs = Math.max(1000, Number(getArg('--max-tick-solve-ms', '45000')) || 45000)
+    const dryRun = hasFlag('--dry-run')
+    const once = hasFlag('--once')
+    const checkUpdateOnly = hasFlag('--check-update')
+    const noUpdateCheck = hasFlag('--no-update-check')
+    const updateWebhookUrl = getArg('--update-webhook', process.env.MEME_UPDATE_WEBHOOK_URL || '')
 
-  const journalRootDir = path.join(dataRootDir, 'journal')
-  const partnerJournalDir = path.join(journalRootDir, partnerAccount)
-  const lockRootDir = path.join(dataRootDir, 'locks')
-  const profileStorePath = getArg('--opponent-profiles', path.join(dataRootDir, 'opponent-profiles.json'))
-  const scheduleFilePath = path.join(dataRootDir, `snipe-schedule.${account}.json`)
-  const huancaiStatePath = path.join(dataRootDir, `huancai-state.${account}.json`)
+    const updateNotifier = new UpdateNotifier({
+      rootDir,
+      stateFilePath: dryRun ? null : path.join(dataRootDir, 'update-status.json'),
+      webhookUrl: updateWebhookUrl || null,
+      enabled: !noUpdateCheck,
+    })
 
-  const httpClient = new KernelHttpClient({
-    baseUrl,
-    sessionFilePath: sessionPath,
-    dryRun,
-  })
-  const partnerHttpClient = fs.existsSync(partnerSessionPath)
-    ? new KernelHttpClient({ baseUrl, sessionFilePath: partnerSessionPath, dryRun: true })
-    : null
-
-  const adapter = await loadRulesAdapterFromFile(rulesPath)
-  const journal = dryRun ? null : new ContentAddressedJournal({ rootDir: journalRootDir, account })
-  const partnerJournal = (!dryRun && (fs.existsSync(partnerJournalDir) || fs.existsSync(partnerSessionPath)))
-    ? new ContentAddressedJournal({ rootDir: journalRootDir, account: partnerAccount })
-    : null
-
-  const snipeScheduler = new SnipeScheduler({
-    accountKey: account,
-    scheduleFilePath: dryRun ? null : scheduleFilePath,
-    profileStorePath,
-    gearLockRoot: lockRootDir,
-    selfIds,
-    domesticOnly,
-    minStealSpots: domesticOnly ? 999999 : 1,
-  })
-
-  const effectiveAllowCapex = noCapexFlag ? false : (allowCapexFlag ? true : domesticOnly)
-  const baseUserConstraints = !domesticOnly
-    ? {
-        allowCapex: effectiveAllowCapex,
-        minStealSpots: 0,
-        allowThiefBuffPurchase: true,
-        allowGuardBuffPurchase: false,
-        cashReserveFloor: 10,
+    if (checkUpdateOnly) {
+      const st = await updateNotifier.checkNow({ printBanner: true })
+      if (!st.hasUpdate && !st.error) {
+        console.log(`[UPDATE] 当前已是最新版本 v${st.localVersion}（checkedAt=${st.checkedAt}）`)
       }
-    : {
-        domesticOnly: true,
-        allowCapex: effectiveAllowCapex,
-        capexTargets: { plotsMax: 24, barnMax: 8, trapsMax: 4, houseMax: 0, toolsMax: { rod: 4, pick: 4, spr: 3 } },
-        maxStealsPerIsleDay: 0,
-        minStealSpots: 999999,
-        allowThiefBuffPurchase: false,
-        allowGuardBuffPurchase: false,
-        cashReserveFloor: 0,
-      }
+      console.log(JSON.stringify(st, null, 2))
+      return
+    }
 
-  const asyncPlanner = new AsyncPlanManager({ rulesPath })
-  const runtimeState = {
-    rulesPath,
-    asyncPlanner,
-    lastPetCareAtSec: 0,
-    lastBattlePrepAtSec: 0,
-    lastBoutFinishedAtMs: 0,
-    lastHuancaiCheckAtSec: 0,
-    lastCapexEvalAtSec: 0,
-    pendingCapex: false,
-    arenaRemaining: null,
-  }
+    const journalRootDir = path.join(dataRootDir, 'journal')
+    const partnerJournalDir = path.join(journalRootDir, partnerAccount)
+    const lockRootDir = path.join(dataRootDir, 'locks')
+    const profileStorePath = getArg('--opponent-profiles', path.join(dataRootDir, 'opponent-profiles.json'))
+    const scheduleFilePath = path.join(dataRootDir, `snipe-schedule.${account}.json`)
+    const huancaiStatePath = path.join(dataRootDir, `huancai-state.${account}.json`)
 
-  let stopping = false
-  process.on('SIGTERM', () => { stopping = true })
-  process.on('SIGINT', () => { stopping = true })
-
-  if (once) {
-    const res = await runLiveAccountTick({
-      account,
-      adapter,
-      httpClient,
-      partnerHttpClient,
-      journal,
-      partnerJournal,
-      snipeScheduler,
-      lockRootDir,
-      profileStorePath,
-      huancaiStatePath,
-      runtimeState,
-      baseUserConstraints,
-      asyncPlanner,
-      rulesPath,
-      maxTickSolveMs,
+    const httpClient = new KernelHttpClient({
+      baseUrl,
+      sessionFilePath: sessionPath,
       dryRun,
     })
-    await asyncPlanner.close()
-    console.log(JSON.stringify({
-      account,
-      dryRun,
-      phase: res.phase,
-      controllerStatus: res.controllerOut?.status ?? null,
-      planSource: res.controllerOut?.planSource ?? null,
-      staminaReservation: res.staminaReservation ?? null,
-      backgroundReport: res.backgroundReport ?? null,
-      nextWakeSec: res.nextWakeSec,
-      httpStats: httpClient.stats,
-      plannerStats: asyncPlanner.stats,
-    }, null, 2))
-    process.exit(0)
-  }
+    const partnerHttpClient = fs.existsSync(partnerSessionPath)
+      ? new KernelHttpClient({ baseUrl, sessionFilePath: partnerSessionPath, dryRun: true })
+      : null
 
-  const pidFilePath = path.join(dataRootDir, `live-daemon.${account}.pid`)
-  if (!dryRun) {
-    fs.mkdirSync(dataRootDir, { recursive: true })
-    fs.writeFileSync(pidFilePath, `${process.pid}\n`, 'utf8')
-  }
+    const adapter = await loadRulesAdapterFromFile(rulesPath)
+    const journal = dryRun ? null : new ContentAddressedJournal({ rootDir: journalRootDir, account })
+    const partnerJournal = (!dryRun && (fs.existsSync(partnerJournalDir) || fs.existsSync(partnerSessionPath)))
+      ? new ContentAddressedJournal({ rootDir: journalRootDir, account: partnerAccount })
+      : null
 
-  try {
-    while (!stopping) {
-      let sleepMs = 5000
-      try {
-        const res = await runLiveAccountTick({
-          account,
-          adapter,
-          httpClient,
-          partnerHttpClient,
-          journal,
-          partnerJournal,
-          snipeScheduler,
-          lockRootDir,
-          profileStorePath,
-          huancaiStatePath,
-          runtimeState,
-          baseUserConstraints,
-          asyncPlanner,
-          rulesPath,
-          maxTickSolveMs,
-          dryRun,
-        })
-        const nowSec = httpClient.estimatedServerNowSec()
-        const deltaSec = Math.max(1, Math.min(120, Number(res.nextWakeSec || (nowSec + 15)) - nowSec))
-        sleepMs = deltaSec * 1000
-        console.log(
-          `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}`
-        )
-      } catch (err) {
-        console.error(`[${new Date().toISOString()}] [LIVE:${account}:ERROR] ${err?.stack || err}`)
-        sleepMs = 10000
-      }
-      let rem = sleepMs
-      while (rem > 0 && !stopping) {
-        const chunk = Math.min(500, rem)
-        await new Promise((r) => setTimeout(r, chunk))
-        rem -= chunk
-      }
+    const snipeScheduler = new SnipeScheduler({
+      accountKey: account,
+      scheduleFilePath: dryRun ? null : scheduleFilePath,
+      profileStorePath,
+      gearLockRoot: lockRootDir,
+      selfIds,
+      domesticOnly,
+      minStealSpots: domesticOnly ? 999999 : 1,
+    })
+
+    const effectiveAllowCapex = noCapexFlag ? false : (allowCapexFlag ? true : domesticOnly)
+    const baseUserConstraints = !domesticOnly
+      ? {
+          allowCapex: effectiveAllowCapex,
+          minStealSpots: 0,
+          allowThiefBuffPurchase: true,
+          allowGuardBuffPurchase: false,
+          cashReserveFloor: 10,
+        }
+      : {
+          domesticOnly: true,
+          allowCapex: effectiveAllowCapex,
+          capexTargets: { plotsMax: 24, barnMax: 8, trapsMax: 4, houseMax: 0, toolsMax: { rod: 4, pick: 4, spr: 3 } },
+          maxStealsPerIsleDay: 0,
+          minStealSpots: 999999,
+          allowThiefBuffPurchase: false,
+          allowGuardBuffPurchase: false,
+          cashReserveFloor: 0,
+        }
+
+    const asyncPlanner = new AsyncPlanManager({ rulesPath })
+    const runtimeState = {
+      rulesPath,
+      asyncPlanner,
+      lastPetCareAtSec: 0,
+      lastBattlePrepAtSec: 0,
+      lastBoutFinishedAtMs: 0,
+      lastHuancaiCheckAtSec: 0,
+      lastCapexEvalAtSec: 0,
+      pendingCapex: false,
+      arenaRemaining: null,
     }
-  } finally {
-    await asyncPlanner.close()
+
+    let stopping = false
+    process.on('SIGTERM', () => { stopping = true })
+    process.on('SIGINT', () => { stopping = true })
+
+    if (once) {
+      await updateNotifier.checkNow({ printBanner: true }).catch(() => null)
+      const res = await runLiveAccountTick({
+        account,
+        adapter,
+        httpClient,
+        partnerHttpClient,
+        journal,
+        partnerJournal,
+        snipeScheduler,
+        lockRootDir,
+        profileStorePath,
+        huancaiStatePath,
+        runtimeState,
+        baseUserConstraints,
+        asyncPlanner,
+        rulesPath,
+        maxTickSolveMs,
+        dryRun,
+      })
+      await asyncPlanner.close()
+      console.log(JSON.stringify({
+        version: updateNotifier.localVersion,
+        account,
+        dryRun,
+        phase: res.phase,
+        controllerStatus: res.controllerOut?.status ?? null,
+        planSource: res.controllerOut?.planSource ?? null,
+        staminaReservation: res.staminaReservation ?? null,
+        backgroundReport: res.backgroundReport ?? null,
+        nextWakeSec: res.nextWakeSec,
+        httpStats: httpClient.stats,
+        plannerStats: asyncPlanner.stats,
+        updateStatus: updateNotifier.status,
+      }, null, 2))
+      return
+    }
+
+    const pidFilePath = path.join(dataRootDir, `live-daemon.${account}.pid`)
+    if (!dryRun) {
+      fs.mkdirSync(dataRootDir, { recursive: true })
+      fs.writeFileSync(pidFilePath, `${process.pid}\n`, 'utf8')
+    }
+    console.log(`[${new Date().toISOString()}] [LIVE:${account}] kernel=v${updateNotifier.localVersion} started pid=${process.pid}`)
+    updateNotifier.maybeCheckInBackground()
+
     try {
-      if (!dryRun && fs.existsSync(pidFilePath)) {
-        const curPid = fs.readFileSync(pidFilePath, 'utf8').trim()
-        if (curPid === String(process.pid)) fs.unlinkSync(pidFilePath)
+      while (!stopping) {
+        let sleepMs = 5000
+        try {
+          const res = await runLiveAccountTick({
+            account,
+            adapter,
+            httpClient,
+            partnerHttpClient,
+            journal,
+            partnerJournal,
+            snipeScheduler,
+            lockRootDir,
+            profileStorePath,
+            huancaiStatePath,
+            runtimeState,
+            baseUserConstraints,
+            asyncPlanner,
+            rulesPath,
+            maxTickSolveMs,
+            dryRun,
+          })
+          const nowSec = httpClient.estimatedServerNowSec()
+          const deltaSec = Math.max(1, Math.min(120, Number(res.nextWakeSec || (nowSec + 15)) - nowSec))
+          sleepMs = deltaSec * 1000
+          if (!snipeScheduler.shouldBlockBackgroundWork(nowSec, 50)) {
+            updateNotifier.maybeCheckInBackground()
+          }
+          console.log(
+            `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${updateNotifier.inlineTag()}`
+          )
+        } catch (err) {
+          console.error(`[${new Date().toISOString()}] [LIVE:${account}:ERROR] ${err?.stack || err}`)
+          sleepMs = 10000
+        }
+        let rem = sleepMs
+        while (rem > 0 && !stopping) {
+          const chunk = Math.min(500, rem)
+          await new Promise((r) => setTimeout(r, chunk))
+          rem -= chunk
+        }
       }
-    } catch {}
-  }
+    } finally {
+      await asyncPlanner.close()
+      try {
+        if (!dryRun && fs.existsSync(pidFilePath)) {
+          const curPid = fs.readFileSync(pidFilePath, 'utf8').trim()
+          if (curPid === String(process.pid)) fs.unlinkSync(pidFilePath)
+        }
+      } catch {}
+    }
+  })()
 }

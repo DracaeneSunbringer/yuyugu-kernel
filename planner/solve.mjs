@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import {
+  buildContinuationTimeline,
   buildObjectiveConfig,
   buildTerminalPrices,
   discountFactor,
@@ -85,6 +86,94 @@ export function discoverRuleUtilityTokens(adapter) {
  * Uses Successive Shortest Augmenting Path (SPFA) on a compact network (<= 35 nodes),
  * guaranteeing 100% global optimality across `q2/q1/q0` and `00:00` natural-day resets.
  */
+const slotScheduleWeakCache = new WeakMap()
+
+function getSlotScheduleItemMeta(R, slots, itemId, needNatDayTable = false) {
+  let root = slotScheduleWeakCache.get(slots)
+  if (!root) {
+    let maxAvailU = 0
+    const natDays = []
+    const natDayMap = new Map()
+    const slotsByNatDay = []
+    for (let s = 0; s < slots.length; s++) {
+      const sl = slots[s]
+      if (!sl.allowSell) continue
+      if (sl.availFromBucket > maxAvailU) maxAvailU = sl.availFromBucket
+      let dIdx = natDayMap.get(sl.naturalDay)
+      if (dIdx === undefined) {
+        dIdx = natDays.length
+        natDayMap.set(sl.naturalDay, dIdx)
+        natDays.push(sl.naturalDay)
+        slotsByNatDay.push([])
+      }
+      slotsByNatDay[dIdx].push(s)
+    }
+    root = { maxAvailU, natDays, slotsByNatDay, byItem: new Map() }
+    slotScheduleWeakCache.set(slots, root)
+  }
+
+  let itemMeta = root.byItem.get(itemId)
+  if (!itemMeta) {
+    const U = root.maxAvailU + 1
+    const bestGlobalSlotIdx = new Int32Array(U * 3).fill(-1)
+    const bestGlobalUnitVal = new Float64Array(U * 3)
+    const quals = [R.QUALITY?.[0] ?? 1, R.QUALITY?.[1] ?? 1, R.QUALITY?.[2] ?? 1]
+    for (let s = 0; s < slots.length; s++) {
+      const sl = slots[s]
+      if (!sl.allowSell) continue
+      const p = Number(sl.prices?.[itemId] || 0)
+      if (!(p > 0)) continue
+      const mult = sl.disc * sl.netTaxFactor
+      const maxU = sl.availFromBucket
+      for (let q = 0; q < 3; q++) {
+        const unit = Math.round(p * quals[q]) * mult
+        for (let u = 0; u <= maxU; u++) {
+          const idx = u * 3 + q
+          if (unit > bestGlobalUnitVal[idx] + 1e-9) {
+            bestGlobalUnitVal[idx] = unit
+            bestGlobalSlotIdx[idx] = s
+          }
+        }
+      }
+    }
+    itemMeta = { bestGlobalSlotIdx, bestGlobalUnitVal, bestNdSlotIdx: null }
+    root.byItem.set(itemId, itemMeta)
+  }
+
+  if (needNatDayTable && !itemMeta.bestNdSlotIdx) {
+    const D = root.natDays.length
+    const U = root.maxAvailU + 1
+    const bestNdSlotIdx = new Int32Array(D * U * 3).fill(-1)
+    const bestNdUnitVal = new Float64Array(D * U * 3)
+    const quals = [R.QUALITY?.[0] ?? 1, R.QUALITY?.[1] ?? 1, R.QUALITY?.[2] ?? 1]
+    for (let dIdx = 0; dIdx < D; dIdx++) {
+      const ndSlots = root.slotsByNatDay[dIdx]
+      const dBase = dIdx * U * 3
+      for (let k = 0; k < ndSlots.length; k++) {
+        const s = ndSlots[k]
+        const sl = slots[s]
+        const p = Number(sl.prices?.[itemId] || 0)
+        if (!(p > 0)) continue
+        const mult = sl.disc * sl.netTaxFactor
+        const maxU = sl.availFromBucket
+        for (let q = 0; q < 3; q++) {
+          const val = Math.round(p * quals[q]) * mult
+          for (let u = 0; u <= maxU; u++) {
+            const idx = dBase + u * 3 + q
+            if (val > bestNdUnitVal[idx] + 1e-9) {
+              bestNdUnitVal[idx] = val
+              bestNdSlotIdx[idx] = s
+            }
+          }
+        }
+      }
+    }
+    itemMeta.bestNdSlotIdx = bestNdSlotIdx
+  }
+
+  return { root, itemMeta }
+}
+
 function solveExactItemSaleSchedule(adapter, {
   itemId,
   supplyByBucket, // Array< [n0, n1, n2] > of length L
@@ -97,31 +186,22 @@ function solveExactItemSaleSchedule(adapter, {
   const L = supplyByBucket.length
 
   if (!isCrop) {
-    // Non-crops have no daily tier decay: each (u, q) independently picks highest discounted unit revenue slot s >= u
+    // Non-crops have no daily tier decay: O(1) lookup from precomputed `(slots, itemId)` table!
+    const { root, itemMeta } = getSlotScheduleItemMeta(R, slots, itemId, false)
     const sellsBySlot = slots.map(() => [0, 0, 0])
     let totalWeightedRevenue = 0
-    for (let u = 0; u < L; u++) {
+    const uLim = Math.min(L, root.maxAvailU + 1)
+    for (let u = 0; u < uLim; u++) {
       const row = supplyByBucket[u]
       if (!row) continue
+      const uBase = u * 3
       for (const q of [2, 1, 0]) {
         const cnt = Math.floor(Number(row[q] || 0))
         if (!(cnt > 0)) continue
-        let bestSlotIdx = -1
-        let bestUnitVal = 0
-        for (let s = 0; s < slots.length; s++) {
-          const sl = slots[s]
-          if (!sl.allowSell || sl.availFromBucket < u) continue
-          const p = Number(sl.prices?.[itemId] || 0)
-          if (!(p > 0)) continue
-          const unit = Math.round(p * (R.QUALITY?.[q] ?? 1)) * sl.disc * sl.netTaxFactor
-          if (unit > bestUnitVal + 1e-9) {
-            bestUnitVal = unit
-            bestSlotIdx = s
-          }
-        }
+        const bestSlotIdx = itemMeta.bestGlobalSlotIdx[uBase + q]
         if (bestSlotIdx >= 0) {
           sellsBySlot[bestSlotIdx][q] += cnt
-          totalWeightedRevenue += cnt * bestUnitVal
+          totalWeightedRevenue += cnt * itemMeta.bestGlobalUnitVal[uBase + q]
         }
       }
     }
@@ -149,42 +229,25 @@ function solveExactItemSaleSchedule(adapter, {
 
   // Exact Tier-0 Non-Binding Fast Path:
   // When `initialScCount + totalSupply <= 150`, Tier 0 (1.0x) has >= totalSupply remaining capacity on EVERY natural day!
-  // Thus Tier 1 (0.85x) and Tier 2 (0.70x) can never be entered, reducing exact global assignment to O(P * |slots|) with zero graph allocations!
+  // Thus Tier 1 (0.85x) and Tier 2 (0.70x) can never be entered, reducing exact global assignment to O(P) table lookup!
   if (initialScCount + totalSupply <= 150) {
+    const { root, itemMeta } = getSlotScheduleItemMeta(R, slots, itemId, false)
     let totalWeightedRevenue = 0
     for (let i = 0; i < supplyNodes.length; i++) {
       const { u, q, cnt } = supplyNodes[i]
-      let bestSlotIdx = -1
-      let bestUnitVal = 0
-      const qual = R.QUALITY?.[q] ?? 1
-      for (let s = 0; s < slots.length; s++) {
-        const sl = slots[s]
-        if (!sl.allowSell || sl.availFromBucket < u) continue
-        const p = Number(sl.prices?.[itemId] || 0)
-        if (!(p > 0)) continue
-        const unit = Math.round(p * qual) * sl.disc * sl.netTaxFactor
-        if (unit > bestUnitVal + 1e-9) {
-          bestUnitVal = unit
-          bestSlotIdx = s
-        }
-      }
+      if (u > root.maxAvailU) continue
+      const idx = u * 3 + q
+      const bestSlotIdx = itemMeta.bestGlobalSlotIdx[idx]
       if (bestSlotIdx >= 0) {
         sellsBySlot[bestSlotIdx][q] += cnt
-        totalWeightedRevenue += cnt * bestUnitVal
+        totalWeightedRevenue += cnt * itemMeta.bestGlobalUnitVal[idx]
       }
     }
     return { sellsBySlot, totalWeightedRevenue }
   }
 
-  const natDays = []
-  const natDayMap = new Map()
-  for (const sl of slots) {
-    if (!sl.allowSell) continue
-    if (!natDayMap.has(sl.naturalDay)) {
-      natDayMap.set(sl.naturalDay, natDays.length)
-      natDays.push(sl.naturalDay)
-    }
-  }
+  const { root, itemMeta } = getSlotScheduleItemMeta(R, slots, itemId, true)
+  const { natDays, maxAvailU } = root
   if (natDays.length === 0) {
     return { sellsBySlot, totalWeightedRevenue: 0 }
   }
@@ -193,6 +256,7 @@ function solveExactItemSaleSchedule(adapter, {
   // Nodes: 0 = SRC, 1..P = supplyNodes, P+1..P+3*D = (ndIdx, tier), last = SNK
   const P = supplyNodes.length
   const D = natDays.length
+  const U = maxAvailU + 1
   const SRC = 0
   const SNK = 1 + P + 3 * D
   const N = SNK + 1
@@ -212,13 +276,16 @@ function solveExactItemSaleSchedule(adapter, {
   }
 
   const tierMults = [1.0, 0.85, 0.70]
+  const maxTierByDay = new Int32Array(D)
   for (let dIdx = 0; dIdx < D; dIdx++) {
     const nd = natDays[dIdx]
     const sc0 = nd === initialNatDay ? initialScCount : 0
     const cap0 = Math.max(0, 150 - sc0)
     const cap1 = Math.max(0, 400 - Math.max(150, sc0))
+    const maxReachableTier = totalSupply <= cap0 ? 0 : (totalSupply <= cap0 + cap1 ? 1 : 2)
+    maxTierByDay[dIdx] = maxReachableTier
     const caps = [cap0, cap1, totalSupply]
-    for (let t = 0; t < 3; t++) {
+    for (let t = 0; t <= maxReachableTier; t++) {
       const tierNode = 1 + P + dIdx * 3 + t
       if (caps[t] > 0) addEdge(tierNode, SNK, caps[t], 0)
     }
@@ -227,25 +294,15 @@ function solveExactItemSaleSchedule(adapter, {
   // Connect each supplyNode (u, q) to best slot s >= u within each naturalDay dIdx
   for (let i = 0; i < P; i++) {
     const { u, q, cnt } = supplyNodes[i]
+    if (u > maxAvailU) continue
+    const qual = R.QUALITY?.[q] ?? 1
     for (let dIdx = 0; dIdx < D; dIdx++) {
-      const nd = natDays[dIdx]
-      let bestSlotIdx = -1
-      let bestBaseUnit = 0
-      for (let s = 0; s < slots.length; s++) {
-        const sl = slots[s]
-        if (!sl.allowSell || sl.naturalDay !== nd || sl.availFromBucket < u) continue
-        const p = Number(sl.prices?.[itemId] || 0)
-        if (!(p > 0)) continue
-        const val = Math.round(p * (R.QUALITY?.[q] ?? 1)) * sl.disc * sl.netTaxFactor
-        if (val > bestBaseUnit + 1e-9) {
-          bestBaseUnit = val
-          bestSlotIdx = s
-        }
-      }
+      const bestSlotIdx = itemMeta.bestNdSlotIdx[dIdx * U * 3 + u * 3 + q]
       if (bestSlotIdx >= 0) {
         const sl = slots[bestSlotIdx]
-        const rawUnit = Math.round(Number(sl.prices[itemId]) * (R.QUALITY?.[q] ?? 1))
-        for (let t = 0; t < 3; t++) {
+        const rawUnit = Math.round(Number(sl.prices[itemId]) * qual)
+        const maxT = maxTierByDay[dIdx]
+        for (let t = 0; t <= maxT; t++) {
           const tierNode = 1 + P + dIdx * 3 + t
           const gain = rawUnit * tierMults[t] * sl.disc * sl.netTaxFactor
           addEdge(1 + i, tierNode, cnt, -gain, { slotIdx: bestSlotIdx, q })
@@ -863,7 +920,7 @@ function mergeCraftActionsPreserveTopo(list) {
 /**
  * Evaluates best seasonal crop to plant on an empty plot `plotIdx` at `atSec`
  * using exact weather-segment timings, regrow season-wither rule (`pet-world-rules.js:411,522`),
- * and marginal downstream item values.
+ * downstream multi-season marginal item values, and Renewal NPV Rate (`net / occupiedSec`).
  */
 function selectBestCropToPlant(adapter, {
   state,
@@ -872,6 +929,7 @@ function selectBestCropToPlant(adapter, {
   tEnd,
   marginalItemValueFn,
   staminaPointCost = 0,
+  enforceHorizonCutoff = false,
 }) {
   const { R } = adapter
   const iDay = R.isleDay(atSec)
@@ -879,6 +937,9 @@ function selectBestCropToPlant(adapter, {
   const isSpr = R.sprinkled(state, plotIdx)
   let bestCrop = null
   let bestNet = 0
+  let bestScore = 0
+  let bestOccupiedSec = 0
+  let bestTotalUnits = 0
 
   for (const crop of R.CROPS || []) {
     if (!crop.seasons.includes(season)) continue
@@ -886,6 +947,7 @@ function selectBestCropToPlant(adapter, {
     let h = 0
     const maxTimes = crop.regrow ? (crop.times || 1) : 1
     let totalExpectedRevenue = 0
+    let totalExpectedUnits = 0
     let totalStaminaSpent = R.WORLD?.cost?.plant ?? 2
 
     while (h < maxTimes) {
@@ -896,7 +958,7 @@ function selectBestCropToPlant(adapter, {
       }
       const mockPlot = { c: crop.id, t: simT, w: 0, g: 0, h }
       const timing = adapter.exactPlotTimings(mockPlot, isSpr, simT)
-      if (!timing || timing.matureAt > tEnd) break
+      if (!timing || (enforceHorizonCutoff && timing.matureAt > tEnd)) break
 
       const wateredStages = isSpr || R.weatherOf(R.isleDay(simT)) === 1 ? 3 : 2
       if (!isSpr && R.weatherOf(R.isleDay(simT)) !== 1) {
@@ -905,6 +967,7 @@ function selectBestCropToPlant(adapter, {
       totalStaminaSpent += R.WORLD?.cost?.harvest ?? 1
 
       const yld = expectedHarvestYield(adapter, wateredStages, false)
+      totalExpectedUnits += yld.expectedUnits
       for (let q = 0; q < 3; q++) {
         totalExpectedRevenue += yld.expectedByQuality[q] * marginalItemValueFn(crop.id, q, timing.matureAt)
       }
@@ -913,16 +976,30 @@ function selectBestCropToPlant(adapter, {
       h++
     }
 
+    if (h <= 0) continue
+    const occupiedSec = Math.max(60, simT - atSec)
     const freeSeedAvail = adapter.availableInv(state, `sd_${crop.id}`, 0) > 0
     const seedCashCost = freeSeedAvail ? 0 : crop.seed
     const net = totalExpectedRevenue - seedCashCost - totalStaminaSpent * staminaPointCost
-    if (net > bestNet + 1e-6) {
+    const score = enforceHorizonCutoff ? net : (net / occupiedSec)
+    if (net > 1e-6 && score > bestScore + 1e-9) {
+      bestScore = score
       bestNet = net
       bestCrop = crop
+      bestOccupiedSec = occupiedSec
+      bestTotalUnits = totalExpectedUnits
     }
   }
 
-  return bestCrop ? { crop: bestCrop, expectedNetGain: bestNet } : null
+  return bestCrop
+    ? {
+        crop: bestCrop,
+        expectedNetGain: bestNet,
+        occupiedSec: bestOccupiedSec,
+        totalExpectedUnits: bestTotalUnits,
+        ratePerSec: bestScore,
+      }
+    : null
 }
 
 /**
@@ -1064,6 +1141,10 @@ function selectCapexByTrajectoryDelta(adapter, {
       const sim = adapter.simulateBatch(curWorld, candActs, { t: curWorld.now, prices: curWorld.prices })
       if (!sim.allOk) continue
       let evalWorld = sim.afterWorld
+      // Under continuous `minGap = 2s` execution, an account can run multiple `eat -> work` batches per
+      // 4h isle-day regardless of `energyMax(s)`; prevent coarse 8-bucket single-pass `eat` ceilings from
+      // hallucinating fake per-bucket food capacity for `upgrade(house)` while preserving its real `+20`
+      // instant stamina and overnight freeze cap gain (`energyPerHouse` per long night).
       if (candActs.length === 1 && candActs[0].a === 'upgrade' && candActs[0].k === 'house') {
         evalWorld = adapter.cloneWorld(sim.afterWorld)
         evalWorld.state.tools.house = Number(curWorld.state?.tools?.house || 0)
@@ -1116,6 +1197,7 @@ function optimizeAndSimulateSequence(adapter, {
   prngFactory = null,
   initialCashEvents = [],
   maxCraftHoldIsleDays = 3,
+  hasExplicitPriceOverride = false,
 }) {
   const { R, graph } = adapter
   const L = seqBuckets.length
@@ -1181,9 +1263,16 @@ function optimizeAndSimulateSequence(adapter, {
   const estPricesByU = seqBuckets.map((b) => pricesForBucketFn(b, soldTracker))
   const tH = L > 0 ? seqBuckets[L - 1].nextAtSec : startWorld.now
   const termStub = { ...startWorld, now: tH }
+  const contTimeline = (
+    objectiveCfg.terminalSupplyMode === 'zero' ||
+    forcedTrunkSellPolicy === 'sell-all-now' ||
+    hasExplicitPriceOverride
+  )
+    ? []
+    : buildContinuationTimeline(adapter, termStub, initialWorldForObjective, objectiveCfg, scenarioSupplyFactor)
   const termPrices = objectiveCfg.terminalSupplyMode === 'zero'
     ? {}
-    : buildTerminalPrices(adapter, termStub, initialWorldForObjective, objectiveCfg, scenarioSupplyFactor)
+    : (contTimeline[0]?.prices ?? buildTerminalPrices(adapter, termStub, initialWorldForObjective, objectiveCfg, scenarioSupplyFactor))
 
   const approxTaxFactor = Number(startWorld.coins || 0) > (R.B12_TAX?.free || 3000000) ? 0.99 : 1.0
 
@@ -1202,29 +1291,78 @@ function optimizeAndSimulateSequence(adapter, {
     })),
     ...(objectiveCfg.terminalSupplyMode === 'zero' || forcedTrunkSellPolicy === 'sell-all-now'
       ? []
-      : [{
-          slotIdx: L,
-          availFromBucket: Math.max(0, L - 1),
-          atSec: tH,
-          naturalDay: R.worldDay(tH),
-          isleIndex: R.isleIndex(tH),
-          prices: termPrices,
-          allowSell: true,
-          isTerminal: true,
-          disc: discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, tH - t0)),
-          netTaxFactor: approxTaxFactor,
-        }]),
+      : contTimeline.length > 1
+        ? contTimeline.map((cs, idx) => ({
+            slotIdx: L + idx,
+            availFromBucket: Math.max(0, L - 1),
+            atSec: cs.atSec,
+            naturalDay: cs.naturalDay,
+            isleIndex: cs.isleIndex,
+            prices: cs.prices,
+            allowSell: true,
+            isTerminal: true,
+            disc: discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, cs.atSec - t0)),
+            netTaxFactor: approxTaxFactor,
+          }))
+        : [{
+            slotIdx: L,
+            availFromBucket: Math.max(0, L - 1),
+            atSec: tH,
+            naturalDay: R.worldDay(tH),
+            isleIndex: R.isleIndex(tH),
+            prices: termPrices,
+            allowSell: true,
+            isTerminal: true,
+            disc: discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, tH - t0)),
+            netTaxFactor: approxTaxFactor,
+          }]),
   ]
 
   const slots = buildSlots(estPricesByU)
 
-  // Track exact unreserved workshop capacity per isleIndex & unreserved initial inventory via `solveJointCraftAndSell`
-  // on initial stock so upstream `plant` / `stockBuy` neither hallucinate saturated slots nor over-claim unprofitable recipes!
+  const contCraftBuckets = []
+  if (contTimeline.length > 1 && allowedSet.has('craft')) {
+    const seenInHorizonIsles = new Set(seqBuckets.map((b) => b.isleIndex))
+    const seenContIsles = new Set()
+    const baseOff = L > 0 ? Number(seqBuckets[L - 1].isleDayOffset || 0) : 0
+    for (const cs of contTimeline) {
+      if (seenInHorizonIsles.has(cs.isleIndex) || seenContIsles.has(cs.isleIndex)) continue
+      seenContIsles.add(cs.isleIndex)
+      contCraftBuckets.push({
+        index: L + contCraftBuckets.length,
+        atSec: cs.atSec,
+        nextAtSec: cs.nextAtSec,
+        naturalDay: cs.naturalDay,
+        isleIndex: cs.isleIndex,
+        isleDay: cs.isleDay,
+        isleDayOffset: baseOff + seenContIsles.size,
+      })
+      if (contCraftBuckets.length >= 2) break
+    }
+  }
+
+  const buildJointSlots = (baseSlots) => {
+    if (contCraftBuckets.length === 0) return baseSlots
+    return baseSlots.map((sl) => {
+      if (!sl.isTerminal) return sl
+      let availU = Math.max(0, L - 1)
+      for (let cIdx = 0; cIdx < contCraftBuckets.length; cIdx++) {
+        if (sl.atSec >= contCraftBuckets[cIdx].atSec) availU = L + cIdx
+      }
+      return { ...sl, availFromBucket: availU }
+    })
+  }
+  const jointSlots = buildJointSlots(slots)
+
+  // Track exact unreserved workshop capacity per isleIndex (both in-horizon and continuation!)
+  // & unreserved initial inventory via `solveJointCraftAndSell` on initial stock
   const initSnap0 = adapter.availableInvSnapshot(startWorld.state)
   const startIsleIdx = R.isleIndex(startWorld.now)
+  const allOpenIsleTimeline = []
   const rawFreeWorkshopByIsle = new Map()
   for (const b of seqBuckets) {
     if (rawFreeWorkshopByIsle.has(b.isleIndex)) continue
+    allOpenIsleTimeline.push({ isleIndex: b.isleIndex, atSec: b.atSec, isContinuation: false })
     if (!allowedSet.has('craft')) {
       rawFreeWorkshopByIsle.set(b.isleIndex, 0)
       continue
@@ -1234,6 +1372,28 @@ function optimizeAndSimulateSequence(adapter, {
       : 0
     rawFreeWorkshopByIsle.set(b.isleIndex, Math.max(0, (R.WORLD?.daily?.craft || 80) - used))
   }
+  for (const cs of contTimeline) {
+    if (rawFreeWorkshopByIsle.has(cs.isleIndex)) continue
+    allOpenIsleTimeline.push({ isleIndex: cs.isleIndex, atSec: cs.atSec, isContinuation: true })
+    rawFreeWorkshopByIsle.set(cs.isleIndex, allowedSet.has('craft') ? (R.WORLD?.daily?.craft || 80) : 0)
+  }
+
+  const startNatDay = R.worldDay(startWorld.now)
+  const projectedScOnStartDay = {}
+  for (const [k, v] of Object.entries(startWorld.state?.cnt || {})) {
+    if (k.startsWith('sc_')) projectedScOnStartDay[k.slice(3)] = Number(v || 0)
+  }
+  const projectedScByNatDay = new Map([[startNatDay, projectedScOnStartDay]])
+  const getProjectedSc = (nd, id) => Number(projectedScByNatDay.get(nd)?.[id] || 0)
+  const addProjectedSc = (nd, id, qty) => {
+    if (!(qty > 0)) return
+    let row = projectedScByNatDay.get(nd)
+    if (!row) {
+      row = {}
+      projectedScByNatDay.set(nd, row)
+    }
+    row[id] = Number(row[id] || 0) + qty
+  }
 
   const unreservedInitCounts = {}
   const reservedByInitCS = {}
@@ -1242,23 +1402,24 @@ function optimizeAndSimulateSequence(adapter, {
   }
 
   const unreservedWorkshopByIsle = new Map(rawFreeWorkshopByIsle)
-  if (allowedSet.has('craft') && L > 0) {
+  if ((allowedSet.has('craft') || allowedSet.has('sell')) && (L + contCraftBuckets.length) > 0) {
     const craftEn = R.WORLD?.cost?.craft ?? 1
+    const initCSBuckets = [...seqBuckets, ...contCraftBuckets]
     const initCS = solveJointCraftAndSell(adapter, {
-      initialSupplyByBucket: [structuredClone(initSnap0), ...seqBuckets.slice(1).map(() => ({}))],
-      buckets: seqBuckets,
-      slots,
-      initialNatDay: R.worldDay(startWorld.now),
+      initialSupplyByBucket: [structuredClone(initSnap0), ...initCSBuckets.slice(1).map(() => ({}))],
+      buckets: initCSBuckets,
+      slots: jointSlots,
+      initialNatDay: startNatDay,
       initialCnt: startWorld.state?.cnt || {},
       craftCapByIsle: new Map(rawFreeWorkshopByIsle),
-      enCapByBucket: Float64Array.from(seqBuckets.map((b) => (rawFreeWorkshopByIsle.get(b.isleIndex) || 0) * craftEn)),
+      enCapByBucket: Float64Array.from(initCSBuckets.map((b) => (rawFreeWorkshopByIsle.get(b.isleIndex) || 0) * craftEn)),
       staminaShadowCost: 0,
-      allowCraft: true,
-      maxCraftHoldIsleDays,
+      allowCraft: allowedSet.has('craft'),
+      maxCraftHoldIsleDays: Math.max(maxCraftHoldIsleDays || 3, initCSBuckets.length > 0 ? (initCSBuckets[initCSBuckets.length - 1].isleDayOffset || 0) + 1 : 3),
     })
     const producedMid = {}
-    for (let u = 0; u < L; u++) {
-      const iIdx = seqBuckets[u].isleIndex
+    for (let u = 0; u < initCSBuckets.length; u++) {
+      const iIdx = initCSBuckets[u].isleIndex
       for (const ca of initCS.craftsByBucket[u] || []) {
         const nCraft = Number(ca.n || 1)
         producedMid[ca.id] = (producedMid[ca.id] || 0) + nCraft
@@ -1277,30 +1438,182 @@ function optimizeAndSimulateSequence(adapter, {
         }
       }
     }
+    for (const [id, sched] of initCS.salePortfolio.perItem.entries()) {
+      if (!graph.cropsById.has(id)) continue
+      for (let s = 0; s < jointSlots.length; s++) {
+        if (jointSlots[s].naturalDay === startNatDay) continue
+        const sr = sched.sellsBySlot[s]
+        if (!sr) continue
+        const soldCnt = (sr[0] || 0) + (sr[1] || 0) + (sr[2] || 0)
+        if (soldCnt > 0) addProjectedSc(jointSlots[s].naturalDay, id, soldCnt)
+      }
+    }
   }
 
-  const projectedScOnStartDay = {}
-  for (const [k, v] of Object.entries(startWorld.state?.cnt || {})) {
-    if (k.startsWith('sc_')) projectedScOnStartDay[k.slice(3)] = Number(v || 0)
+  // Project background seasonal farm output across post-`tH` continuation isle-days (`stepIdx >= 1`)
+  // so cross-season renewable crops reflect future tier/workshop saturation while off-season crops reflect true scarcity!
+  const plotCountBg = Number(startWorld.state?.plotN || 0)
+  if (allowedSet.has('plant') && plotCountBg > 0 && contTimeline.length > 1) {
+    let sprCount = 0
+    for (let pi = 0; pi < plotCountBg; pi++) {
+      if (R.sprinkled(startWorld.state, pi)) sprCount++
+    }
+    const mostlySpr = sprCount * 2 >= plotCountBg
+    const contDaysMap = new Map()
+    for (const cs of contTimeline) {
+      if (cs.stepIdx < 1) continue
+      let dInfo = contDaysMap.get(cs.isleIndex)
+      if (!dInfo) {
+        dInfo = {
+          isleIndex: cs.isleIndex,
+          isleDay: cs.isleDay,
+          season: cs.season,
+          weather: cs.weather,
+          atSec: cs.atSec,
+          naturalDay: cs.naturalDay,
+          durationSec: 0,
+        }
+        contDaysMap.set(cs.isleIndex, dInfo)
+      }
+      dInfo.durationSec += Math.max(0, cs.nextAtSec - cs.atSec)
+    }
+
+    const cycleProfileMemo = new Map()
+    const getCropCycleProfile = (crop, weatherIsRain) => {
+      const mKey = `${crop.id}:${mostlySpr ? 1 : 0}:${weatherIsRain ? 1 : 0}`
+      let prof = cycleProfileMemo.get(mKey)
+      if (!prof) {
+        const speedMult = mostlySpr ? 0.6 : (weatherIsRain ? 0.85 : 1.0)
+        const maxTimes = crop.regrow ? (crop.times || 1) : 1
+        const growSec = Math.max(60, crop.grow * 60 * speedMult)
+        const regrowSec = maxTimes > 1 ? Math.max(60, (crop.regrow || crop.grow) * 60 * speedMult) : 0
+        const cycleSec = growSec + Math.max(0, maxTimes - 1) * regrowSec
+        const wStages = mostlySpr || weatherIsRain ? 3 : 2
+        const yld = expectedHarvestYield(adapter, wStages, false)
+        prof = {
+          cycleSec: Math.max(60, cycleSec),
+          totalUnits: maxTimes * yld.expectedUnits,
+          byQ: yld.expectedByQuality.map((v) => v * maxTimes),
+          seedCost: Number(crop.seed || 0),
+        }
+        cycleProfileMemo.set(mKey, prof)
+      }
+      return prof
+    }
+
+    for (const dInfo of contDaysMap.values()) {
+      const activePlotSecCap = plotCountBg * Math.min(28800, Math.max(3600, dInfo.durationSec))
+      const chunkCount = 4
+      const chunkPlotSec = activePlotSecCap / chunkCount
+      const inSeasonCrops = (R.CROPS || []).filter((c) => c.seasons.includes(dInfo.season))
+      if (inSeasonCrops.length === 0) continue
+
+      for (let ch = 0; ch < chunkCount; ch++) {
+        let bestBg = null
+        for (const crop of inSeasonCrops) {
+          const prof = getCropCycleProfile(crop, dInfo.weather === 1)
+          const cycles = chunkPlotSec / prof.cycleSec
+          if (!(cycles > 0)) continue
+
+          // Best direct sale slot from dInfo.atSec onwards
+          let dirRevPerCycle = 0
+          let bestDirNatDay = dInfo.naturalDay
+          for (let q = 0; q < 3; q++) {
+            const uQ = prof.byQ[q]
+            if (!(uQ > 0)) continue
+            const qual = R.QUALITY?.[q] ?? 1
+            let bestUnit = 0
+            let chosenNd = dInfo.naturalDay
+            for (const sl of slots) {
+              if (!sl.allowSell || sl.atSec + 1 < dInfo.atSec) continue
+              const p = Number(sl.prices?.[crop.id] || 0)
+              if (!(p > 0)) continue
+              const sc = getProjectedSc(sl.naturalDay, crop.id)
+              const mult = sc >= 400 ? 0.70 : sc >= 150 ? 0.85 : 1.0
+              const val = Math.round(p * qual) * mult * sl.disc * sl.netTaxFactor
+              if (val > bestUnit + 1e-9) {
+                bestUnit = val
+                chosenNd = sl.naturalDay
+              }
+            }
+            dirRevPerCycle += uQ * bestUnit
+            if (q === 0) bestDirNatDay = chosenNd
+          }
+
+          let bestRevPerCycle = dirRevPerCycle
+          let usedRec = null
+          if (allowedSet.has('craft')) {
+            const openSlotsHere = unreservedWorkshopByIsle.get(dInfo.isleIndex) || 0
+            if (openSlotsHere >= 1 - 1e-9) {
+              for (const rec of graph.consumedByRecipes.get(crop.id) || []) {
+                if (!(rec.price > 0) || Object.keys(rec.in || {}).length !== 1) continue
+                const needQty = Number(rec.in[crop.id] || 0)
+                if (!(needQty > 0)) continue
+                let bestRecOut = 0
+                for (const sl of slots) {
+                  if (!sl.allowSell || sl.atSec + 1 < dInfo.atSec) continue
+                  bestRecOut = Math.max(bestRecOut, Number(sl.prices?.[rec.id] || 0) * sl.disc * sl.netTaxFactor)
+                }
+                const impliedCycle = prof.totalUnits * (bestRecOut / needQty)
+                if (impliedCycle > bestRevPerCycle + 1e-6) {
+                  bestRevPerCycle = impliedCycle
+                  usedRec = { needQty }
+                }
+              }
+            }
+          }
+
+          const rate = (bestRevPerCycle - prof.seedCost) / prof.cycleSec
+          if (rate > 1e-6 && (!bestBg || rate > bestBg.rate + 1e-9)) {
+            bestBg = {
+              crop,
+              rate,
+              units: cycles * prof.totalUnits,
+              usedRec,
+              bestDirNatDay,
+            }
+          }
+        }
+        if (!bestBg) break
+        if (bestBg.usedRec) {
+          const curOpen = unreservedWorkshopByIsle.get(dInfo.isleIndex) || 0
+          const needSlots = bestBg.units / bestBg.usedRec.needQty
+          const usedSlots = Math.min(curOpen, needSlots)
+          unreservedWorkshopByIsle.set(dInfo.isleIndex, Math.max(0, curOpen - usedSlots))
+          const leftoverUnits = Math.max(0, bestBg.units - usedSlots * bestBg.usedRec.needQty)
+          if (leftoverUnits > 0) addProjectedSc(bestBg.bestDirNatDay, bestBg.crop.id, leftoverUnits)
+        } else {
+          addProjectedSc(bestBg.bestDirNatDay, bestBg.crop.id, bestBg.units)
+        }
+      }
+    }
   }
 
-  const bestDirectUnitValue = (id, q = 0, atSec = startWorld.now) => {
+  const findBestDirectSaleChoice = (id, q = 0, atSec = startWorld.now) => {
     const qual = R.QUALITY?.[q] ?? 1
     let bestDirect = 0
+    let bestNatDay = startNatDay
+    const isCrop = graph.cropsById.has(id)
     for (const sl of slots) {
       if (!sl.allowSell || sl.atSec + 1 < atSec) continue
       const p = Number(sl.prices?.[id] || 0)
       if (!(p > 0)) continue
-      const isCrop = graph.cropsById.has(id)
-      const sc0 = sl.naturalDay === R.worldDay(startWorld.now) ? Number(projectedScOnStartDay[id] || 0) : 0
+      const sc0 = isCrop ? getProjectedSc(sl.naturalDay, id) : 0
       const tierMult = !isCrop ? 1.0 : (sc0 >= 400 ? 0.70 : sc0 >= 150 ? 0.85 : 1.0)
-      bestDirect = Math.max(bestDirect, Math.round(p * qual) * tierMult * sl.disc * sl.netTaxFactor)
+      const val = Math.round(p * qual) * tierMult * sl.disc * sl.netTaxFactor
+      if (val > bestDirect + 1e-9) {
+        bestDirect = val
+        bestNatDay = sl.naturalDay
+      }
     }
-    return bestDirect
+    return { val: bestDirect, natDay: bestNatDay }
   }
 
+  const bestDirectUnitValue = (id, q = 0, atSec = startWorld.now) => findBestDirectSaleChoice(id, q, atSec).val
+
   const marginalItemValueFn = (id, q = 0, atSec = startWorld.now, { reserveUnits = 0 } = {}) => {
-    const bestDirect = bestDirectUnitValue(id, q, atSec)
+    const dirChoice = findBestDirectSaleChoice(id, q, atSec)
+    const bestDirect = dirChoice.val
     let best = bestDirect
     let usedWorkshopRecipe = null
 
@@ -1311,10 +1624,14 @@ function optimizeAndSimulateSequence(adapter, {
         const needThis = Number(r.in?.[id] || 0)
         if (!(needThis > 0)) continue
         const minSlotReq = reserveUnits > 0 ? Math.min(1, reserveUnits / needThis) : 1 / needThis
-        const hasOpenSlot = seqBuckets.some(
-          (fb) => fb.atSec + 1 >= atSec && (unreservedWorkshopByIsle.get(fb.isleIndex) || 0) + 1e-9 >= Math.max(1, minSlotReq)
-        )
-        if (!hasOpenSlot) continue
+        let openIsleEntry = null
+        for (const entry of allOpenIsleTimeline) {
+          if (entry.atSec + 1 >= atSec && (unreservedWorkshopByIsle.get(entry.isleIndex) || 0) + 1e-9 >= Math.max(1, minSlotReq)) {
+            openIsleEntry = entry
+            break
+          }
+        }
+        if (!openIsleEntry) continue
 
         let compFeasible = true
         let otherCost = 0
@@ -1328,9 +1645,10 @@ function optimizeAndSimulateSequence(adapter, {
           otherCost += oQty * bestDirectUnitValue(oId, 0, atSec)
         }
         if (!compFeasible) continue
+        const craftReadySec = Math.max(atSec, openIsleEntry.atSec)
         let bestRecOut = 0
         for (const sl of slots) {
-          if (!sl.allowSell || sl.atSec + 1 < atSec) continue
+          if (!sl.allowSell || sl.atSec + 1 < craftReadySec) continue
           bestRecOut = Math.max(bestRecOut, Number(sl.prices?.[r.id] || 0) * sl.disc * sl.netTaxFactor)
         }
         const implied = (bestRecOut - otherCost) / needThis
@@ -1345,16 +1663,18 @@ function optimizeAndSimulateSequence(adapter, {
       if (usedWorkshopRecipe) {
         // Exact fractional workshop slot reservation: 1 unit of an ingredient that takes `needThis` per craft
         // reserves `1 / needThis` of a slot (NEVER `Math.ceil(1 / needThis)`!)
-        const slotsConsumed = reserveUnits / usedWorkshopRecipe.needThis
-        for (const fb of seqBuckets) {
-          if (fb.atSec + 1 >= atSec && (unreservedWorkshopByIsle.get(fb.isleIndex) || 0) >= 1 - 1e-9) {
-            const cur = unreservedWorkshopByIsle.get(fb.isleIndex) || 0
-            unreservedWorkshopByIsle.set(fb.isleIndex, Math.max(0, cur - slotsConsumed))
-            break
+        let remSlotsToConsume = reserveUnits / usedWorkshopRecipe.needThis
+        for (const entry of allOpenIsleTimeline) {
+          if (remSlotsToConsume <= 1e-9) break
+          if (entry.atSec + 1 >= atSec && (unreservedWorkshopByIsle.get(entry.isleIndex) || 0) > 1e-9) {
+            const cur = unreservedWorkshopByIsle.get(entry.isleIndex) || 0
+            const tk = Math.min(cur, remSlotsToConsume)
+            unreservedWorkshopByIsle.set(entry.isleIndex, Math.max(0, cur - tk))
+            remSlotsToConsume -= tk
           }
         }
       } else if (graph.cropsById.has(id)) {
-        projectedScOnStartDay[id] = Number(projectedScOnStartDay[id] || 0) + reserveUnits
+        addProjectedSc(dirChoice.natDay, id, reserveUnits)
       }
     }
 
@@ -1634,13 +1954,16 @@ function optimizeAndSimulateSequence(adapter, {
           tEnd: tH,
           marginalItemValueFn,
           staminaPointCost: 0,
+          enforceHorizonCutoff: objectiveCfg.terminalSupplyMode === 'zero',
         })
         if (!bestP) break
         const hasFreeSeed = adapter.availableInv(ps, `sd_${bestP.crop.id}`, 0) > 0
         const costCash = hasFreeSeed ? 0 : bestP.crop.seed
         if (costCash > simCash) continue
-        // Reserve workshop/crop-tier capacity as each plot is tentatively planted!
-        marginalItemValueFn(bestP.crop.id, 0, b.atSec, { reserveUnits: 2 })
+        // Reserve realistic full-cycle expected harvest units across workshop/crop-tier capacity!
+        marginalItemValueFn(bestP.crop.id, 0, b.atSec, {
+          reserveUnits: Math.max(1, Math.round(bestP.totalExpectedUnits || 2)),
+        })
         plantActs.push({ a: 'plant', i, c: bestP.crop.id })
         if (!R.sprinkled(ps, i) && weather !== 1 && simEn >= (R.WORLD?.cost?.plant ?? 2) + (R.WORLD?.cost?.water ?? 1)) {
           plantActs.push({ a: 'water', i })
@@ -2018,7 +2341,7 @@ function optimizeAndSimulateSequence(adapter, {
         // - Existing stamina supplies (`inv-eat` + `coffee`)
         // - Cargo edible supplies (`tide_snack` + ALL `q=0` edible crops on `b12Stock`)
         // - Cargo `recipe-bundle`s (1-stage & 2-stage chains), `explosive`s, and `direct` arbitrage!
-        for (let pass = 0; pass < 2 && availCoins > 0; pass++) {
+        for (let pass = 0; pass < (u === 0 ? 2 : 1) && availCoins > 0; pass++) {
           const totalOpenSlots = distinctOpenIsles.reduce(
             (sAcc, iIdx) => sAcc + Math.floor((unreservedWorkshopByIsle.get(iIdx) || 0) + 1e-9),
             0
@@ -2155,6 +2478,29 @@ function optimizeAndSimulateSequence(adapter, {
 
           const committedEatEn = committedPassEatUnits.reduce((acc, e) => acc + e.enGain, 0)
           const effectiveFreeEn = Math.min(eatStaminaCap, baseFreeEn + committedEatEn)
+          const neededExtraEnForWork = Math.max(0, totalWorkEnDemand - effectiveFreeEn)
+          let maxConsumerGainPerEn = 0
+          if (neededExtraEnForWork > 0) {
+            for (const wIt of allActiveWorkForEn) {
+              if (wIt.netGain > 0 && wIt.enCost > 0) {
+                const r = wIt.netGain / wIt.enCost
+                if (r > maxConsumerGainPerEn) maxConsumerGainPerEn = r
+              }
+            }
+            for (const ce of cargoExplosiveUnits) {
+              if (ce.netGain > 0 && ce.enCost > 0) {
+                const r = ce.netGain / ce.enCost
+                if (r > maxConsumerGainPerEn) maxConsumerGainPerEn = r
+              }
+            }
+            for (const bu of bundleUnits) {
+              const buEn = Math.max(1, bu.slotsCost * craftEn)
+              if (bu.netGain > 0) {
+                const r = bu.netGain / buEn
+                if (r > maxConsumerGainPerEn) maxConsumerGainPerEn = r
+              }
+            }
+          }
 
           // 2) Cargo Dual-Use (`eat` vs `direct` mutually exclusive per physical copy!) & `snack` supplies
           const cargoPhase1Units = []
@@ -2164,10 +2510,23 @@ function optimizeAndSimulateSequence(adapter, {
             if (utilityTokens.explosiveId && itemId === utilityTokens.explosiveId) continue
             const maxAfford = Math.min(left, Math.floor(availCoins / price))
 
+            const curEnNowForCargoEat = Math.max(0, Math.floor(Number(probeWorld.state?.en || 0))) + committedEatEn
+            const maxEatEnRoomFromCargo = Math.max(
+              0,
+              Math.min(totalWorkEnDemand, eatStaminaCap) - Math.min(effectiveFreeEn, curEnNowForCargoEat)
+            )
             if (utilityTokens.snackId && itemId === utilityTokens.snackId) {
-              if (!allowedSet.has('eat') || remSnackNeed <= 0 || totalWorkEnDemand <= effectiveFreeEn) continue
-              const cnt = Math.min(maxAfford, remSnackNeed)
               const snackEn = R.B12_SNACK?.energy || 20
+              if (
+                !allowedSet.has('eat') ||
+                remSnackNeed <= 0 ||
+                maxEatEnRoomFromCargo <= 0 ||
+                neededExtraEnForWork <= 0 ||
+                snackEn * maxConsumerGainPerEn <= price * bucketDisc + 1e-6
+              ) {
+                continue
+              }
+              const cnt = Math.min(maxAfford, remSnackNeed, Math.ceil(maxEatEnRoomFromCargo / Math.max(1, snackEn)) + 1)
               for (let k = 0; k < cnt; k++) {
                 cargoPhase1Units.push({
                   kind: 'cargo-item',
@@ -2186,8 +2545,15 @@ function optimizeAndSimulateSequence(adapter, {
             }
 
             const edibleSp = cargoEdibleSpecs.find((sp) => sp.kind !== 'snack' && sp.id === itemId && sp.q === 0)
-            const maxEatCopies = (edibleSp && edibleSp.energyGain > 0 && totalWorkEnDemand > effectiveFreeEn)
-              ? Math.min(maxAfford, Math.ceil((totalWorkEnDemand - effectiveFreeEn) / edibleSp.energyGain) + 1)
+            const eatCanImproveWork =
+              Boolean(edibleSp) &&
+              allowedSet.has('eat') &&
+              edibleSp.energyGain > 0 &&
+              maxEatEnRoomFromCargo > 0 &&
+              neededExtraEnForWork > 0 &&
+              edibleSp.energyGain * maxConsumerGainPerEn > price * bucketDisc + 1e-6
+            const maxEatCopies = eatCanImproveWork
+              ? Math.min(maxAfford, Math.ceil(maxEatEnRoomFromCargo / edibleSp.energyGain) + 1)
               : 0
 
             const origSc = Number(projectedScOnStartDay[itemId] || 0)
@@ -2251,30 +2617,250 @@ function optimizeAndSimulateSequence(adapter, {
           const slotsBinding = maxCashFeasibleBundleSlots > S
           const S_eff = slotsBinding ? Math.min(24, S) : 0
 
+          const packBinaryCargoUnits = (list, sameFn, scaleFn) => {
+            const out = []
+            let idx = 0
+            while (idx < list.length) {
+              const base = list[idx]
+              let run = 1
+              while (idx + run < list.length && sameFn(base, list[idx + run])) run++
+              let rem = run
+              let bPow = 1
+              while (rem > 0) {
+                const takeN = Math.min(bPow, rem)
+                out.push(scaleFn(base, takeN))
+                rem -= takeN
+                bPow *= 2
+              }
+              idx += run
+            }
+            return out
+          }
+
+          // Prune zero-cash `inv-eat` and `existing-work` tails that exceed physical stamina cap `eatStaminaCap` / `220`
+          // (purely exact: zero-cash items beyond total DP stamina capacity can never be packed!)
+          const prunedInvEat = [...existingInvEatUnits].sort(
+            (a, b2) => (b2.netGain / Math.max(1, b2.enGain)) - (a.netGain / Math.max(1, a.enGain))
+          )
+          const boundedInvEat = []
+          let accEatEn = 0
+          const maxNeededEatEn = Math.max(0, eatStaminaCap - effectiveFreeEn) + 24
+          for (const ie of prunedInvEat) {
+            if (accEatEn >= maxNeededEatEn) break
+            boundedInvEat.push(ie)
+            accEatEn += Math.max(1, ie.enGain || 1)
+          }
+          const bundledInvEat = packBinaryCargoUnits(
+            boundedInvEat,
+            (a, b2) => a.enGain === b2.enGain && Math.abs(a.netGain - b2.netGain) <= 1e-9,
+            (base, n) => ({
+              enGain: base.enGain * n,
+              cashCost: 0,
+              unitCash: 0,
+              bundleCount: n,
+              netGain: base.netGain * n,
+              isCoffee: false,
+              kind: 'inv-eat',
+              isCargo: false,
+            })
+          )
+
+          const paidActiveWorkRaw = allActiveWorkForEn
+            .filter((x) => (x.cashCost || 0) > 0)
+            .sort((a, b2) => (a.cashCost - b2.cashCost) || (a.enCost - b2.enCost) || (b2.netGain - a.netGain))
+          const bundledPaidWork = packBinaryCargoUnits(
+            paidActiveWorkRaw,
+            (a, b2) => a.enCost === b2.enCost && a.cashCost === b2.cashCost && Math.abs(a.netGain - b2.netGain) <= 1e-9,
+            (base, n) => ({
+              enCost: base.enCost * n,
+              cashCost: base.cashCost * n,
+              unitCash: base.cashCost,
+              bundleCount: n,
+              netGain: base.netGain * n,
+              kind: 'existing-work',
+              isCargo: false,
+            })
+          )
+
+          const freeActiveWork = allActiveWorkForEn
+            .filter((x) => !(x.cashCost > 0))
+            .sort((a, b2) => (b2.netGain / Math.max(1, b2.enCost)) - (a.netGain / Math.max(1, a.enCost)))
+          const boundedFreeWork = []
+          let accFreeWorkEn = 0
+          for (const fw of freeActiveWork) {
+            if (accFreeWorkEn >= 220) break
+            boundedFreeWork.push(fw)
+            accFreeWorkEn += Math.max(1, fw.enCost || 1)
+          }
+          const bundledFreeWork = packBinaryCargoUnits(
+            boundedFreeWork,
+            (a, b2) => a.enCost === b2.enCost && Math.abs(a.netGain - b2.netGain) <= 1e-9,
+            (base, n) => ({
+              enCost: base.enCost * n,
+              cashCost: 0,
+              unitCash: 0,
+              bundleCount: n,
+              netGain: base.netGain * n,
+              kind: 'existing-work',
+              isCargo: false,
+            })
+          )
+
+          const packDualPartitionCargoUnits = (list, sameFn, scaleFn) => {
+            const out = []
+            let idx = 0
+            while (idx < list.length) {
+              const base = list[idx]
+              let run = 1
+              while (idx + run < list.length && sameFn(base, list[idx + run])) run++
+              if (base.canEat && base.canDirect) {
+                // Exact 2-partition binary decomposition `[1, 1, 1, 2, 2, 4, 4, ...]` represents every `(kEat, kDirect)` with `kEat + kDirect <= run`!
+                let rem = run
+                if (rem > 0) {
+                  out.push(scaleFn(base, 1))
+                  rem -= 1
+                }
+                for (let bPow = 1; rem > 0; bPow *= 2) {
+                  for (let rep = 0; rep < 2 && rem > 0; rep++) {
+                    const takeN = Math.min(bPow, rem)
+                    out.push(scaleFn(base, takeN))
+                    rem -= takeN
+                  }
+                }
+              } else {
+                let rem = run
+                let bPow = 1
+                while (rem > 0) {
+                  const takeN = Math.min(bPow, rem)
+                  out.push(scaleFn(base, takeN))
+                  rem -= takeN
+                  bPow *= 2
+                }
+              }
+              idx += run
+            }
+            return out
+          }
+
+          const bundledCargoP1 = packDualPartitionCargoUnits(
+            cargoPhase1Units,
+            (a, b2) =>
+              a.itemId === b2.itemId &&
+              a.isSnack === b2.isSnack &&
+              a.canEat === b2.canEat &&
+              a.canDirect === b2.canDirect &&
+              a.enGain === b2.enGain &&
+              a.cashCost === b2.cashCost &&
+              Math.abs(a.eatGain - b2.eatGain) <= 1e-9 &&
+              Math.abs(a.directGain - b2.directGain) <= 1e-9,
+            (base, n) =>
+              n === 1
+                ? { ...base, unitCash: base.cashCost, bundleCount: 1, baseUnit: base }
+                : {
+                    ...base,
+                    cashCost: base.cashCost * n,
+                    enGain: base.enGain * n,
+                    eatGain: base.eatGain * n,
+                    directGain: base.directGain * n,
+                    unitCash: base.cashCost,
+                    bundleCount: n,
+                    baseUnit: base,
+                  }
+          )
+
+          const bundledCargoExplosive = packBinaryCargoUnits(
+            cargoExplosiveUnits,
+            (a, b2) =>
+              a.itemId === b2.itemId &&
+              a.enCost === b2.enCost &&
+              a.cashCost === b2.cashCost &&
+              Math.abs(a.netGain - b2.netGain) <= 1e-9,
+            (base, n) =>
+              n === 1
+                ? { ...base, unitCash: base.cashCost, bundleCount: 1, baseUnit: base }
+                : {
+                    ...base,
+                    enCost: base.enCost * n,
+                    cashCost: base.cashCost * n,
+                    netGain: base.netGain * n,
+                    unitCash: base.cashCost,
+                    bundleCount: n,
+                    baseUnit: base,
+                  }
+          )
+
+          const bundledRecipeUnits = packBinaryCargoUnits(
+            bundleUnits,
+            (a, b2) =>
+              a.slotsCost === b2.slotsCost &&
+              a.enCost === b2.enCost &&
+              a.cashCost === b2.cashCost &&
+              Math.abs(a.netGain - b2.netGain) <= 1e-9 &&
+              JSON.stringify(a.buyPlan) === JSON.stringify(b2.buyPlan) &&
+              JSON.stringify(a.invPlan) === JSON.stringify(b2.invPlan),
+            (base, n) =>
+              n === 1
+                ? { ...base, unitCash: base.cashCost, bundleCount: 1, baseUnit: base }
+                : {
+                    ...base,
+                    slotsCost: base.slotsCost * n,
+                    enCost: base.enCost * n,
+                    cashCost: base.cashCost * n,
+                    netGain: base.netGain * n,
+                    unitCash: base.cashCost,
+                    bundleCount: n,
+                    baseUnit: base,
+                  }
+          )
+
           const phase1SupplyAndDual = [
-            ...existingInvEatUnits.map((x) => ({ ...x, kind: 'inv-eat', isCargo: false })),
-            ...shopCoffeeUnits,
-            ...cargoPhase1Units,
+            ...bundledInvEat,
+            ...shopCoffeeUnits.map((x) => ({ ...x, unitCash: x.cashCost, bundleCount: 1 })),
+            ...bundledCargoP1,
           ]
           const phase2NonSlotWork = [
-            ...allActiveWorkForEn.map((x) => ({ ...x, kind: 'existing-work', isCargo: false })),
-            ...cargoExplosiveUnits,
-            ...(slotsBinding ? [] : bundleUnits),
+            ...bundledFreeWork,
+            ...bundledPaidWork,
+            ...bundledCargoExplosive,
+            ...(slotsBinding ? [] : bundledRecipeUnits),
           ]
-          const phase3SlotBundles = slotsBinding ? bundleUnits : []
+          const phase3SlotBundles = slotsBinding ? bundledRecipeUnits : []
 
           const allCargoDpItems = [...phase1SupplyAndDual, ...phase2NonSlotWork, ...phase3SlotBundles]
           const totalMaxDpCashSpend = allCargoDpItems.reduce((acc, it) => acc + Number(it.cashCost || 0), 0)
-          const cashBinding = totalMaxDpCashSpend > availCoins + 1e-9
+          const demandedCargoQty = new Map()
+          for (const bu of bundleUnits) {
+            for (const [bId, bQty] of Object.entries(bu.buyPlan || {})) {
+              demandedCargoQty.set(bId, (demandedCargoQty.get(bId) || 0) + bQty)
+            }
+          }
+          for (const ce of cargoExplosiveUnits) {
+            demandedCargoQty.set(ce.itemId, (demandedCargoQty.get(ce.itemId) || 0) + 1)
+          }
+          for (const cp of cargoPhase1Units) {
+            demandedCargoQty.set(cp.itemId, (demandedCargoQty.get(cp.itemId) || 0) + 1)
+          }
+          let maxPhysicalCargoCash = 0
+          for (const [cId, demQ] of demandedCargoQty.entries()) {
+            const cP = cargoPrice.get(cId) || 0
+            const cL = Math.min(demQ, cargoLeft.get(cId) || 0, cP > 0 ? Math.floor(availCoins / cP) : 0)
+            if (cL > 0 && cP > 0) maxPhysicalCargoCash += cL * cP
+          }
+          const maxNonCargoDpCash =
+            shopCoffeeUnits.reduce((sAcc, x) => sAcc + Number(x.cashCost || 0), 0) +
+            paidActiveWorkRaw.reduce((sAcc, x) => sAcc + Number(x.cashCost || 0), 0)
+          const trueMaxSpendableCash = Math.min(totalMaxDpCashSpend, maxPhysicalCargoCash + maxNonCargoDpCash)
+          const cashBinding = trueMaxSpendableCash > availCoins + 1e-9
 
           let rawGcd = 0
           if (cashBinding) {
             for (const it of allCargoDpItems) {
-              if (it.cashCost > 0) rawGcd = rawGcd === 0 ? it.cashCost : gcdCargo(rawGcd, it.cashCost)
+              const uCash = Number(it.unitCash ?? it.cashCost ?? 0)
+              if (uCash > 0) rawGcd = rawGcd === 0 ? uCash : gcdCargo(rawGcd, uCash)
             }
           }
           if (rawGcd <= 0) rawGcd = 1
-          const maxCashCells = S_eff > 0 ? 250 : 800
+          const maxCashCells = u === 0 ? (S_eff > 0 ? 250 : 800) : (S_eff > 0 ? 80 : 140)
           const cashUnit = !cashBinding
             ? 1
             : Math.floor(availCoins / rawGcd) > maxCashCells
@@ -2296,54 +2882,85 @@ function optimizeAndSimulateSequence(adapter, {
           const E = Math.min(220, maxReachableEn, Math.max(effectiveFreeEn, totalWorkEnDemand))
           const stride = C + 1
           const sliceSize = (E + 1) * stride
-          if (cashBinding) {
+          if (cashBinding && u === 0) {
             recordCashGrid('cargo-stamina-slots-dp', cashUnit, rawGcd, (S_eff + 1) * sliceSize)
           }
 
           const NEG_INF = -1e18
           const dp1 = new Float64Array(sliceSize)
           dp1.fill(NEG_INF)
-          dp1[Math.min(E, effectiveFreeEn) * stride] = 0
+          const minP1E = Math.min(E, effectiveFreeEn)
+          let maxReachableE = minP1E
+          dp1[minP1E * stride] = 0
+          let maxReachableC = 0
 
-          const prevP1 = phase1SupplyAndDual.map(() => new Int32Array(sliceSize))
+          const firstCargoP1 = phase1SupplyAndDual.findIndex((x) => x.isCargo)
+          const hasCargoP1 = firstCargoP1 >= 0
+          const prevP1 = phase1SupplyAndDual.map((_, idx) =>
+            hasCargoP1 && idx >= firstCargoP1 ? new Int32Array(sliceSize) : null
+          )
           for (let i = 0; i < phase1SupplyAndDual.length; i++) {
             const it = phase1SupplyAndDual[i]
-            const cCost = cashBinding && it.cashCost > 0 ? Math.ceil(it.cashCost / cashUnit) : 0
+            const uCash = Number(it.unitCash ?? it.cashCost ?? 0)
+            const bCnt = Number(it.bundleCount || 1)
+            const cCost = cashBinding && uCash > 0 ? bCnt * Math.ceil(uCash / cashUnit) : 0
             if (cCost > C) continue
             const pArr = prevP1[i]
+            const cStart = Math.min(maxReachableC, C - cCost)
+            const eStart = maxReachableE
 
             if (it.kind === 'cargo-item') {
               const capE = Math.min(E, eatStaminaCap)
-              for (let srcC = C - cCost; srcC >= 0; srcC--) {
-                const dstC = srcC + cCost
-                for (let srcE = E; srcE >= 0; srcE--) {
-                  const srcIdx = srcE * stride + srcC
-                  const srcVal = dp1[srcIdx]
-                  if (srcVal <= -1e17) continue
-                  if (it.canEat) {
-                    const newE = Math.min(capE, Math.max(srcE, srcE + it.enGain))
-                    const dstIdx = newE * stride + dstC
-                    const candVal = srcVal + it.eatGain
-                    if (candVal > dp1[dstIdx] + 1e-6) {
-                      dp1[dstIdx] = candVal
-                      pArr[dstIdx] = (srcIdx + 1) * 2
-                    }
-                  }
-                  if (it.canDirect) {
+              if (!it.canEat && it.canDirect) {
+                for (let srcC = cStart; srcC >= 0; srcC--) {
+                  const dstC = srcC + cCost
+                  for (let srcE = eStart; srcE >= minP1E; srcE--) {
+                    const srcIdx = srcE * stride + srcC
+                    const srcVal = dp1[srcIdx]
+                    if (srcVal <= -1e17) continue
                     const dstIdx = srcE * stride + dstC
                     const candVal = srcVal + it.directGain
                     if (candVal > dp1[dstIdx] + 1e-6) {
                       dp1[dstIdx] = candVal
-                      pArr[dstIdx] = (srcIdx + 1) * 2 + 1
+                      if (pArr) pArr[dstIdx] = (srcIdx + 1) * 2 + 1
                     }
                   }
+                }
+              } else {
+                for (let srcC = cStart; srcC >= 0; srcC--) {
+                  const dstC = srcC + cCost
+                  for (let srcE = eStart; srcE >= minP1E; srcE--) {
+                    const srcIdx = srcE * stride + srcC
+                    const srcVal = dp1[srcIdx]
+                    if (srcVal <= -1e17) continue
+                    if (it.canEat) {
+                      const newE = Math.min(capE, Math.max(srcE, srcE + it.enGain))
+                      const dstIdx = newE * stride + dstC
+                      const candVal = srcVal + it.eatGain
+                      if (candVal > dp1[dstIdx] + 1e-6) {
+                        dp1[dstIdx] = candVal
+                        if (pArr) pArr[dstIdx] = (srcIdx + 1) * 2
+                      }
+                    }
+                    if (it.canDirect) {
+                      const dstIdx = srcE * stride + dstC
+                      const candVal = srcVal + it.directGain
+                      if (candVal > dp1[dstIdx] + 1e-6) {
+                        dp1[dstIdx] = candVal
+                        if (pArr) pArr[dstIdx] = (srcIdx + 1) * 2 + 1
+                      }
+                    }
+                  }
+                }
+                if (it.canEat && it.enGain > 0) {
+                  maxReachableE = Math.max(maxReachableE, Math.min(capE, eStart + it.enGain))
                 }
               }
             } else {
               const capE = it.isCoffee ? E : Math.min(E, eatStaminaCap)
-              for (let srcE = E; srcE >= 0; srcE--) {
+              for (let srcE = eStart; srcE >= minP1E; srcE--) {
                 const newE = Math.min(capE, Math.max(srcE, srcE + it.enGain))
-                for (let srcC = C - cCost; srcC >= 0; srcC--) {
+                for (let srcC = cStart; srcC >= 0; srcC--) {
                   if (newE === srcE && cCost === 0) continue
                   const srcIdx = srcE * stride + srcC
                   const srcVal = dp1[srcIdx]
@@ -2352,24 +2969,36 @@ function optimizeAndSimulateSequence(adapter, {
                   const candVal = srcVal + it.netGain
                   if (candVal > dp1[dstIdx] + 1e-6) {
                     dp1[dstIdx] = candVal
-                    pArr[dstIdx] = (srcIdx + 1) * 2
+                    if (pArr) pArr[dstIdx] = (srcIdx + 1) * 2
                   }
                 }
               }
+              if (it.enGain > 0) {
+                maxReachableE = Math.max(maxReachableE, Math.min(capE, eStart + it.enGain))
+              }
             }
+            if (cCost > 0) maxReachableC = Math.min(C, maxReachableC + cCost)
           }
 
-          const prevP2 = phase2NonSlotWork.map(() => new Int32Array(sliceSize))
+          const firstCargoP2 = phase2NonSlotWork.findIndex((x) => x.isCargo)
+          const needTraceP2From = hasCargoP1 ? 0 : (firstCargoP2 >= 0 ? firstCargoP2 : phase2NonSlotWork.length)
+          const prevP2 = phase2NonSlotWork.map((_, idx) =>
+            idx >= needTraceP2From ? new Int32Array(sliceSize) : null
+          )
           for (let i = 0; i < phase2NonSlotWork.length; i++) {
             const it = phase2NonSlotWork[i]
             const cEn = it.enCost || 0
-            const cCost = cashBinding && it.cashCost > 0 ? Math.ceil(it.cashCost / cashUnit) : 0
+            const uCash = Number(it.unitCash ?? it.cashCost ?? 0)
+            const bCnt = Number(it.bundleCount || 1)
+            const cCost = cashBinding && uCash > 0 ? bCnt * Math.ceil(uCash / cashUnit) : 0
             if (cEn > E || cCost > C) continue
             const pArr = prevP2[i]
-            for (let newE = 0; newE <= E - cEn; newE++) {
+            const cMaxDst = Math.min(C, maxReachableC + cCost)
+            const eMaxDst = Math.min(E, maxReachableE) - cEn
+            for (let newE = 0; newE <= eMaxDst; newE++) {
               const srcRow = (newE + cEn) * stride
               const dstRow = newE * stride
-              for (let newC = C; newC >= cCost; newC--) {
+              for (let newC = cMaxDst; newC >= cCost; newC--) {
                 const srcC = newC - cCost
                 const srcIdx = srcRow + srcC
                 const srcVal = dp1[srcIdx]
@@ -2378,9 +3007,18 @@ function optimizeAndSimulateSequence(adapter, {
                 const candVal = srcVal + it.netGain
                 if (candVal > dp1[dstIdx] + 1e-6) {
                   dp1[dstIdx] = candVal
-                  pArr[dstIdx] = srcIdx + 1
+                  if (pArr) pArr[dstIdx] = srcIdx + 1
                 }
               }
+            }
+            if (cCost > 0) maxReachableC = Math.min(C, maxReachableC + cCost)
+          }
+
+          const pushChosenCargoExpanded = (item, chosenMode) => {
+            const base = item.baseUnit || item
+            const cnt = Number(item.bundleCount || 1)
+            for (let k = 0; k < cnt; k++) {
+              chosenCargo.push({ ...base, chosenMode })
             }
           }
 
@@ -2392,20 +3030,26 @@ function optimizeAndSimulateSequence(adapter, {
             dp3.set(dp1, 0)
             const prevP3 = phase3SlotBundles.map(() => new Int32Array(totalCells3))
 
+            let maxReachableS = 0
             for (let i = 0; i < phase3SlotBundles.length; i++) {
               const it = phase3SlotBundles[i]
               const sCost = it.slotsCost
               const cEn = it.enCost || 0
-              const cCost = cashBinding && it.cashCost > 0 ? Math.ceil(it.cashCost / cashUnit) : 0
-              if (sCost > S_eff || cEn > E || cCost > C) continue
+              const uCash = Number(it.unitCash ?? it.cashCost ?? 0)
+              const bCnt = Number(it.bundleCount || 1)
+              const cCost = cashBinding && uCash > 0 ? bCnt * Math.ceil(uCash / cashUnit) : 0
+              if (sCost > S_eff || cEn > maxReachableE || cCost > C) continue
               const pArr = prevP3[i]
-              for (let newS = S_eff; newS >= sCost; newS--) {
+              const cMaxDst = Math.min(C, maxReachableC + cCost)
+              const sMaxDst = Math.min(S_eff, maxReachableS + sCost)
+              const eMaxDst = Math.min(E, maxReachableE) - cEn
+              for (let newS = sMaxDst; newS >= sCost; newS--) {
                 const srcSOff = (newS - sCost) * sliceSize
                 const dstSOff = newS * sliceSize
-                for (let newE = 0; newE <= E - cEn; newE++) {
+                for (let newE = 0; newE <= eMaxDst; newE++) {
                   const srcERow = srcSOff + (newE + cEn) * stride
                   const dstERow = dstSOff + newE * stride
-                  for (let newC = C; newC >= cCost; newC--) {
+                  for (let newC = cMaxDst; newC >= cCost; newC--) {
                     const srcIdx = srcERow + (newC - cCost)
                     const srcVal = dp3[srcIdx]
                     if (srcVal <= -1e17) continue
@@ -2418,6 +3062,8 @@ function optimizeAndSimulateSequence(adapter, {
                   }
                 }
               }
+              if (cCost > 0) maxReachableC = Math.min(C, maxReachableC + cCost)
+              maxReachableS = sMaxDst
             }
 
             let bestIdx3 = Math.min(E, effectiveFreeEn) * stride
@@ -2432,32 +3078,31 @@ function optimizeAndSimulateSequence(adapter, {
             for (let i = phase3SlotBundles.length - 1; i >= 0; i--) {
               const code = prevP3[i][curIdx]
               if (code > 0) {
-                chosenCargo.push({ ...phase3SlotBundles[i], chosenMode: 'recipe-bundle' })
+                pushChosenCargoExpanded(phase3SlotBundles[i], 'recipe-bundle')
                 curIdx = code - 1
               }
             }
             // Now `curIdx` is in slice `s = 0` (`0 <= curIdx < sliceSize`)!
-            for (let i = phase2NonSlotWork.length - 1; i >= 0; i--) {
+            for (let i = phase2NonSlotWork.length - 1; i >= needTraceP2From; i--) {
               const code = prevP2[i][curIdx]
               if (code > 0) {
                 if (phase2NonSlotWork[i].isCargo) {
-                  chosenCargo.push({ ...phase2NonSlotWork[i], chosenMode: phase2NonSlotWork[i].kind })
+                  pushChosenCargoExpanded(phase2NonSlotWork[i], phase2NonSlotWork[i].kind)
                 }
                 curIdx = code - 1
               }
             }
-            for (let i = phase1SupplyAndDual.length - 1; i >= 0; i--) {
-              const code = prevP1[i][curIdx]
-              if (code > 0) {
-                const isDirect = (code & 1) === 1
-                const srcIdx = ((code - (code & 1)) / 2) - 1
-                if (phase1SupplyAndDual[i].isCargo) {
-                  chosenCargo.push({
-                    ...phase1SupplyAndDual[i],
-                    chosenMode: isDirect ? 'direct' : 'cargo-eat',
-                  })
+            if (hasCargoP1) {
+              for (let i = phase1SupplyAndDual.length - 1; i >= firstCargoP1; i--) {
+                const code = prevP1[i][curIdx]
+                if (code > 0) {
+                  const isDirect = (code & 1) === 1
+                  const srcIdx = ((code - (code & 1)) / 2) - 1
+                  if (phase1SupplyAndDual[i].isCargo) {
+                    pushChosenCargoExpanded(phase1SupplyAndDual[i], isDirect ? 'direct' : 'cargo-eat')
+                  }
+                  curIdx = srcIdx
                 }
-                curIdx = srcIdx
               }
             }
           } else {
@@ -2470,27 +3115,26 @@ function optimizeAndSimulateSequence(adapter, {
               }
             }
             let curIdx = bestIdx1
-            for (let i = phase2NonSlotWork.length - 1; i >= 0; i--) {
+            for (let i = phase2NonSlotWork.length - 1; i >= needTraceP2From; i--) {
               const code = prevP2[i][curIdx]
               if (code > 0) {
                 if (phase2NonSlotWork[i].isCargo) {
-                  chosenCargo.push({ ...phase2NonSlotWork[i], chosenMode: phase2NonSlotWork[i].kind })
+                  pushChosenCargoExpanded(phase2NonSlotWork[i], phase2NonSlotWork[i].kind)
                 }
                 curIdx = code - 1
               }
             }
-            for (let i = phase1SupplyAndDual.length - 1; i >= 0; i--) {
-              const code = prevP1[i][curIdx]
-              if (code > 0) {
-                const isDirect = (code & 1) === 1
-                const srcIdx = ((code - (code & 1)) / 2) - 1
-                if (phase1SupplyAndDual[i].isCargo) {
-                  chosenCargo.push({
-                    ...phase1SupplyAndDual[i],
-                    chosenMode: isDirect ? 'direct' : 'cargo-eat',
-                  })
+            if (hasCargoP1) {
+              for (let i = phase1SupplyAndDual.length - 1; i >= firstCargoP1; i--) {
+                const code = prevP1[i][curIdx]
+                if (code > 0) {
+                  const isDirect = (code & 1) === 1
+                  const srcIdx = ((code - (code & 1)) / 2) - 1
+                  if (phase1SupplyAndDual[i].isCargo) {
+                    pushChosenCargoExpanded(phase1SupplyAndDual[i], isDirect ? 'direct' : 'cargo-eat')
+                  }
+                  curIdx = srcIdx
                 }
-                curIdx = srcIdx
               }
             }
           }
@@ -2608,7 +3252,7 @@ function optimizeAndSimulateSequence(adapter, {
       trackWorld = adapter.advanceTimeOnly(trackWorld, b.atSec, { futurePrices: bPrices })
       trackWorld = applyExogenousArrivals(trackWorld, b.exogenousArrivalsAtStart)
       if (preActionsByU[u].length > 0) {
-        trackWorld = adapter.simulateBatch(trackWorld, preActionsByU[u], { t: b.atSec, prices: bPrices, rand: trackPrng }).afterWorld
+        trackWorld = simulateValidBatch(adapter, trackWorld, preActionsByU[u], { t: b.atSec, prices: bPrices, rand: trackPrng }).afterWorld
       }
       const curSnap = adapter.availableInvSnapshot(trackWorld.state)
       for (const [id, row] of Object.entries(curSnap)) {
@@ -2623,19 +3267,36 @@ function optimizeAndSimulateSequence(adapter, {
     }
   }
 
-  // Step C: Solve multi-bucket joint Craft + Sell across buckets `0..L-1` to reserve scarce craft slots & inputs
-  // for higher-margin future arrivals (e.g., reserving 1 craft slot for `t0 + 60` strawberry arrival)!
+  // Step C: Solve multi-bucket joint Craft + Sell across buckets `0..L-1` (plus post-`tH` continuation craft buckets)
+  // to reserve scarce craft slots & raw inputs for higher-margin future/off-season peaks!
+  const craftEnForJoint = R.WORLD?.cost?.craft ?? 1
+  const jointBuckets = [...seqBuckets, ...contCraftBuckets]
+  const jointSupplyByBucket = [...supplyByBucket, ...contCraftBuckets.map(() => ({}))]
+  const jointCraftCapByIsle = new Map(craftCapByIsle)
+  for (const cb of contCraftBuckets) {
+    if (!jointCraftCapByIsle.has(cb.isleIndex)) {
+      jointCraftCapByIsle.set(cb.isleIndex, allowedSet.has('craft') ? (R.WORLD?.daily?.craft || 80) : 0)
+    }
+  }
+  const jointEnAfterPre = Float64Array.from(jointBuckets.map((b2, idx2) =>
+    idx2 < L
+      ? Math.max(enAfterPreByU[idx2] || 0, (jointCraftCapByIsle.get(b2.isleIndex) || 0) * craftEnForJoint)
+      : (jointCraftCapByIsle.get(b2.isleIndex) || 0) * craftEnForJoint
+  ))
+  const jointMaxHoldDays = contCraftBuckets.length > 0 && jointBuckets.length > 0
+    ? Math.max(maxCraftHoldIsleDays || 3, (jointBuckets[jointBuckets.length - 1].isleDayOffset || 0) + 1)
+    : maxCraftHoldIsleDays
   const jointCS = solveJointCraftAndSell(adapter, {
-    initialSupplyByBucket: supplyByBucket,
-    buckets: seqBuckets,
-    slots,
+    initialSupplyByBucket: jointSupplyByBucket,
+    buckets: jointBuckets,
+    slots: jointSlots,
     initialNatDay: R.worldDay(startWorld.now),
     initialCnt: startWorld.state?.cnt || {},
-    craftCapByIsle,
-    enCapByBucket: Float64Array.from(seqBuckets.map((b2, idx2) => Math.max(enAfterPreByU[idx2] || 0, craftCapByIsle.get(b2.isleIndex) || 0))),
+    craftCapByIsle: jointCraftCapByIsle,
+    enCapByBucket: jointEnAfterPre,
     staminaShadowCost: 0,
     allowCraft: allowedSet.has('craft'),
-    maxCraftHoldIsleDays,
+    maxCraftHoldIsleDays: jointMaxHoldDays,
   })
 
   // Step D: Unified Integer Bounded Knapsack Stamina Competition + Exact Marginal Stamina Top-Up (`eat` / `coffee`)!
@@ -2740,7 +3401,11 @@ function optimizeAndSimulateSequence(adapter, {
         const p = Number(sl.prices?.[id] || 0)
         if (!(p > 0)) continue
         const isCrop = graph.cropsById.has(id)
-        const sc0 = sl.naturalDay === b.naturalDay ? Number(stState?.cnt?.['sc_' + id] || 0) + extraSc : 0
+        const sc0 = !isCrop
+          ? 0
+          : sl.naturalDay === b.naturalDay
+            ? Number(stState?.cnt?.['sc_' + id] || 0) + extraSc
+            : getProjectedSc(sl.naturalDay, id)
         const tierMult = !isCrop ? 1.0 : (sc0 >= 400 ? 0.70 : sc0 >= 150 ? 0.85 : 1.0)
         best = Math.max(best, Math.round(p * qual) * tierMult * sl.disc * sl.netTaxFactor)
       }
@@ -2750,6 +3415,12 @@ function optimizeAndSimulateSequence(adapter, {
     const recipeInputSet = new Set()
     for (const rec of R.RECIPES || []) {
       for (const inId of Object.keys(rec.in || {})) recipeInputSet.add(inId)
+    }
+
+    const edibleOpportunityUnitValue = (stState, id, q = 0) => {
+      const dirVal = directSaleOnlyValue(stState, id, q)
+      if (!recipeInputSet.has(id)) return dirVal
+      return Math.max(dirVal, marginalItemValueFn(id, q, b.atSec))
     }
 
     const computeBucketCraftBundles = (stWorld) => {
@@ -2770,7 +3441,7 @@ function optimizeAndSimulateSequence(adapter, {
       if (freeSlotsNow <= 0) return craftItems
 
       const snapAvail = adapter.availableInvSnapshot(s)
-      for (let fu = u + 1; fu < L; fu++) {
+      for (let fu = u + 1; fu < jointCS.craftsByBucket.length; fu++) {
         for (const ca of jointCS.craftsByBucket[fu] || []) {
           const rec = graph.recipesById.get(ca.id)
           if (!rec?.in) continue
@@ -2917,7 +3588,12 @@ function optimizeAndSimulateSequence(adapter, {
       return Math.max(1, x)
     }
 
-    const solveBucketStaminaKnapsack = (stWorld, maxEnLimit, craftBundlesOverride = null, { fullIsleQuotas = false } = {}) => {
+    const solveBucketStaminaKnapsack = (
+      stWorld,
+      maxEnLimit,
+      craftBundlesOverride = null,
+      { fullIsleQuotas = false, fishEvOverride = null } = {}
+    ) => {
       const s = stWorld.state
       const freeCash = Math.max(0, Number(stWorld.coins || 0) - Number(constraints.cashReserveFloor || 0))
       const actionRoom = fullIsleQuotas ? 200 : Math.max(0, maxBucketActions - bucketActs.length)
@@ -2975,7 +3651,9 @@ function optimizeAndSimulateSequence(adapter, {
             0
           )
           const bestIsleEv = bestFishEvInIsle.get(b.isleIndex) || 0
-          const valBait = fullIsleQuotas ? Math.max(rawValBait, bestIsleEv) : rawValBait
+          const valBait = fishEvOverride != null
+            ? fishEvOverride
+            : (fullIsleQuotas ? Math.max(rawValBait, bestIsleEv) : rawValBait)
           const enCapCheck = Number(R.energyMax(s))
           const hasBetterWindowLaterSameIsle = !fullIsleQuotas
             && seqBuckets.slice(u + 1).some((fb) => fb.isleIndex === b.isleIndex)
@@ -3039,12 +3717,53 @@ function optimizeAndSimulateSequence(adapter, {
       const E = Math.max(0, Math.min(maxEnLimit, maxCostSum))
       const totalPaidCash = items.reduce((sAcc, it) => sAcc + Number(it.cashCost || 0), 0)
 
+      // Exact Bounded -> 0-1 Binary Bundling (`1, 2, 4, ...`) with zero-cash items ordered first!
+      const freeRaw = []
+      const paidRaw = []
+      for (const it of items) {
+        if (it.cashCost > 0) paidRaw.push(it)
+        else freeRaw.push(it)
+      }
+      const orderedRaw = [...freeRaw, ...paidRaw]
+      const sameKsItem = (a, b2) => {
+        if (a.kind !== b2.kind || a.costEn !== b2.costEn || (a.cashCost || 0) !== (b2.cashCost || 0)) return false
+        if (Math.abs(a.gain - b2.gain) > 1e-9) return false
+        if (a.kind === 'craft-bundle') {
+          if (!a.craftSteps || !b2.craftSteps || a.craftSteps.length !== 1 || b2.craftSteps.length !== 1) return false
+          return a.craftSteps[0].id === b2.craftSteps[0].id && a.craftSteps[0].n === b2.craftSteps[0].n
+        }
+        return true
+      }
+      const dpItems = []
+      let rIdx = 0
+      while (rIdx < orderedRaw.length) {
+        const base = orderedRaw[rIdx]
+        let run = 1
+        while (rIdx + run < orderedRaw.length && sameKsItem(base, orderedRaw[rIdx + run])) run++
+        let rem = run
+        let bPow = 1
+        const uCash = Number(base.cashCost || 0)
+        while (rem > 0) {
+          const takeN = Math.min(bPow, rem)
+          dpItems.push({
+            baseItem: base,
+            bundleCount: takeN,
+            unitCash: uCash,
+            costEn: base.costEn * takeN,
+            gain: base.gain * takeN,
+          })
+          rem -= takeN
+          bPow *= 2
+        }
+        rIdx += run
+      }
+
       // When multiple paid item pools (`bomb-buy` + `fish-buy-bait`) compete for scarce `freeCash`,
       // solve exact 2D `(e, c)` DP so reconstructed items NEVER exceed `freeCash`!
       if (totalPaidCash > freeCash + 1e-9 && E > 0) {
         let rawGcd = 0
-        for (const it of items) {
-          if (it.cashCost > 0) rawGcd = rawGcd === 0 ? it.cashCost : gcdInt(rawGcd, it.cashCost)
+        for (const it of dpItems) {
+          if (it.unitCash > 0) rawGcd = rawGcd === 0 ? it.unitCash : gcdInt(rawGcd, it.unitCash)
         }
         if (rawGcd <= 0) rawGcd = 1
         const cashUnit = Math.floor(freeCash / rawGcd) > 500
@@ -3054,24 +3773,32 @@ function optimizeAndSimulateSequence(adapter, {
         const stride = C + 1
         recordCashGrid('bucket-stamina-cash-dp', cashUnit, rawGcd, (E + 1) * stride)
         const dp2 = new Float64Array((E + 1) * stride)
-        const take2 = items.map(() => new Uint8Array((E + 1) * stride))
+        dp2.fill(-1e18)
+        dp2[0] = 0
+        let maxReachC = 0
+        const take2 = dpItems.map(() => new Uint8Array((E + 1) * stride))
 
-        for (let i = 0; i < items.length; i++) {
-          const cEn = items[i].costEn
-          const cCash = items[i].cashCost > 0 ? Math.ceil(items[i].cashCost / cashUnit) : 0
-          const g = items[i].gain
+        for (let i = 0; i < dpItems.length; i++) {
+          const cEn = dpItems[i].costEn
+          const cCash = dpItems[i].unitCash > 0 ? dpItems[i].bundleCount * Math.ceil(dpItems[i].unitCash / cashUnit) : 0
+          const g = dpItems[i].gain
           if (cEn > E || cCash > C) continue
+          const cMax = Math.min(C, maxReachC + cCash)
+          const tArr = take2[i]
           for (let e = E; e >= cEn; e--) {
             const rowOff = e * stride
             const prevOff = (e - cEn) * stride
-            for (let c = C; c >= cCash; c--) {
-              const cand = dp2[prevOff + (c - cCash)] + g
+            for (let c = cMax; c >= cCash; c--) {
+              const prevVal = dp2[prevOff + (c - cCash)]
+              if (prevVal <= -1e17) continue
+              const cand = prevVal + g
               if (cand > dp2[rowOff + c] + 1e-6) {
                 dp2[rowOff + c] = cand
-                take2[i][rowOff + c] = 1
+                tArr[rowOff + c] = 1
               }
             }
           }
+          if (cCash > 0) maxReachC = Math.min(C, maxReachC + cCash)
         }
 
         const bestAtMost = new Float64Array(E + 1)
@@ -3082,7 +3809,7 @@ function optimizeAndSimulateSequence(adapter, {
           let rowBestE = e > 0 ? bestExactE[e - 1] : 0
           let rowBestC = e > 0 ? bestExactC[e - 1] : 0
           const rowOff = e * stride
-          for (let c = 0; c <= C; c++) {
+          for (let c = 0; c <= maxReachC; c++) {
             if (dp2[rowOff + c] > rowBest + 1e-6) {
               rowBest = dp2[rowOff + c]
               rowBestE = e
@@ -3099,11 +3826,12 @@ function optimizeAndSimulateSequence(adapter, {
           let curE = bestExactE[clamped]
           let curC = bestExactC[clamped]
           const picked = []
-          for (let i = items.length - 1; i >= 0 && curE > 0; i--) {
+          for (let i = dpItems.length - 1; i >= 0 && curE > 0; i--) {
             if (take2[i][curE * stride + curC]) {
-              picked.push(items[i])
-              curE -= items[i].costEn
-              curC -= items[i].cashCost > 0 ? Math.ceil(items[i].cashCost / cashUnit) : 0
+              const cnt = dpItems[i].bundleCount
+              for (let k = 0; k < cnt; k++) picked.push(dpItems[i].baseItem)
+              curE -= dpItems[i].costEn
+              curC -= dpItems[i].unitCash > 0 ? cnt * Math.ceil(dpItems[i].unitCash / cashUnit) : 0
             }
           }
           picked.reverse()
@@ -3114,16 +3842,17 @@ function optimizeAndSimulateSequence(adapter, {
       }
 
       const dp = new Float64Array(E + 1)
-      const takeTable = items.map(() => new Uint8Array(E + 1))
+      const takeTable = dpItems.map(() => new Uint8Array(E + 1))
 
-      for (let i = 0; i < items.length; i++) {
-        const cEn = items[i].costEn
-        const g = items[i].gain
+      for (let i = 0; i < dpItems.length; i++) {
+        const cEn = dpItems[i].costEn
+        const g = dpItems[i].gain
+        const tArr = takeTable[i]
         for (let e = E; e >= cEn; e--) {
           const cand = dp[e - cEn] + g
           if (cand > dp[e] + 1e-6) {
             dp[e] = cand
-            takeTable[i][e] = 1
+            tArr[e] = 1
           }
         }
       }
@@ -3143,10 +3872,11 @@ function optimizeAndSimulateSequence(adapter, {
         const clamped = Math.max(0, Math.min(E, Math.floor(availEn)))
         let curE = bestExactE[clamped]
         const picked = []
-        for (let i = items.length - 1; i >= 0 && curE > 0; i--) {
+        for (let i = dpItems.length - 1; i >= 0 && curE > 0; i--) {
           if (takeTable[i][curE]) {
-            picked.push(items[i])
-            curE -= items[i].costEn
+            const cnt = dpItems[i].bundleCount
+            for (let k = 0; k < cnt; k++) picked.push(dpItems[i].baseItem)
+            curE -= dpItems[i].costEn
           }
         }
         picked.reverse()
@@ -3183,7 +3913,7 @@ function optimizeAndSimulateSequence(adapter, {
               )
             : adapter.availableInv(s0, spec.id, spec.q)
           if (!(qty > 0) || !(spec.energyGain > 0)) continue
-          const unitCost = spec.kind === 'snack' ? 0 : directSaleOnlyValue(s0, spec.id, spec.q)
+          const unitCost = spec.kind === 'snack' ? 0 : edibleOpportunityUnitValue(s0, spec.id, spec.q)
           topUpUnits.push({
             kind: 'eat',
             id: spec.id,
@@ -3226,27 +3956,139 @@ function optimizeAndSimulateSequence(adapter, {
       }
     }
 
+    // Compute remaining same-isle free natural regen & post-midnight coffee capacity across later same-isle buckets
+    // so expensive off-season crops are never eaten prematurely when free overnight regen + post-midnight coffee cover isle quotas!
+    const sameIsleFutureIndices = []
+    let futureSameIsleRegenEn = 0
+    let estFutureSameIslePreEn = 0
+    let hasPostMidnightSameIsleReset = false
+    for (let fu = u + 1; fu < L; fu++) {
+      if (seqBuckets[fu].isleIndex !== b.isleIndex) break
+      sameIsleFutureIndices.push(fu)
+      if (seqBuckets[fu].naturalDay !== b.naturalDay) hasPostMidnightSameIsleReset = true
+    }
+    let curRawFishEvForGate = 0
+    let maxFutureSameIsleFishEv = 0
+    if (sameIsleFutureIndices.length > 0) {
+      const rawCapGate = Number(R.energyMax(execWorld.state))
+      const capEGate = Number.isFinite(rawCapGate) && rawCapGate > 0 ? rawCapGate : 100
+      const regenStepGate = R.WORLD?.regen || 180
+      let prevSecGate = Math.max(b.atSec, Number(execWorld.state?.enT || b.atSec))
+      for (const fu of sameIsleFutureIndices) {
+        const fSec = seqBuckets[fu].atSec
+        const segRegen = Math.min(capEGate, Math.max(0, Math.floor((fSec - prevSecGate) / regenStepGate)))
+        futureSameIsleRegenEn += segRegen
+        prevSecGate += segRegen * regenStepGate
+        for (const pa of preActionsByU[fu] || []) {
+          estFutureSameIslePreEn += Number(R.WORLD?.cost?.[pa.a] || 0)
+        }
+      }
+      if (allowedSet.has('fish')) {
+        const fyNow = expectedFishYieldPerCast(adapter, execWorld.state, b.atSec, true)
+        curRawFishEvForGate = Object.entries(fyNow.byFish).reduce(
+          (acc, [fId, qs]) => acc + qs[0] * marginalItemValueFn(fId, 0, b.atSec) + qs[1] * marginalItemValueFn(fId, 1, b.atSec) + qs[2] * marginalItemValueFn(fId, 2, b.atSec),
+          0
+        )
+        for (const fu of sameIsleFutureIndices) {
+          const fb = seqBuckets[fu]
+          const fyFut = expectedFishYieldPerCast(adapter, execWorld.state, fb.atSec, true)
+          const fEv = Object.entries(fyFut.byFish).reduce(
+            (acc, [fId, qs]) => acc + qs[0] * marginalItemValueFn(fId, 0, fb.atSec) + qs[1] * marginalItemValueFn(fId, 1, fb.atSec) + qs[2] * marginalItemValueFn(fId, 2, fb.atSec),
+            0
+          )
+          if (fEv > maxFutureSameIsleFishEv) maxFutureSameIsleFishEv = fEv
+        }
+      }
+    }
+
+    let planWorld = adapter.cloneWorld(execWorld)
+    let planBundles = cachedCraftBundles
+    const plannedTopUpActs = []
+
     if (allowedSet.has('eat') || allowedSet.has('coffee')) {
-      for (let topStep = 0; topStep < 24 && bucketActs.length < maxBucketActions - 4; topStep++) {
-        const s = execWorld.state
+      const futureCraftNeedByItem = {}
+      for (let fu = u + 1; fu < jointCS.craftsByBucket.length; fu++) {
+        for (const ca of jointCS.craftsByBucket[fu] || []) {
+          const rec = graph.recipesById.get(ca.id)
+          for (const [inId, perU] of Object.entries(rec?.in || {})) {
+            futureCraftNeedByItem[inId] = (futureCraftNeedByItem[inId] || 0) + perU * Number(ca.n || 1)
+          }
+        }
+      }
+
+      const rawPoolAfterCraftReserve = (qCounts, craftReserve) => {
+        const rem = [qCounts[0], qCounts[1], qCounts[2]]
+        let keep = craftReserve
+        for (let qIdx = 0; qIdx < 3 && keep > 0; qIdx++) {
+          const tk = Math.min(rem[qIdx], keep)
+          rem[qIdx] -= tk
+          keep -= tk
+        }
+        return rem
+      }
+
+      const nextBucketChangesNatDay = u + 1 < L && seqBuckets[u + 1].naturalDay !== b.naturalDay
+      let cachedKsIsleFull = null
+      let cachedKsIsleCoins = -1
+      let cachedKsIsleBundles = null
+
+      for (let topStep = 0; topStep < 24 && bucketActs.length + plannedTopUpActs.length < maxBucketActions - 4; topStep++) {
+        const s = planWorld.state
         const curEn = Math.max(0, Math.floor(Number(s.en || 0)))
         const spendableCurEn = Math.max(0, curEn - bucketEnFloor)
         const rawEnMax = Number(R.energyMax(s))
         const enMax = Number.isFinite(rawEnMax) && rawEnMax > 0 ? rawEnMax : 100
-        const ksEatBase = solveBucketStaminaKnapsack(execWorld, Math.max(spendableCurEn, Math.max(0, enMax - bucketEnFloor), Math.max(0, curEn + (R.WORLD?.coffee?.energy || 60) - bucketEnFloor)), cachedCraftBundles)
+        const ksEatBase = solveBucketStaminaKnapsack(
+          planWorld,
+          Math.max(spendableCurEn, Math.max(0, enMax - bucketEnFloor), Math.max(0, curEn + (R.WORLD?.coffee?.energy || 60) - bucketEnFloor)),
+          planBundles
+        )
         const baseVal = ksEatBase.bestAtMost[Math.min(ksEatBase.E, spendableCurEn)]
 
-        const futureCraftNeedByItem = {}
-        for (let fu = u + 1; fu < L; fu++) {
-          for (const ca of jointCS.craftsByBucket[fu] || []) {
-            const rec = graph.recipesById.get(ca.id)
-            for (const [inId, perU] of Object.entries(rec?.in || {})) {
-              futureCraftNeedByItem[inId] = (futureCraftNeedByItem[inId] || 0) + perU * Number(ca.n || 1)
-            }
+        if (sameIsleFutureIndices.length > 0) {
+          const curCoinsNow = Number(planWorld.coins || 0)
+          if (!cachedKsIsleFull || curCoinsNow !== cachedKsIsleCoins || planBundles !== cachedKsIsleBundles) {
+            cachedKsIsleFull = solveBucketStaminaKnapsack(planWorld, 800, planBundles, {
+              fullIsleQuotas: true,
+              fishEvOverride: allowedSet.has('fish') ? maxFutureSameIsleFishEv : null,
+            })
+            cachedKsIsleCoins = curCoinsNow
+            cachedKsIsleBundles = planBundles
           }
         }
+        const ksIsleFull = cachedKsIsleFull
+        const freeFutureEn = Math.max(0, futureSameIsleRegenEn - estFutureSameIslePreEn)
+        const coffeePrice = R.WORLD?.coffee?.price || 15000
+        const coffeeEnGain = R.WORLD?.coffee?.energy || 60
+        const coffeeCpe = (coffeePrice * bucketDisc) / Math.max(1, coffeeEnGain)
+        const cheaperPostMidCoffeeEn = (hasPostMidnightSameIsleReset && allowedSet.has('coffee'))
+          ? Math.min(
+              R.WORLD?.daily?.coffee || 3,
+              Math.floor(Math.max(0, Number(planWorld.coins || 0) - Number(constraints.cashReserveFloor || 0)) / coffeePrice)
+            ) * coffeeEnGain
+          : 0
+
+        const capWithIsleWindow = (localDelta, addedEn, avgCpe, isZeroCostExpiringSnack = false) => {
+          if (!ksIsleFull || (isZeroCostExpiringSnack && avgCpe <= 1e-6)) return localDelta
+          const coveredEn = spendableCurEn + freeFutureEn + (avgCpe > coffeeCpe + 1e-6 ? cheaperPostMidCoffeeEn : 0)
+          let isleDelta =
+            ksIsleFull.bestAtMost[Math.min(ksIsleFull.E, coveredEn + addedEn)] -
+            ksIsleFull.bestAtMost[Math.min(ksIsleFull.E, coveredEn)]
+          if (allowedSet.has('fish') && curRawFishEvForGate > maxFutureSameIsleFishEv + 1e-6) {
+            const fishCostEn = Math.max(1, R.WORLD?.cost?.fish ?? 4)
+            const usedFishNow = s.iq?.d === b.isleIndex ? Number(s.iq.fish || 0) : 0
+            const remFishNow = Math.max(0, (R.WORLD?.daily?.fish || 80) - usedFishNow)
+            const alreadyFundedNow = Math.floor(spendableCurEn / fishCostEn)
+            if (remFishNow > alreadyFundedNow) {
+              const extraCasts = Math.min(remFishNow - alreadyFundedNow, Math.ceil(addedEn / fishCostEn))
+              isleDelta += extraCasts * (curRawFishEvForGate - maxFutureSameIsleFishEv)
+            }
+          }
+          return Math.min(localDelta, Math.max(0, isleDelta))
+        }
+
         const curBucketCraftNeedByItem = {}
-        for (const cb of cachedCraftBundles || []) {
+        for (const cb of planBundles || []) {
           for (const stStep of cb.craftSteps || []) {
             const rec = graph.recipesById.get(stStep.id)
             for (const [inId, perU] of Object.entries(rec?.in || {})) {
@@ -3255,27 +4097,15 @@ function optimizeAndSimulateSequence(adapter, {
           }
         }
 
-        const rawPoolAfterCraftReserve = (qCounts, craftReserve) => {
-          const rem = [qCounts[0], qCounts[1], qCounts[2]]
-          let keep = craftReserve
-          for (let qIdx = 0; qIdx < 3 && keep > 0; qIdx++) {
-            const tk = Math.min(rem[qIdx], keep)
-            rem[qIdx] -= tk
-            keep -= tk
-          }
-          return rem
-        }
-
         let bestFoodAct = null
-        let bestAfterBundles = cachedCraftBundles
+        let bestFoodBatchCount = 1
+        let bestAfterBundles = planBundles
         let bestRatio = 1.0
         let bestOppCost = Infinity
 
         if (allowedSet.has('eat') && curEn < enMax && ksEatBase.E > curEn) {
           // Build the available non-craft-cannibalizing food pool sorted by unit cost-per-energy (`cpe`),
-          // breaking ties strictly by lower `oppCost` (`q=0` BEFORE `q=1` BEFORE `q=2`!) so:
-          // 1) Multi-unit food reachability (`2 * 5 en` turnips -> `6 en` bomb) is recognized from `curEn = 0`, and
-          // 2) Staircase jumps in `ksEatBase.bestAtMost` NEVER trick 1-step lookahead into eating `q=2` before `q=0`!
+          // breaking ties strictly by lower `oppCost` (`q=0` BEFORE `q=1` BEFORE `q=2`!)
           const poolEntries = []
           const deferredCraftCutSpecs = []
           for (const spec of edibleSpecs) {
@@ -3324,13 +4154,10 @@ function optimizeAndSimulateSequence(adapter, {
                 const afterRem = rawPoolAfterCraftReserve(qAfter, totNeed)
                 for (let qIdx = 0; qIdx < 3; qIdx++) {
                   const diff = beforeRem[qIdx] - afterRem[qIdx]
-                  if (diff > 0) unitOppCost += diff * directSaleOnlyValue(s, spec.id, qIdx)
+                  if (diff > 0) unitOppCost += diff * edibleOpportunityUnitValue(s, spec.id, qIdx)
                 }
               } else {
-                unitOppCost = Math.max(
-                  directSaleOnlyValue(s, spec.id, spec.q),
-                  marginalItemValueFn(spec.id, 0, b.atSec)
-                )
+                unitOppCost = edibleOpportunityUnitValue(s, spec.id, spec.q)
               }
             }
             poolEntries.push({
@@ -3341,6 +4168,7 @@ function optimizeAndSimulateSequence(adapter, {
               firstGain: gainEn,
               unitOppCost,
               cpe: unitOppCost / Math.max(1, gainEn),
+              isExpiringSnack: spec.kind === 'snack' && nextBucketChangesNatDay,
             })
           }
 
@@ -3350,7 +4178,6 @@ function optimizeAndSimulateSequence(adapter, {
               (a.unitOppCost - b2.unitOppCost) ||
               ((a.spec.q ?? 0) - (b2.spec.q ?? 0))
             )
-            // Find the highest return-on-cost reachable stamina threshold `targetE` (`curEn < targetE <= min(ksEatBase.E, enMax)`)
             let reachEn = curEn
             let cumCost = 0
             for (const pe of poolEntries) {
@@ -3359,8 +4186,15 @@ function optimizeAndSimulateSequence(adapter, {
                 if (!(stepGain > 0)) break
                 reachEn += stepGain
                 cumCost += pe.unitOppCost
+                const addedEn = Math.max(1, reachEn - curEn)
                 const workAtReach = ksEatBase.bestAtMost[Math.min(ksEatBase.E, Math.max(0, reachEn - bucketEnFloor))]
-                const deltaWork = workAtReach - baseVal
+                const rawDeltaWork = workAtReach - baseVal
+                const deltaWork = capWithIsleWindow(
+                  rawDeltaWork,
+                  addedEn,
+                  cumCost / addedEn,
+                  poolEntries[0].isExpiringSnack
+                )
                 const netImp = deltaWork - cumCost
                 if (netImp > 1e-6) {
                   const firstEntry = poolEntries[0]
@@ -3369,19 +4203,24 @@ function optimizeAndSimulateSequence(adapter, {
                     bestRatio = ratio
                     bestOppCost = firstEntry.unitOppCost
                     bestFoodAct = firstEntry.candAct
-                    bestAfterBundles = cachedCraftBundles
+                    const maxRoom = Math.max(
+                      1,
+                      Math.min(R.WORLD?.maxActions || 40, maxBucketActions - 4 - bucketActs.length - plannedTopUpActs.length)
+                    )
+                    bestFoodBatchCount = Math.min(firstEntry.count, pe === firstEntry ? (k + 1) : firstEntry.count, maxRoom)
+                    bestAfterBundles = planBundles
                   }
                 }
               }
             }
           }
 
-          // Now evaluate craft-cannibalizing candidates ONLY if their exact weak-dominance upper bound
-          // (`ksEatBase.bestAtMost[optimisticAfterEn] - baseVal`) can beat BOTH `oppCost` AND `bestRatio`!
+          // Evaluate craft-cannibalizing candidates ONLY if their exact weak-dominance upper bound beats `oppCost` and `bestRatio`
           for (const { spec, candAct, gainEn } of deferredCraftCutSpecs) {
-            const oppCost = directSaleOnlyValue(s, spec.id, spec.q)
+            const oppCost = edibleOpportunityUnitValue(s, spec.id, spec.q)
             const optimisticAfterEn = Math.max(0, Math.min(enMax, curEn + gainEn) - bucketEnFloor)
-            const optimisticDelta = ksEatBase.bestAtMost[Math.min(ksEatBase.E, optimisticAfterEn)] - baseVal
+            const rawOptimisticDelta = ksEatBase.bestAtMost[Math.min(ksEatBase.E, optimisticAfterEn)] - baseVal
+            const optimisticDelta = capWithIsleWindow(rawOptimisticDelta, gainEn, oppCost / Math.max(1, gainEn), false)
             if (optimisticDelta - oppCost <= 1e-6) continue
             const optimisticRatio = oppCost <= 1e-6 ? 1e12 + (optimisticDelta - oppCost) : optimisticDelta / oppCost
             if (
@@ -3391,7 +4230,7 @@ function optimizeAndSimulateSequence(adapter, {
               continue
             }
 
-            const simFood = adapter.simulateBatch(execWorld, [candAct], { t: b.atSec, prices: dynamicPrices })
+            const simFood = adapter.simulateBatch(planWorld, [candAct], { t: b.atSec, prices: dynamicPrices })
             if (!simFood.allOk) continue
             const afterW = simFood.afterWorld
             const afterEn = Math.max(0, Math.floor(Number(afterW.state?.en || 0)))
@@ -3400,7 +4239,8 @@ function optimizeAndSimulateSequence(adapter, {
             const afterBundles = computeBucketCraftBundles(afterW)
             const ksAfter = solveBucketStaminaKnapsack(afterW, spendableAfterEn, afterBundles)
             const newVal = ksAfter.bestAtMost[Math.min(ksAfter.E, spendableAfterEn)]
-            const deltaWorkVal = newVal - baseVal
+            const rawDeltaWorkVal = newVal - baseVal
+            const deltaWorkVal = capWithIsleWindow(rawDeltaWorkVal, afterEn - curEn, oppCost / Math.max(1, afterEn - curEn), false)
             const netImprovement = deltaWorkVal - oppCost
             if (netImprovement > 1e-6) {
               const ratio = oppCost <= 1e-6 ? 1e12 + netImprovement : deltaWorkVal / oppCost
@@ -3408,36 +4248,37 @@ function optimizeAndSimulateSequence(adapter, {
                 bestRatio = ratio
                 bestOppCost = oppCost
                 bestFoodAct = candAct
+                bestFoodBatchCount = 1
                 bestAfterBundles = afterBundles
               }
             }
           }
         }
 
-        const coffeePrice = R.WORLD?.coffee?.price || 15000
         if (
           allowedSet.has('coffee') &&
           Number(s.cnt?.coffee || 0) < (R.WORLD?.daily?.coffee || 3) &&
-          Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0) >= coffeePrice
+          Number(planWorld.coins || 0) - Number(constraints.cashReserveFloor || 0) >= coffeePrice
         ) {
-          const coffeeEnGain = R.WORLD?.coffee?.energy || 60
           const oppCost = coffeePrice * bucketDisc
           const optimisticCoffeeEn = Math.max(0, curEn + coffeeEnGain - bucketEnFloor)
-          const optimisticCoffeeDelta = ksEatBase.bestAtMost[Math.min(ksEatBase.E, optimisticCoffeeEn)] - baseVal
+          const rawOptCoffeeDelta = ksEatBase.bestAtMost[Math.min(ksEatBase.E, optimisticCoffeeEn)] - baseVal
+          const optimisticCoffeeDelta = capWithIsleWindow(rawOptCoffeeDelta, coffeeEnGain, oppCost / Math.max(1, coffeeEnGain), false)
           const optimisticCoffeeRatio = optimisticCoffeeDelta / Math.max(1e-9, oppCost)
           if (
             optimisticCoffeeDelta - oppCost > 1e-6 &&
             (optimisticCoffeeRatio > bestRatio + 1e-6 || (Math.abs(optimisticCoffeeRatio - bestRatio) <= 1e-6 && oppCost < bestOppCost - 1e-6))
           ) {
             const candAct = { a: 'coffee' }
-            const simFood = adapter.simulateBatch(execWorld, [candAct], { t: b.atSec, prices: dynamicPrices })
+            const simFood = adapter.simulateBatch(planWorld, [candAct], { t: b.atSec, prices: dynamicPrices })
             if (simFood.allOk) {
               const afterW = simFood.afterWorld
               const afterEn = Math.max(0, Math.floor(Number(afterW.state?.en || 0)))
               const spendableCoffeeEn = Math.max(0, afterEn - bucketEnFloor)
-              const ksAfter = solveBucketStaminaKnapsack(afterW, spendableCoffeeEn, cachedCraftBundles)
+              const ksAfter = solveBucketStaminaKnapsack(afterW, spendableCoffeeEn, planBundles)
               const newVal = ksAfter.bestAtMost[Math.min(ksAfter.E, spendableCoffeeEn)]
-              const deltaWorkVal = newVal - baseVal
+              const rawDeltaWorkVal = newVal - baseVal
+              const deltaWorkVal = capWithIsleWindow(rawDeltaWorkVal, afterEn - curEn, oppCost / Math.max(1, afterEn - curEn), false)
               const netImprovement = deltaWorkVal - oppCost
               if (netImprovement > 1e-6) {
                 const ratio = deltaWorkVal / oppCost
@@ -3445,7 +4286,8 @@ function optimizeAndSimulateSequence(adapter, {
                   bestRatio = ratio
                   bestOppCost = oppCost
                   bestFoodAct = candAct
-                  bestAfterBundles = cachedCraftBundles
+                  bestFoodBatchCount = 1
+                  bestAfterBundles = planBundles
                 }
               }
             }
@@ -3453,18 +4295,84 @@ function optimizeAndSimulateSequence(adapter, {
         }
 
         if (!bestFoodAct) break
-        pushAndSim([bestFoodAct])
-        cachedCraftBundles = bestAfterBundles
+        const chosenFoodBatch = bestFoodBatchCount > 1
+          ? Array.from({ length: bestFoodBatchCount }, () => bestFoodAct)
+          : [bestFoodAct]
+        const simChosen = adapter.simulateBatch(planWorld, chosenFoodBatch, { t: b.atSec, prices: dynamicPrices })
+        if (!simChosen.allOk) {
+          if (bestFoodBatchCount > 1) {
+            const simOne = adapter.simulateBatch(planWorld, [bestFoodAct], { t: b.atSec, prices: dynamicPrices })
+            if (!simOne.allOk) break
+            planWorld = simOne.afterWorld
+            plannedTopUpActs.push(bestFoodAct)
+            planBundles = bestAfterBundles
+            continue
+          }
+          break
+        }
+        planWorld = simChosen.afterWorld
+        plannedTopUpActs.push(...chosenFoodBatch)
+        planBundles = bestAfterBundles
       }
     }
 
-    // 3. Solve final Exact Bucket Stamina Knapsack at `execWorld.state.en - bucketEnFloor` and emit chosen actions!
-    //    (Shop buys & deterministic crafts run before stochastic actions so prefix compiler captures maximum deterministic value!)
+    // 3. Solve Exact Bucket Stamina Knapsack on `planWorld` and emit `eat` / `coffee` JUST-IN-TIME
+    //    right before the exact action whose stamina cost exceeds `execWorld.state.en - bucketEnFloor`!
     {
-      const curEn = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor)
-      if (curEn > 0) {
-        const ksFinal = solveBucketStaminaKnapsack(execWorld, curEn)
-        const chosenItems = ksFinal.reconstructAt(curEn)
+      let topUpCursor = 0
+      const edibleGainByKey = new Map()
+      for (const sp of edibleSpecs) {
+        edibleGainByKey.set(sp.kind === 'snack' ? `${sp.id}:snack` : `${sp.id}:${sp.q ?? 0}`, sp.energyGain)
+      }
+      const getPendingEatReserve = () => {
+        const res = {}
+        for (let idx = topUpCursor; idx < plannedTopUpActs.length; idx++) {
+          const ta = plannedTopUpActs[idx]
+          if (ta.a === 'eat' && ta.q != null) {
+            res[ta.id] ||= [0, 0, 0]
+            res[ta.id][ta.q] += 1
+          }
+        }
+        return res
+      }
+      const getPendingCoffeeCash = () => {
+        let c = 0
+        const cPrice = R.WORLD?.coffee?.price || 15000
+        for (let idx = topUpCursor; idx < plannedTopUpActs.length; idx++) {
+          if (plannedTopUpActs[idx].a === 'coffee') c += cPrice
+        }
+        return c
+      }
+      const ensureExecStamina = (neededSpendableEn) => {
+        while (topUpCursor < plannedTopUpActs.length) {
+          let curExecEn = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)))
+          if (curExecEn - bucketEnFloor >= neededSpendableEn) return
+          const rawCapExec = Number(R.energyMax(execWorld.state))
+          const capExec = Number.isFinite(rawCapExec) && rawCapExec > 0 ? rawCapExec : 100
+          const coffeeEnStep = R.WORLD?.coffee?.energy || 60
+          const startIdx = topUpCursor
+          while (topUpCursor < plannedTopUpActs.length && curExecEn - bucketEnFloor < neededSpendableEn) {
+            const ta = plannedTopUpActs[topUpCursor]
+            if (ta.a === 'coffee') {
+              curExecEn += coffeeEnStep
+            } else {
+              const g = ta.q != null
+                ? (edibleGainByKey.get(`${ta.id}:${ta.q}`) || 0)
+                : (edibleGainByKey.get(`${ta.id}:snack`) || edibleGainByKey.get(`${ta.id}:0`) || 0)
+              if (curExecEn >= capExec || g <= 0) break
+              curExecEn = Math.min(capExec, curExecEn + g)
+            }
+            topUpCursor++
+          }
+          if (topUpCursor <= startIdx) break
+          pushAndSim(plannedTopUpActs.slice(startIdx, topUpCursor))
+        }
+      }
+
+      const planSpendableEn = Math.max(0, Math.floor(Number(planWorld.state?.en || 0)) - bucketEnFloor)
+      if (planSpendableEn > 0) {
+        const ksFinal = solveBucketStaminaKnapsack(planWorld, planSpendableEn, planBundles)
+        const chosenItems = ksFinal.reconstructAt(planSpendableEn)
         if (chosenItems.length > 0) {
           const rawCraftList = []
           let nBombInv = 0
@@ -3487,19 +4395,42 @@ function optimizeAndSimulateSequence(adapter, {
             else if (it.kind === 'mine') nMine++
           }
 
-          // 3a) Deterministic crafts first!
+          // 3a) Deterministic crafts first (pulling top-up stamina just-in-time per craft chunk!)
           if (rawCraftList.length > 0) {
-            pushAndSim(mergeCraftActionsPreserveTopo(rawCraftList))
+            const craftEnUnit = R.WORLD?.cost?.craft ?? 1
+            const mergedCrafts = mergeCraftActionsPreserveTopo(rawCraftList)
+            let cIdx = 0
+            while (cIdx < mergedCrafts.length) {
+              const firstNeed = Math.max(1, Number(mergedCrafts[cIdx].n || 1)) * craftEnUnit
+              ensureExecStamina(firstNeed)
+              const availEn = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor)
+              const craftChunk = []
+              let usedEn = 0
+              while (cIdx < mergedCrafts.length) {
+                const stepEn = Math.max(1, Number(mergedCrafts[cIdx].n || 1)) * craftEnUnit
+                if (craftChunk.length > 0 && usedEn + stepEn > availEn) break
+                craftChunk.push(mergedCrafts[cIdx])
+                usedEn += stepEn
+                cIdx++
+              }
+              pushAndSim(craftChunk)
+            }
           }
 
-          // 3b) Shop purchases for bombs/bait (deterministic, lowers wallet before `b12TaxSale`!)
-          let freeCashNow = Math.max(0, Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0))
+          // 3b) Shop purchases for bombs/bait (preserving cash reserved for any pending just-in-time `coffee`!)
+          let freeCashNow = Math.max(
+            0,
+            Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0) - getPendingCoffeeCash()
+          )
           if (nBombBuy > 0 && utilityTokens.explosiveId) {
             const pBomb = Number(R.SHOP?.[utilityTokens.explosiveId]?.price || 0)
             const affordB = pBomb > 0 ? Math.min(nBombBuy, Math.floor(freeCashNow / pBomb)) : 0
             if (affordB > 0) {
               pushAndSim([{ a: 'buy', id: utilityTokens.explosiveId, n: affordB }])
-              freeCashNow = Math.max(0, Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0))
+              freeCashNow = Math.max(
+                0,
+                Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0) - getPendingCoffeeCash()
+              )
               nBombBuy = affordB
             } else {
               nBombBuy = 0
@@ -3516,19 +4447,16 @@ function optimizeAndSimulateSequence(adapter, {
             }
           }
 
-          // Note: Before running stochastic extraction (`bomb`/`fish`/`mine`), sell any deterministic finished goods
-          // that should be liquidated in THIS bucket so `compileExecutablePrefix` executes deterministic sells
-          // BEFORE truncating on the first stochastic action!
+          // Sell deterministic finished goods before stochastic extraction while protecting pending `eat` reserves!
           if (
             (nBombInv + nBombBuy + nFishInvBait + nFishBuyBait + nFishNoBait + nMine > 0) &&
             allowedSet.has('sell') &&
             !(forcedTrunkSellPolicy === 'hold-in-first-bucket' && u === 0 && L > 1)
           ) {
-            emitOptimalBucketSells(u, b, dynamicPrices, pushAndSim)
+            emitOptimalBucketSells(u, b, dynamicPrices, pushAndSim, getPendingEatReserve())
           }
 
-          // 3c) Stochastic extraction actions ordered by highest marginal gain per stamina so the single compiled
-          //     stochastic action at the end of a truncated prefix is ALWAYS the highest-EV extraction!
+          // 3c) Stochastic extraction actions ordered by highest marginal gain per stamina
           const stochGroups = []
           const totalBombs = nBombInv + nBombBuy
           if (totalBombs > 0) {
@@ -3559,10 +4487,7 @@ function optimizeAndSimulateSequence(adapter, {
           }
           stochGroups.sort((a, b2) => b2.perEn - a.perEn)
 
-          // 3b-post) Post-turnover empty-plot planting:
-          //          When deterministic `stockBuy -> craft -> sell` inside this bucket replenished wallet cash
-          //          (e.g. `enableFirstBucketPlant: false` preserved pre-craft cash for cargo wine bundles),
-          //          plant remaining empty plots deterministically BEFORE stochastic extraction!
+          // 3b-post) Post-turnover empty-plot planting (preserving cash reserved for pending `coffee`!)
           if (allowedSet.has('plant') && (execWorld.state?.plotN || 0) > 0) {
             const ps = execWorld.state
             const weatherNow = R.weatherOf(b.isleDay)
@@ -3570,7 +4495,10 @@ function optimizeAndSimulateSequence(adapter, {
               + (totalBaitedFish + totalUnbaitedFish) * (R.WORLD?.cost?.fish ?? 4)
               + nMine * (R.WORLD?.cost?.mine ?? 3)
             const lowestStochPerEn = stochGroups.length > 0 ? stochGroups[stochGroups.length - 1].perEn : 0
-            let simCashP = Math.max(0, Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0))
+            let simCashP = Math.max(
+              0,
+              Number(execWorld.coins || 0) - Number(constraints.cashReserveFloor || 0) - getPendingCoffeeCash()
+            )
             let simEnP = Math.max(0, Math.floor(Number(ps.en || 0)))
             const postPlants = []
             for (let i = 0; i < ps.plotN; i++) {
@@ -3585,11 +4513,15 @@ function optimizeAndSimulateSequence(adapter, {
                 tEnd: tH,
                 marginalItemValueFn,
                 staminaPointCost: oppPerEn,
+                enforceHorizonCutoff: objectiveCfg.terminalSupplyMode === 'zero',
               })
               if (!bestP) continue
               const hasFreeSeed = adapter.availableInv(ps, `sd_${bestP.crop.id}`, 0) > 0
               const costCash = hasFreeSeed ? 0 : bestP.crop.seed
               if (costCash > simCashP) continue
+              marginalItemValueFn(bestP.crop.id, 0, b.atSec, {
+                reserveUnits: Math.max(1, Math.round(bestP.totalExpectedUnits || 2)),
+              })
               postPlants.push({ a: 'plant', i, c: bestP.crop.id })
               simCashP -= costCash
               simEnP -= pCostEn
@@ -3603,20 +4535,44 @@ function optimizeAndSimulateSequence(adapter, {
             }
           }
 
+          let seenFirstStochInBucket = false
           for (const grp of stochGroups) {
             if (!grp.acts || grp.acts.length === 0) continue
-            const remEnForStoch = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor)
-            if (remEnForStoch <= 0) break
             const sampleAct = grp.acts[0]
-            const unitCost = sampleAct.a === 'bomb'
-              ? (R.WORLD?.cost?.bomb ?? 6)
-              : (sampleAct.a === 'fish' ? (R.WORLD?.cost?.fish ?? 4) : (R.WORLD?.cost?.mine ?? 3))
-            const maxAffordEn = Math.floor(remEnForStoch / Math.max(1, unitCost))
-            if (maxAffordEn <= 0) continue
-            pushAndSim(grp.acts.slice(0, maxAffordEn))
+            const unitCost = Math.max(
+              1,
+              sampleAct.a === 'bomb'
+                ? (R.WORLD?.cost?.bomb ?? 6)
+                : (sampleAct.a === 'fish' ? (R.WORLD?.cost?.fish ?? 4) : (R.WORLD?.cost?.mine ?? 3))
+            )
+            let cursorAct = 0
+            while (cursorAct < grp.acts.length && bucketActs.length < maxBucketActions) {
+              let remEnForStoch = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor)
+              if (remEnForStoch < unitCost) {
+                const rawCapExec = Number(R.energyMax(execWorld.state))
+                const capExec = Number.isFinite(rawCapExec) && rawCapExec > 0 ? rawCapExec : 100
+                const wantEn = (u === 0 && !seenFirstStochInBucket)
+                  ? unitCost
+                  : Math.min(
+                      Math.max(unitCost, Math.max(0, capExec - bucketEnFloor)),
+                      (grp.acts.length - cursorAct) * unitCost
+                    )
+                ensureExecStamina(wantEn)
+                remEnForStoch = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - bucketEnFloor)
+              }
+              if (remEnForStoch < unitCost) break
+              const maxAffordEn = (u === 0 && !seenFirstStochInBucket && topUpCursor < plannedTopUpActs.length)
+                ? Math.min(grp.acts.length - cursorAct, Math.floor(remEnForStoch / unitCost))
+                : Math.min(grp.acts.length - cursorAct, Math.floor(remEnForStoch / unitCost))
+              if (maxAffordEn <= 0) break
+              pushAndSim(grp.acts.slice(cursorAct, cursorAct + maxAffordEn))
+              cursorAct += maxAffordEn
+              seenFirstStochInBucket = true
+            }
           }
         }
       }
+      cachedCraftBundles = computeBucketCraftBundles(execWorld)
     }
 
     // 4. Execute optimal multi-bucket `sell` actions for any remaining/newly extracted inventory in this bucket!
@@ -3627,8 +4583,16 @@ function optimizeAndSimulateSequence(adapter, {
     finalBucketActions[u] = bucketActs
   }
 
-  function emitOptimalBucketSells(u, b, dynamicPrices, pushAndSimFn) {
+  function emitOptimalBucketSells(u, b, dynamicPrices, pushAndSimFn, pendingEatReserve = null) {
     const curAvail = adapter.availableInvSnapshot(execWorld.state)
+    if (pendingEatReserve) {
+      for (const [eId, qArr] of Object.entries(pendingEatReserve)) {
+        if (!curAvail[eId]) continue
+        for (let q = 0; q < 3; q++) {
+          curAvail[eId][q] = Math.max(0, (curAvail[eId][q] || 0) - (qArr[q] || 0))
+        }
+      }
+    }
     const remSlots = slots
       .filter((sl) => sl.availFromBucket >= u)
       .map((sl) => ({
@@ -3652,17 +4616,17 @@ function optimizeAndSimulateSequence(adapter, {
         continue
       }
       // Build full remaining supply across `u..L-1` (current stock at `u` + future arrivals in `u+1..L-1`),
-      // deducting planned future crafts (`u+1..L-1`) from the arriving bucket backwards down to `0` (`curAvail`)
-      // so cross-day crop sale tiers (`150` / `400`) account for upcoming harvests while reserving raw inputs!
+      // deducting planned future & continuation crafts (`u+1..jointCS.craftsByBucket.length-1`)
+      // from the arriving bucket backwards down to `0` (`curAvail`)!
       const remSupply = [
         [...(curAvail[id] || [0, 0, 0])],
         ...seqBuckets.slice(u + 1).map((_, idx) => [...(supplyByBucket[u + 1 + idx]?.[id] || [0, 0, 0])]),
       ]
-      for (let relFu = 1; relFu < remSupply.length; relFu++) {
-        const fu = u + relFu
+      for (let fu = u + 1; fu < jointCS.craftsByBucket.length; fu++) {
+        const relFu = Math.min(remSupply.length - 1, fu - u)
         let needAtFu = 0
         for (const ca of jointCS.craftsByBucket[fu] || []) {
-          if (ca.id === id) {
+          if (fu < L && ca.id === id) {
             remSupply[relFu][0] += Number(ca.n || 1)
           }
           const rec = graph.recipesById.get(ca.id)
@@ -3713,8 +4677,10 @@ function optimizeAndSimulateSequence(adapter, {
     cashEvents,
     objectiveCfg,
     scenarioSupplyFactor,
-    explicitTerminalPrices: actualTermPrices,
+    explicitTerminalPrices: hasExplicitPriceOverride ? actualTermPrices : null,
     prevIsleSoldMap: actualTermPrevSold,
+    allowTerminalCraft: allowedSet.has('craft'),
+    allowTerminalHarvest: allowedSet.has('harvest'),
   })
 
   const marginalContext = {
@@ -3723,16 +4689,16 @@ function optimizeAndSimulateSequence(adapter, {
     sourceWorldDay: R.worldDay(startWorld.now),
     sourceCoins: Math.floor(Number(startWorld.coins || 0)),
     sourceEnergy: Math.floor(Number(startWorld.state?.en || 0)),
-    seqBuckets,
-    slots,
-    supplyByBucket,
+    seqBuckets: jointBuckets,
+    slots: jointSlots,
+    supplyByBucket: jointSupplyByBucket,
     jointCS,
-    craftCapByIsle,
-    enAfterPreByU,
+    craftCapByIsle: jointCraftCapByIsle,
+    enAfterPreByU: jointEnAfterPre,
     initialNatDay: R.worldDay(startWorld.now),
     initialCnt: startWorld.state?.cnt || {},
     allowCraft: allowedSet.has('craft'),
-    maxCraftHoldIsleDays,
+    maxCraftHoldIsleDays: jointMaxHoldDays,
     u0MarginalStaminaMeta,
     baseWorldEn0: Number(startWorld.state?.en || 0),
     t0,
@@ -3758,6 +4724,26 @@ function simulateValidBatch(adapter, world, candidateActions, { t, prices, rand 
   if (!candidateActions || candidateActions.length === 0) {
     return { validActions: [], sim: null, afterWorld: world }
   }
+  const maxBatch = adapter.R?.WORLD?.maxActions || 40
+  if (candidateActions.length > maxBatch) {
+    const validActions = []
+    const mergedOut = []
+    let cur = world
+    for (let i = 0; i < candidateActions.length; i += maxBatch) {
+      const part = simulateValidBatch(adapter, cur, candidateActions.slice(i, i + maxBatch), { t, prices, rand })
+      if (part.validActions.length > 0) {
+        validActions.push(...part.validActions)
+        if (part.sim?.result?.out) mergedOut.push(...part.sim.result.out)
+        cur = part.afterWorld
+      }
+    }
+    if (validActions.length === 0) return { validActions: [], sim: null, afterWorld: world }
+    return {
+      validActions,
+      sim: { allOk: true, result: { out: mergedOut }, afterWorld: cur },
+      afterWorld: cur,
+    }
+  }
   const drawn = []
   const wrappedRand = typeof rand === 'function'
     ? () => {
@@ -3774,10 +4760,24 @@ function simulateValidBatch(adapter, world, candidateActions, { t, prices, rand 
   if (fastSim.allOk) {
     return { validActions: candidateActions, sim: fastSim, afterWorld: fastSim.afterWorld }
   }
+  const fastOut = fastSim.result?.out || []
+  const fastAccepted = candidateActions.filter((_, idx) => fastOut[idx]?.ok === true)
+  if (fastAccepted.length === 0) {
+    return { validActions: [], sim: null, afterWorld: world }
+  }
   let replayCursor = 0
   const replayRand = typeof rand === 'function'
     ? () => (replayCursor < drawn.length ? drawn[replayCursor++] : rand())
     : null
+  const reSim = adapter.simulateBatch(world, fastAccepted, {
+    t,
+    prices,
+    ...(replayRand ? { rand: replayRand } : {}),
+  })
+  if (reSim.allOk) {
+    return { validActions: fastAccepted, sim: reSim, afterWorld: reSim.afterWorld }
+  }
+  replayCursor = 0
   const accepted = []
   const mergedOut = []
   let cur = adapter.cloneWorld(world)
@@ -4097,6 +5097,8 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     isPastDeadlineFn: isPastDeadline,
   })
 
+  const hasExplicitPriceOverride = Boolean(options.explicitPricesByBucket || options.explicitPricesByIsleIndex)
+
   // Evaluate a trunk policy candidate by running conditional recourse across all scenarios ω in Ω!
   const evaluateTrunkPolicy = (
     trunkPolicyMode,
@@ -4125,8 +5127,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       enableFirstBucketStockBuy,
     }
     const activeHasBranch = scenarios.length > 1
-      && !options.explicitPricesByBucket
-      && !options.explicitPricesByIsleIndex
+      && !hasExplicitPriceOverride
       && activeBuckets.some((b) => !b.isTrunkBeforePriceReveal)
 
     if (!activeHasBranch) {
@@ -4144,8 +5145,10 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
           cashEvents: autoInitCashEvents,
           objectiveCfg,
           scenarioSupplyFactor: sc.externalSupplyFactor,
-          explicitTerminalPrices: termP,
+          explicitTerminalPrices: hasExplicitPriceOverride ? termP : null,
           prevIsleSoldMap: termPrev,
+          allowTerminalCraft: allowedSet.has('craft'),
+          allowTerminalHarvest: allowedSet.has('harvest'),
         })
         return {
           expectedValue: ev.totalObjectiveValue,
@@ -4176,6 +5179,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         prngFactory,
         initialCashEvents: autoInitCashEvents,
         maxCraftHoldIsleDays,
+        hasExplicitPriceOverride,
       })
       return {
         expectedValue: res.objectiveEval.totalObjectiveValue,
@@ -4257,6 +5261,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       prngFactory,
       initialCashEvents: autoInitCashEvents,
       maxCraftHoldIsleDays,
+      hasExplicitPriceOverride,
     })
 
     // Replay ONLY the shared trunk actions `0..K-1` identically to obtain the exact common `worldAtBranchStart`!
@@ -4275,17 +5280,19 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       const acts = trunkActions[u] || []
       if (acts.length > 0) {
         const beforeC = Number(trunkWorld.coins || 0)
-        const sim = adapter.simulateBatch(trunkWorld, acts, { t: b.atSec, prices: startW.prices || {}, rand: replayPrng })
-        trunkWorld = sim.afterWorld
+        const sv = simulateValidBatch(adapter, trunkWorld, acts, { t: b.atSec, prices: startW.prices || {}, rand: replayPrng })
+        trunkWorld = sv.afterWorld
         const afterC = Number(trunkWorld.coins || 0)
         if (afterC !== beforeC) trunkCashEvents.push({ atSec: b.atSec, netCashDelta: afterC - beforeC })
-        acts.forEach((act, idx) => {
-          if (act.a === 'sell' && sim.result.out[idx]?.ok) {
-            const m = trunkSoldByIsle.get(b.isleIndex) || {}
-            m[act.id] = (m[act.id] || 0) + Number(act.n || 0)
-            trunkSoldByIsle.set(b.isleIndex, m)
-          }
-        })
+        if (sv.sim) {
+          sv.validActions.forEach((act, idx) => {
+            if (act.a === 'sell' && sv.sim.result.out[idx]?.ok) {
+              const m = trunkSoldByIsle.get(b.isleIndex) || {}
+              m[act.id] = (m[act.id] || 0) + Number(act.n || 0)
+              trunkSoldByIsle.set(b.isleIndex, m)
+            }
+          })
+        }
       }
     }
 
@@ -4316,6 +5323,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         prngFactory,
         initialCashEvents: [],
         maxCraftHoldIsleDays,
+        hasExplicitPriceOverride,
       })
       if (branchRes.discretizationMeta) {
         mergedDisc.maxDpCells = Math.max(mergedDisc.maxDpCells, branchRes.discretizationMeta.maxDpCells || 0)
@@ -4338,7 +5346,10 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         cashEvents: combinedCashEvents,
         objectiveCfg,
         scenarioSupplyFactor: sc.externalSupplyFactor,
+        explicitTerminalPrices: hasExplicitPriceOverride ? null : null,
         prevIsleSoldMap: termPrevSold,
+        allowTerminalCraft: allowedSet.has('craft'),
+        allowTerminalHarvest: allowedSet.has('harvest'),
       })
       expectedVal += sc.weight * fullEval.totalObjectiveValue
       scenarioBranches[sc.id] = {
@@ -4523,7 +5534,9 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
 
     if (!exactEvaluated) {
       const defaultM = scenarios.length > 1 && buckets.length > 4 ? 4 : 8
-      const M = Math.max(4, Math.floor(Number(options.stochasticPolicySamples ?? defaultM)))
+      const M = options.stochasticPolicySamples != null
+        ? Math.max(1, Math.floor(Number(options.stochasticPolicySamples)))
+        : defaultM
       const sampleVals = []
 
       // Pre-compute deterministic prefix state once when `firstStochIdx === -1 && b0`!
@@ -4640,9 +5653,22 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     ? ['optimal', 'hold-in-first-bucket', 'sell-all-now']
     : ['optimal']
 
+  const sellableIdSet = new Set(adapter.graph.sellableIds)
+  const hasAnySellableInvAtT0 = Object.entries(world0.state?.inv || {}).some(
+    ([id, q]) => sellableIdSet.has(id) && Array.isArray(q) && ((q[0] || 0) + (q[1] || 0) + (q[2] || 0)) > 0
+  )
+
   let bestDomestic = null
   for (const mode of candidateModes) {
     if (bestDomestic && isPastDeadline()) break
+    if (mode === 'hold-in-first-bucket' && bestDomestic) {
+      const optActs0 = bestDomestic.trunkActionsByBucket?.[0] || []
+      if (!optActs0.some((a) => a.a === 'sell')) continue
+    }
+    if (mode === 'sell-all-now' && bestDomestic && !hasAnySellableInvAtT0) {
+      const optActs0 = bestDomestic.trunkActionsByBucket?.[0] || []
+      if (!optActs0.some((a) => a.a === 'harvest' || a.a === 'collect' || a.a === 'stockBuy')) continue
+    }
     const rawCand = evaluateTrunkPolicy(mode, world0, world0)
     const cand = hasImmediatePrefixStochastic(rawCand) ? scoreDomesticCandidate(rawCand) : rawCand
     if (!bestDomestic || cand.policyExpectedValue > bestDomestic.policyExpectedValue + 1e-6) {

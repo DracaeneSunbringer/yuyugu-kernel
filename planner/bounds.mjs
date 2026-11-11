@@ -1,4 +1,4 @@
-import { buildObjectiveConfig, buildTerminalPrices, discountFactor } from '../model/objective.mjs'
+import { buildContinuationTimeline, buildObjectiveConfig, buildTerminalPrices, discountFactor } from '../model/objective.mjs'
 
 /**
  * Computes a mathematically valid Lagrangian Relaxation Upper Bound U(λ) >= opt*
@@ -71,16 +71,20 @@ export function computeValidUpperBound(adapter, {
     return m
   })
 
-  // Terminal bucket index = B (representing liquidation tail at t_H)
+  // Terminal continuation timeline starting at t_H
   const termWorldStub = { ...world, now: tH }
+  const contSlots = objectiveCfg.terminalSupplyMode === 'zero'
+    ? []
+    : buildContinuationTimeline(adapter, termWorldStub, world, objectiveCfg, null)
   const termPrices = objectiveCfg.terminalSupplyMode === 'zero'
     ? {}
-    : buildTerminalPrices(adapter, termWorldStub, world, objectiveCfg, null)
+    : (contSlots[0]?.prices ?? buildTerminalPrices(adapter, termWorldStub, world, objectiveCfg, null))
 
   const allSlots = [
     ...buckets.map((b, idx) => ({
       slotIdx: idx,
       atSec: b.atSec,
+      nextAtSec: b.nextAtSec,
       naturalDay: b.naturalDay,
       isleIndex: b.isleIndex,
       isleDay: b.isleDay,
@@ -90,18 +94,32 @@ export function computeValidUpperBound(adapter, {
     })),
     ...(objectiveCfg.terminalSupplyMode === 'zero'
       ? []
-      : [{
-          slotIdx: B,
-          atSec: tH,
-          naturalDay: R.worldDay(tH),
-          isleIndex: R.isleIndex(tH),
-          isleDay: R.isleDay(tH),
-          prices: termPrices,
-          isTerminal: true,
-          disc: discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, tH - t0)),
-        }]),
+      : contSlots.length > 1
+        ? contSlots.map((cs, idx) => ({
+            slotIdx: B + idx,
+            atSec: cs.atSec,
+            nextAtSec: cs.nextAtSec,
+            naturalDay: cs.naturalDay,
+            isleIndex: cs.isleIndex,
+            isleDay: cs.isleDay,
+            prices: cs.prices,
+            isTerminal: true,
+            disc: discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, cs.atSec - t0)),
+          }))
+        : [{
+            slotIdx: B,
+            atSec: tH,
+            nextAtSec: tH,
+            naturalDay: R.worldDay(tH),
+            isleIndex: R.isleIndex(tH),
+            isleDay: R.isleDay(tH),
+            prices: termPrices,
+            isTerminal: true,
+            disc: discountFactor(objectiveCfg.discountRatePerHour, Math.max(0, tH - t0)),
+          }]),
   ]
   const S = allSlots.length
+  const craftBoundSlots = contSlots.length > 1 ? S : B
 
   // Identify relevant items (all items with initial stock, arrivals, edibles including snacks, cargo stockBuy, or recipes)
   const edibleSpecs = typeof adapter.listDeterministicEdibleSpecs === 'function'
@@ -124,7 +142,7 @@ export function computeValidUpperBound(adapter, {
   const items = [...itemSet]
 
   // Group slots by isleIndex and naturalDay
-  const isleIndices = [...new Set(buckets.map((b) => b.isleIndex))]
+  const isleIndices = [...new Set(allSlots.slice(0, craftBoundSlots).map((s) => s.isleIndex))]
   const naturalDays = [...new Set(allSlots.map((s) => s.naturalDay))]
 
   const initIsleIdx = R.isleIndex(t0)
@@ -195,8 +213,8 @@ export function computeValidUpperBound(adapter, {
   }
 
   const cPrefixEn = []
-  for (let b = 0; b < B; b++) {
-    cPrefixEn.push(addConstraint(`en@${b}`, initEn + maxRegenTo(buckets[b].nextAtSec)))
+  for (let b = 0; b < craftBoundSlots; b++) {
+    cPrefixEn.push(addConstraint(`en@${b}`, initEn + maxRegenTo(allSlots[b].nextAtSec)))
   }
 
   const cCropTier = new Map() // `${id}:${nd}:${tierIdx}` -> constraintIdx
@@ -258,16 +276,16 @@ export function computeValidUpperBound(adapter, {
     }
   }
 
-  // 2) Craft variables in buckets 0..B-1
+  // 2) Craft variables in slots 0..craftBoundSlots-1
   if (allowed.has('craft')) {
     const craftEnCost = R.WORLD?.cost?.craft ?? 1
-    for (let b = 0; b < B; b++) {
+    for (let b = 0; b < craftBoundSlots; b++) {
       const slot = allSlots[b]
       const cap = craftCapByIsle.get(slot.isleIndex) || 0
       if (cap <= 0) continue
       for (const r of R.RECIPES || []) {
         const terms = [[cCraftIsle.get(slot.isleIndex), 1]]
-        for (let fb = b; fb < B; fb++) {
+        for (let fb = b; fb < craftBoundSlots; fb++) {
           terms.push([cPrefixEn[fb], craftEnCost])
         }
         for (let fs = b; fs < S; fs++) {
@@ -315,7 +333,7 @@ export function computeValidUpperBound(adapter, {
       const left = Math.max(0, (R.WORLD?.daily?.coffee || 3) - used)
       if (left <= 0) continue
       const terms = []
-      for (let fb = b; fb < B; fb++) {
+      for (let fb = b; fb < craftBoundSlots; fb++) {
         terms.push([cPrefixEn[fb], -(R.WORLD?.coffee?.energy || 60)])
       }
       vars.push({ ub: left, obj: -(R.WORLD?.coffee?.price || 15000) * slot.disc, terms })
@@ -361,7 +379,7 @@ export function computeValidUpperBound(adapter, {
         for (let fs = b; fs < S; fs++) {
           terms.push([cPrefixItem.get(`${spec.id}@${fs}`), 1])
         }
-        for (let fb = b; fb < B; fb++) {
+        for (let fb = b; fb < craftBoundSlots; fb++) {
           terms.push([cPrefixEn[fb], -spec.energyGain])
         }
         vars.push({ ub, obj: 0, terms })
