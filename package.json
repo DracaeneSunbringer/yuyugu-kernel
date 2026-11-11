@@ -1,0 +1,17 @@
+{
+  "name": "yuyugu-unified-kernel",
+  "version": "1.0.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "Zero-hardcoded-ID unified rolling-horizon economic decision kernel, staged raid scheduler, CRN combat optimizer, and counterfactual audit engine for 52dmeme Pet World (鱼鱼谷)",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node cli/live-daemon.mjs",
+    "start:domestic": "node cli/live-daemon.mjs --domestic-only",
+    "preflight": "node cli/live-daemon.mjs --dry-run --once",
+    "shadow": "node cli/shadow-daemon.mjs --once",
+    "test": "node --test test/*.test.mjs"
+  }
+}

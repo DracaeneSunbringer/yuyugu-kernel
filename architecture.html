@@ -1,0 +1,2167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>yuyugu-kernel · 系统架构与时序规范图谱</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,500;6..72,600&family=Noto+Serif+SC:wght@600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      /* Archival Drafting Vellum & Carbon Ink Palette */
+      --paper-bg: #f3efe6;
+      --paper-elevated: #faf8f3;
+      --paper-inset: #ebe5d8;
+      --paper-code: #181816;
+
+      --ink-primary: #161614;
+      --ink-secondary: #4e4c46;
+      --ink-muted: #7c786e;
+      --ink-faint: #a5a095;
+
+      --rule-hair: #dad3c5;
+      --rule-strong: #b8b0a0;
+      --rule-ink: #2c2b28;
+
+      /* Precision Engineering Accents: Vermilion (Action/Out) & Prussian Teal (State/Audit/In) */
+      --vermilion: #d64527;
+      --vermilion-soft: rgba(214, 69, 39, 0.10);
+      --vermilion-mid: rgba(214, 69, 39, 0.28);
+
+      --teal: #185c63;
+      --teal-soft: rgba(24, 92, 99, 0.10);
+      --teal-mid: rgba(24, 92, 99, 0.26);
+
+      --ochre: #9c6514;
+      --ochre-soft: rgba(156, 101, 20, 0.11);
+
+      --font-display: 'Newsreader', 'Noto Serif SC', 'Source Han Serif SC', 'Songti SC', Georgia, serif;
+      --font-sans: 'Plus Jakarta Sans', 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei UI', sans-serif;
+      --font-mono: 'IBM Plex Mono', 'Cascadia Mono', 'SFMono-Regular', Consolas, monospace;
+
+      --shadow-card: 0 1px 2px rgba(22, 22, 20, 0.05), 0 6px 18px rgba(22, 22, 20, 0.035);
+      --shadow-active: 0 2px 6px rgba(214, 69, 39, 0.12), 0 12px 28px rgba(22, 22, 20, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      background-color: var(--paper-bg);
+      color: var(--ink-primary);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* Subtle Engineering Drafting Grid + Tactile Grain */
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+      background-image:
+        linear-gradient(to right, rgba(22, 22, 20, 0.032) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(22, 22, 20, 0.032) 1px, transparent 1px);
+      background-size: 32px 32px;
+    }
+
+    .page-frame {
+      position: relative;
+      z-index: 1;
+      max-width: 1520px;
+      margin: 0 auto;
+      padding: 36px 40px 72px;
+    }
+
+    /* ==================== EDITORIAL SPECIFICATION MASTHEAD ==================== */
+    .masthead {
+      border-top: 2px solid var(--ink-primary);
+      border-bottom: 1px solid var(--rule-strong);
+      padding: 22px 0 26px;
+      margin-bottom: 28px;
+    }
+
+    .masthead-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--ink-muted);
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--rule-hair);
+      margin-bottom: 20px;
+    }
+
+    .status-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--ink-primary);
+      font-weight: 600;
+    }
+
+    .status-beacon {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--vermilion);
+    }
+
+    .masthead-body {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 36px;
+      align-items: end;
+    }
+
+    .masthead-title {
+      font-family: var(--font-display);
+      font-size: clamp(28px, 3vw, 40px);
+      font-weight: 700;
+      line-height: 1.18;
+      letter-spacing: -0.01em;
+      color: var(--ink-primary);
+    }
+
+    .masthead-lead {
+      margin-top: 10px;
+      font-size: 14.5px;
+      color: var(--ink-secondary);
+      max-width: 780px;
+      line-height: 1.65;
+    }
+
+    .spec-metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(118px, auto));
+      border: 1px solid var(--rule-strong);
+      background: var(--paper-elevated);
+    }
+
+    .spec-cell {
+      padding: 12px 16px;
+      border-right: 1px solid var(--rule-hair);
+    }
+
+    .spec-cell:last-child {
+      border-right: none;
+    }
+
+    .spec-k {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--ink-muted);
+    }
+
+    .spec-v {
+      font-family: var(--font-mono);
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--ink-primary);
+      margin-top: 3px;
+      white-space: nowrap;
+    }
+
+    .spec-v .accent {
+      color: var(--vermilion);
+    }
+
+    /* ==================== NAVIGATION BAR & SIGNAL KEY ==================== */
+    .nav-strip {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+
+    .view-tabs {
+      display: inline-flex;
+      border: 1px solid var(--ink-primary);
+      background: var(--paper-elevated);
+    }
+
+    .view-tab {
+      appearance: none;
+      border: none;
+      border-right: 1px solid var(--rule-strong);
+      background: transparent;
+      color: var(--ink-secondary);
+      padding: 10px 18px;
+      font-family: var(--font-sans);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      transition: background 0.18s ease, color 0.18s ease;
+    }
+
+    .view-tab:last-child {
+      border-right: none;
+    }
+
+    .view-tab:hover {
+      background: var(--paper-inset);
+      color: var(--ink-primary);
+    }
+
+    .view-tab.active {
+      background: var(--ink-primary);
+      color: var(--paper-elevated);
+    }
+
+    .tab-num {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      opacity: 0.7;
+    }
+
+    .view-tab.active .tab-num {
+      color: #f4a38f;
+      opacity: 1;
+    }
+
+    .signal-legend {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--ink-secondary);
+    }
+
+    .legend-entry {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .legend-line {
+      width: 22px;
+      height: 2px;
+      display: inline-block;
+    }
+
+    .legend-line.out {
+      background: var(--vermilion);
+    }
+
+    .legend-line.in {
+      background: var(--teal);
+    }
+
+    .legend-line.bus {
+      border-top: 1.5px dashed var(--rule-strong);
+      height: 0;
+    }
+
+    /* ==================== VIEW CONTAINER & STAGGERED REVEAL ==================== */
+    .view-pane {
+      display: none;
+    }
+
+    .view-pane.active {
+      display: block;
+      animation: paneReveal 0.28s cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+
+    @keyframes paneReveal {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ==================== VIEW 01: SCHEMATIC TOPOLOGY + SPEC SHEET ==================== */
+    .topology-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 390px;
+      gap: 28px;
+      align-items: start;
+    }
+
+    .schematic-canvas {
+      position: relative;
+      background: var(--paper-elevated);
+      border: 1px solid var(--rule-strong);
+      box-shadow: var(--shadow-card);
+      padding: 28px 44px 34px;
+    }
+
+    /* Corner Registration Marks */
+    .schematic-canvas::before,
+    .schematic-canvas::after {
+      content: "+";
+      position: absolute;
+      font-family: var(--font-mono);
+      font-size: 14px;
+      color: var(--ink-faint);
+      line-height: 1;
+      pointer-events: none;
+    }
+    .schematic-canvas::before { top: 8px; left: 12px; }
+    .schematic-canvas::after { bottom: 8px; right: 12px; }
+
+    /* SVG Orthogonal Wire Layer — sits behind cards & masked headings */
+    #schematic-svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 2;
+    }
+
+    /* Dedicated Terminal Pin Layer — sits cleanly on card borders without clipping */
+    #ports-svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 5;
+    }
+
+    .trace-idle {
+      fill: none;
+      stroke: var(--rule-hair);
+      stroke-width: 1.15;
+    }
+
+    .trace-active {
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .trace-out {
+      stroke: var(--vermilion);
+      stroke-dasharray: 6 5;
+      animation: pulseTrace 0.9s linear infinite;
+    }
+
+    .trace-in {
+      stroke: var(--teal);
+      stroke-dasharray: 6 5;
+      animation: pulseTrace 0.9s linear infinite;
+    }
+
+    @keyframes pulseTrace {
+      from { stroke-dashoffset: 22; }
+      to { stroke-dashoffset: 0; }
+    }
+
+    .port-dot {
+      stroke-width: 1.5;
+      fill: var(--paper-elevated);
+    }
+
+    /* Tier Stack with Dedicated Routing Gutters (38px between tiers) */
+    .tier-stack {
+      position: relative;
+      z-index: 3;
+      display: flex;
+      flex-direction: column;
+      gap: 38px;
+    }
+
+    .tier-block {
+      position: relative;
+    }
+
+    .tier-heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 10px;
+      padding-bottom: 5px;
+      border-bottom: 1px solid var(--rule-hair);
+    }
+
+    .tier-label {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 10px;
+      background: var(--paper-elevated);
+      padding-right: 10px;
+      position: relative;
+      z-index: 4;
+    }
+
+    .tier-index {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--vermilion);
+      letter-spacing: 0.08em;
+    }
+
+    .tier-name {
+      font-size: 12.5px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      color: var(--ink-primary);
+    }
+
+    .tier-dir {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--ink-muted);
+      background: var(--paper-elevated);
+      padding-left: 10px;
+      position: relative;
+      z-index: 4;
+    }
+
+    .module-grid {
+      display: grid;
+      gap: 14px;
+    }
+
+    .cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    /* Clean Architectural Module Card — Concise, Scannable, Zero Clutter */
+    .mod-card {
+      position: relative;
+      background: #ffffff;
+      border: 1px solid var(--rule-strong);
+      padding: 13px 15px 14px;
+      cursor: pointer;
+      transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease, opacity 0.18s ease;
+      user-select: none;
+    }
+
+    .mod-card:hover {
+      border-color: var(--ink-primary);
+      transform: translateY(-1px);
+      box-shadow: var(--shadow-card);
+    }
+
+    .mod-card.is-selected {
+      border-color: var(--vermilion);
+      box-shadow: inset 3px 0 0 var(--vermilion), var(--shadow-active);
+      background: #fffdfb;
+    }
+
+    .mod-card.is-upstream {
+      border-color: var(--teal);
+      box-shadow: inset 3px 0 0 var(--teal);
+    }
+
+    .mod-card.is-downstream {
+      border-color: var(--vermilion);
+      background: #fffaf8;
+    }
+
+    .mod-card.is-dimmed {
+      opacity: 0.42;
+    }
+
+    .mod-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 5px;
+    }
+
+    .mod-code {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--ink-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .mod-badge {
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border: 1px solid var(--rule-hair);
+      background: var(--paper-bg);
+      color: var(--ink-secondary);
+      white-space: nowrap;
+    }
+
+    .mod-card.is-selected .mod-badge {
+      border-color: var(--vermilion-mid);
+      background: var(--vermilion-soft);
+      color: var(--vermilion);
+    }
+
+    .mod-card.is-upstream .mod-badge {
+      border-color: var(--teal-mid);
+      background: var(--teal-soft);
+      color: var(--teal);
+    }
+
+    .mod-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--ink-primary);
+      line-height: 1.35;
+      margin-bottom: 4px;
+    }
+
+    .mod-brief {
+      font-size: 12px;
+      color: var(--ink-secondary);
+      line-height: 1.5;
+    }
+
+    /* ==================== STICKY MODULE SPECIFICATION SHEET ==================== */
+    .spec-drawer {
+      position: sticky;
+      top: 24px;
+      background: var(--paper-elevated);
+      border: 1px solid var(--ink-primary);
+      border-top: 3px solid var(--ink-primary);
+      padding: 22px 24px 24px;
+      box-shadow: var(--shadow-card);
+    }
+
+    .drawer-header {
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--rule-hair);
+      margin-bottom: 16px;
+    }
+
+    .drawer-kicker {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--vermilion);
+      font-weight: 600;
+    }
+
+    .drawer-title {
+      font-family: var(--font-display);
+      font-size: 21px;
+      font-weight: 700;
+      color: var(--ink-primary);
+      margin-top: 4px;
+      line-height: 1.3;
+    }
+
+    .drawer-path {
+      display: inline-block;
+      margin-top: 8px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--teal);
+      background: var(--teal-soft);
+      padding: 2px 8px;
+      border: 1px solid var(--teal-mid);
+    }
+
+    .drawer-summary {
+      font-size: 13px;
+      color: var(--ink-secondary);
+      line-height: 1.65;
+      margin-bottom: 18px;
+    }
+
+    .io-strip {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+
+    .io-box {
+      padding: 9px 11px;
+      border: 1px solid var(--rule-hair);
+      background: #ffffff;
+    }
+
+    .io-label {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+
+    .io-label.in { color: var(--teal); }
+    .io-label.out { color: var(--vermilion); }
+
+    .io-items {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--ink-primary);
+      line-height: 1.5;
+    }
+
+    .drawer-section-h {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--ink-muted);
+      margin: 16px 0 8px;
+    }
+
+    .spec-list {
+      list-style: none;
+    }
+
+    .spec-list li {
+      position: relative;
+      padding-left: 15px;
+      font-size: 12.5px;
+      color: var(--ink-primary);
+      line-height: 1.58;
+      margin-bottom: 7px;
+    }
+
+    .spec-list li::before {
+      content: "—";
+      position: absolute;
+      left: 0;
+      color: var(--vermilion);
+      font-family: var(--font-mono);
+    }
+
+    .code-plate {
+      background: var(--paper-code);
+      color: #e8e4da;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      line-height: 1.55;
+      padding: 12px 14px;
+      overflow-x: auto;
+      border-left: 3px solid var(--vermilion);
+    }
+
+    .drawer-actions {
+      margin-top: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--ink-muted);
+    }
+
+    .ghost-btn {
+      appearance: none;
+      background: transparent;
+      border: 1px solid var(--rule-strong);
+      color: var(--ink-primary);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 5px 11px;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .ghost-btn:hover {
+      background: var(--paper-inset);
+      border-color: var(--ink-primary);
+    }
+
+    /* ==================== VIEW 02: PRECISION CHRONOGRAM ==================== */
+    .sheet-panel {
+      background: var(--paper-elevated);
+      border: 1px solid var(--rule-strong);
+      padding: 32px 36px 36px;
+      box-shadow: var(--shadow-card);
+      margin-bottom: 24px;
+    }
+
+    .sheet-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      flex-wrap: wrap;
+      gap: 16px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--rule-strong);
+      margin-bottom: 28px;
+    }
+
+    .sheet-kicker {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--vermilion);
+      margin-bottom: 4px;
+    }
+
+    .sheet-title {
+      font-family: var(--font-display);
+      font-size: 24px;
+      font-weight: 700;
+      color: var(--ink-primary);
+    }
+
+    .sheet-desc {
+      margin-top: 6px;
+      font-size: 13.5px;
+      color: var(--ink-secondary);
+      max-width: 820px;
+    }
+
+    /* Logic-Analyzer Two-Lane Chronogram */
+    .chronogram-wrap {
+      border: 1px solid var(--rule-strong);
+      background: #ffffff;
+      padding: 24px 26px;
+      margin-bottom: 28px;
+      overflow-x: auto;
+    }
+
+    .chrono-svg {
+      width: 100%;
+      min-width: 980px;
+      height: auto;
+      display: block;
+    }
+
+    .phase-ledger {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      border-top: 2px solid var(--ink-primary);
+      border-left: 1px solid var(--rule-hair);
+    }
+
+    .phase-col {
+      padding: 16px 15px;
+      border-right: 1px solid var(--rule-hair);
+      border-bottom: 1px solid var(--rule-hair);
+      background: #ffffff;
+    }
+
+    .phase-col.highlight {
+      background: #fff9f6;
+      border-top: 3px solid var(--vermilion);
+      margin-top: -2px;
+    }
+
+    .phase-t {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--vermilion);
+      margin-bottom: 6px;
+    }
+
+    .phase-col:not(.highlight) .phase-t {
+      color: var(--teal);
+    }
+
+    .phase-h {
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--ink-primary);
+      margin-bottom: 6px;
+    }
+
+    .phase-p {
+      font-size: 12px;
+      color: var(--ink-secondary);
+      line-height: 1.55;
+    }
+
+    /* Latency Comparison Bar */
+    .latency-compare {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      margin-top: 26px;
+    }
+
+    .lat-card {
+      border: 1px solid var(--rule-strong);
+      background: #ffffff;
+      padding: 18px 22px;
+    }
+
+    .lat-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 12px;
+    }
+
+    .lat-label {
+      font-weight: 700;
+      font-size: 14px;
+    }
+
+    .lat-num {
+      font-family: var(--font-mono);
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .lat-bar-track {
+      height: 22px;
+      background: var(--paper-inset);
+      display: flex;
+      overflow: hidden;
+      margin-bottom: 10px;
+    }
+
+    .seg {
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    .lat-caption {
+      font-size: 12px;
+      color: var(--ink-secondary);
+    }
+
+    /* ==================== VIEW 03: RESOURCE COUPLING & MATRICES ==================== */
+    .coupling-diagram {
+      border: 1px solid var(--rule-strong);
+      background: #ffffff;
+      padding: 24px;
+      margin-bottom: 28px;
+      overflow-x: auto;
+    }
+
+    .causal-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+
+    .causal-step {
+      background: #ffffff;
+      border: 1px solid var(--rule-strong);
+      padding: 18px 18px 16px;
+      position: relative;
+    }
+
+    .causal-step::after {
+      content: "→";
+      position: absolute;
+      right: -13px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-family: var(--font-mono);
+      font-size: 14px;
+      color: var(--vermilion);
+      font-weight: 700;
+      z-index: 2;
+    }
+
+    .causal-step:last-child::after {
+      display: none;
+    }
+
+    .step-idx {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--vermilion);
+      font-weight: 600;
+      letter-spacing: 0.06em;
+    }
+
+    .step-fn {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--teal);
+      margin-top: 2px;
+      margin-bottom: 8px;
+    }
+
+    .step-title {
+      font-size: 14.5px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    .step-body {
+      font-size: 12.5px;
+      color: var(--ink-secondary);
+      line-height: 1.58;
+    }
+
+    .tables-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+    }
+
+    .spec-table-wrap h3 {
+      font-family: var(--font-display);
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+
+    .spec-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #ffffff;
+      border: 1px solid var(--rule-strong);
+      font-size: 12.5px;
+    }
+
+    .spec-table th,
+    .spec-table td {
+      padding: 11px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--rule-hair);
+      vertical-align: top;
+    }
+
+    .spec-table th {
+      background: var(--paper-inset);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--ink-primary);
+      border-bottom: 1px solid var(--rule-strong);
+    }
+
+    .spec-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.9em;
+      background: var(--paper-inset);
+      padding: 1px 5px;
+      color: var(--ink-primary);
+    }
+
+    .pill-on {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--teal);
+    }
+
+    .pill-off {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--ink-muted);
+    }
+
+    @media (max-width: 1240px) {
+      .topology-layout {
+        grid-template-columns: 1fr;
+      }
+      .spec-drawer {
+        position: static;
+      }
+      .masthead-body {
+        grid-template-columns: 1fr;
+      }
+      .phase-ledger {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+      .causal-strip {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .causal-step::after {
+        display: none;
+      }
+      .tables-grid,
+      .latency-compare {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 780px) {
+      .page-frame {
+        padding: 20px 16px 48px;
+      }
+      .cols-3, .cols-4, .cols-2 {
+        grid-template-columns: 1fr;
+      }
+      .spec-metrics {
+        grid-template-columns: repeat(2, 1fr);
+      }
+      .phase-ledger,
+      .causal-strip {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page-frame">
+    <!-- ==================== MASTHEAD ==================== -->
+    <header class="masthead">
+      <div class="masthead-meta">
+        <span class="status-tag">
+          <span class="status-beacon"></span>
+          YUYUGU UNIFIED ECONOMIC KERNEL · ARCHITECTURAL SPECIFICATION SHEET
+        </span>
+        <span>NODE.JS &gt;= 22 · ZERO EXTERNAL DEPENDENCIES · MIT</span>
+      </div>
+
+      <div class="masthead-body">
+        <div>
+          <h1 class="masthead-title">鱼鱼谷自动化内核 · 系统架构与时序图谱</h1>
+          <p class="masthead-lead">
+            将农田种植、牧场、工坊 80 次稀缺配额、自然日阶梯出货、体力边际补给、卡点出访与战斗配装纳入同一套跨期数学规划模型，配合独立 Worker 异步抢占与零共享代码反事实审计闭环。
+          </p>
+        </div>
+
+        <div class="spec-metrics">
+          <div class="spec-cell">
+            <div class="spec-k">Test Matrix</div>
+            <div class="spec-v">52 / 52 <span class="accent">PASS</span></div>
+          </div>
+          <div class="spec-cell">
+            <div class="spec-k">Raid Eval</div>
+            <div class="spec-v">&lt; 5 ms</div>
+          </div>
+          <div class="spec-cell">
+            <div class="spec-k">Unlock Dispatch</div>
+            <div class="spec-v">T + <span class="accent">25 ms</span></div>
+          </div>
+          <div class="spec-cell">
+            <div class="spec-k">Hardcoded IDs</div>
+            <div class="spec-v">0</div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- ==================== VIEW TABS & LEGEND ==================== -->
+    <div class="nav-strip">
+      <div class="view-tabs" role="tablist">
+        <button class="view-tab active" data-tab="pane-topology" role="tab">
+          <span class="tab-num">01</span>系统分层拓扑图
+        </button>
+        <button class="view-tab" data-tab="pane-chronogram" role="tab">
+          <span class="tab-num">02</span>卡点出访前置时序尺
+        </button>
+        <button class="view-tab" data-tab="pane-coupling" role="tab">
+          <span class="tab-num">03</span>跨池收益流向与时钟矩阵
+        </button>
+      </div>
+
+      <div class="signal-legend" id="topology-legend">
+        <span class="legend-entry"><span class="legend-line in"></span>上游输入依赖 (Inputs)</span>
+        <span class="legend-entry"><span class="legend-line out"></span>下游驱动输出 (Outputs)</span>
+        <span class="legend-entry"><span class="legend-line bus"></span>点击任意模块检视正交信号链路</span>
+      </div>
+    </div>
+
+    <!-- ==================== VIEW 01: ORTHOGONAL SCHEMATIC TOPOLOGY ==================== -->
+    <section id="pane-topology" class="view-pane active">
+      <div class="topology-layout">
+        <div class="schematic-canvas" id="schematic-canvas">
+          <svg id="schematic-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+          <svg id="ports-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+
+          <div class="tier-stack">
+            <!-- TIER 01: EXTERNAL TRUTH & SANDBOX -->
+            <div class="tier-block" data-tier="0">
+              <div class="tier-heading">
+                <div class="tier-label">
+                  <span class="tier-index">TIER 01</span>
+                  <span class="tier-name">远端状态机与动态规则真值层</span>
+                </div>
+                <span class="tier-dir">HTTPS REST · rules/ · model/rules-adapter.mjs</span>
+              </div>
+              <div class="module-grid cols-3">
+                <div class="mod-card" id="mod-server" data-mod="server" data-tier="0">
+                  <div class="mod-meta">
+                    <span class="mod-code">/api/pet/world · /visit · /battle</span>
+                    <span class="mod-badge">REMOTE</span>
+                  </div>
+                  <div class="mod-title">52dmeme 服务端状态机</div>
+                  <div class="mod-brief">维护乐观锁版本号 rev、岛钟起点、1800s 成熟保护期与幂等去重回执。</div>
+                </div>
+
+                <div class="mod-card" id="mod-rules" data-mod="rules" data-tier="0">
+                  <div class="mod-meta">
+                    <span class="mod-code">model/rules-adapter.mjs</span>
+                    <span class="mod-badge">SANDBOX</span>
+                  </div>
+                  <div class="mod-title">动态规则沙箱适配器</div>
+                  <div class="mod-brief">隔离加载前端 pet-world-rules.js，动态提取全配方图与跨晴雨精确成熟时间。</div>
+                </div>
+
+                <div class="mod-card" id="mod-shadow" data-mod="shadow" data-tier="0">
+                  <div class="mod-meta">
+                    <span class="mod-code">cli/shadow-daemon.mjs</span>
+                    <span class="mod-badge">GET ONLY</span>
+                  </div>
+                  <div class="mod-title">纯只读影子观测器</div>
+                  <div class="mod-brief">底层物理阻断一切非 GET 请求，支持零副作用预演规划与离线收益对撞。</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- TIER 02: PREEMPTIBLE ORCHESTRATION -->
+            <div class="tier-block" data-tier="1">
+              <div class="tier-heading">
+                <div class="tier-label">
+                  <span class="tier-index">TIER 02</span>
+                  <span class="tier-name">算执解耦调度与异步线程抢占层</span>
+                </div>
+                <span class="tier-dir">cli/live-daemon.mjs · controller.mjs · execution/async-planner.mjs</span>
+              </div>
+              <div class="module-grid cols-3">
+                <div class="mod-card is-selected" id="mod-livedaemon" data-mod="livedaemon" data-tier="1">
+                  <div class="mod-meta">
+                    <span class="mod-code">cli/live-daemon.mjs</span>
+                    <span class="mod-badge">ENTRY</span>
+                  </div>
+                  <div class="mod-title">常驻守护主循环</div>
+                  <div class="mod-brief">按实测 RTT 与换装冷却动态推导备战提前量，统管出访抢占、内政与后台切片。</div>
+                </div>
+
+                <div class="mod-card" id="mod-controller" data-mod="controller" data-tier="1">
+                  <div class="mod-meta">
+                    <span class="mod-code">cli/controller.mjs</span>
+                    <span class="mod-badge">STEPPER</span>
+                  </div>
+                  <div class="mod-title">单步原子事务控制器</div>
+                  <div class="mod-brief">锁外求取计划，提交瞬间进锁二次校验最新 rev，杜绝耗时规划阻塞紧急动作。</div>
+                </div>
+
+                <div class="mod-card" id="mod-asyncplanner" data-mod="asyncplanner" data-tier="1">
+                  <div class="mod-meta">
+                    <span class="mod-code">execution/async-planner.mjs</span>
+                    <span class="mod-badge">WORKER</span>
+                  </div>
+                  <div class="mod-title">Worker 规划线程与缓存</div>
+                  <div class="mod-brief">独立线程运行重型搜索并回传常驻边际估值基线；临近出访窗口 5ms 内硬中断。</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- TIER 03: UNIFIED ECONOMIC KERNEL -->
+            <div class="tier-block" data-tier="2">
+              <div class="tier-heading">
+                <div class="tier-label">
+                  <span class="tier-index">TIER 03</span>
+                  <span class="tier-name">跨期统一估值与滚动时域求解层</span>
+                </div>
+                <span class="tier-dir">model/observations.mjs · objective.mjs · planner/</span>
+              </div>
+              <div class="module-grid cols-3">
+                <div class="mod-card" id="mod-obs" data-mod="obs" data-tier="2">
+                  <div class="mod-meta">
+                    <span class="mod-code">model/observations.mjs · objective.mjs</span>
+                    <span class="mod-badge">VALUATION</span>
+                  </div>
+                  <div class="mod-title">观测脱敏与终端清算估值</div>
+                  <div class="mod-brief">剥离会话凭据、隔离锁仓物品，以真实阶梯与税率结算期末库存，消除囤货拖延。</div>
+                </div>
+
+                <div class="mod-card" id="mod-solver" data-mod="solver" data-tier="2">
+                  <div class="mod-meta">
+                    <span class="mod-code">planner/solve.mjs · bounds.mjs</span>
+                    <span class="mod-badge">OPTIMIZER</span>
+                  </div>
+                  <div class="mod-title">跨池联合规划与弱对偶上界</div>
+                  <div class="mod-brief">联合求解工坊 80 槽分配、货船采购、跨日阶梯抛售、补体回本线与出访保底体力。</div>
+                </div>
+
+                <div class="mod-card" id="mod-compiler" data-mod="compiler" data-tier="2">
+                  <div class="mod-meta">
+                    <span class="mod-code">planner/compile-prefix.mjs</span>
+                    <span class="mod-badge">COMPILER</span>
+                  </div>
+                  <div class="mod-title">因果依赖前缀编译器</div>
+                  <div class="mod-brief">逐条沙箱验真首桶动作，同批合并独立收割，遇未观测随机产出依赖即安全截断。</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- TIER 04: EXECUTION LEAVES -->
+            <div class="tier-block" data-tier="3">
+              <div class="tier-heading">
+                <div class="tier-label">
+                  <span class="tier-index">TIER 04</span>
+                  <span class="tier-name">精确执行末枝与幂等传输网关层</span>
+                </div>
+                <span class="tier-dir">execution/snipe-scheduler.mjs · combat-engine.mjs · reconcile.mjs</span>
+              </div>
+              <div class="module-grid cols-4">
+                <div class="mod-card" id="mod-snipe" data-mod="snipe" data-tier="3">
+                  <div class="mod-meta">
+                    <span class="mod-code">execution/snipe-scheduler.mjs</span>
+                    <span class="mod-badge">T+25ms</span>
+                  </div>
+                  <div class="mod-title">卡点出访与增量巡检</div>
+                  <div class="mod-brief">低频游标巡检成熟时刻，复用内政边际估值过滤负期望守卫，解锁瞬间直发。</div>
+                </div>
+
+                <div class="mod-card" id="mod-combat" data-mod="combat" data-tier="3">
+                  <div class="mod-meta">
+                    <span class="mod-code">execution/combat-engine.mjs</span>
+                    <span class="mod-badge">CRN SIM</span>
+                  </div>
+                  <div class="mod-title">公用随机数配装引擎</div>
+                  <div class="mod-brief">基于历史面板做 20 回合确定性配对模拟选装，装备切换全包入 finally 归位防守装。</div>
+                </div>
+
+                <div class="mod-card" id="mod-pet" data-mod="pet" data-tier="3">
+                  <div class="mod-meta">
+                    <span class="mod-code">execution/pet-and-battle.mjs</span>
+                    <span class="mod-badge">CAUSAL</span>
+                  </div>
+                  <div class="mod-title">养成·加点·擂台·幻彩链</div>
+                  <div class="mod-brief">严格按喂宠升级→开箱加点→锁外冷却打擂台→22:30 幻彩保底单向顺序推进。</div>
+                </div>
+
+                <div class="mod-card" id="mod-reconcile" data-mod="reconcile" data-tier="3">
+                  <div class="mod-meta">
+                    <span class="mod-code">execution/http-client · reconcile</span>
+                    <span class="mod-badge">IDEMPOTENT</span>
+                  </div>
+                  <div class="mod-title">区间时钟校准与事务对账</div>
+                  <div class="mod-brief">分桶限流、非幂等请求零重试防双倍罚金，先落盘原始回执再刷新状态。</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- TIER 05: IMMUTABLE JOURNAL & AUDIT -->
+            <div class="tier-block" data-tier="4">
+              <div class="tier-heading">
+                <div class="tier-label">
+                  <span class="tier-index">TIER 05</span>
+                  <span class="tier-name">内容寻址账本与零耦合独立审计层</span>
+                </div>
+                <span class="tier-dir">audit/journal.mjs · replay.mjs · reference-solver.mjs</span>
+              </div>
+              <div class="module-grid cols-2">
+                <div class="mod-card" id="mod-journal" data-mod="journal" data-tier="4">
+                  <div class="mod-meta">
+                    <span class="mod-code">audit/journal.mjs</span>
+                    <span class="mod-badge">SHA-256 CAS</span>
+                  </div>
+                  <div class="mod-title">内容寻址不可变事务账本</div>
+                  <div class="mod-brief">按哈希归档脱敏前后快照、规则版本与回执，支持进程中断恢复与跨岛日配额保守占用。</div>
+                </div>
+
+                <div class="mod-card" id="mod-audit" data-mod="audit" data-tier="4">
+                  <div class="mod-meta">
+                    <span class="mod-code">audit/reference-solver · report.mjs</span>
+                    <span class="mod-badge">0 PLANNER IMPORTS</span>
+                  </div>
+                  <div class="mod-title">独立分支定界反事实审计器</div>
+                  <div class="mod-brief">物理隔离于 planner/* 之外，基于事前同信息集独立枚举检验历史动作是否存在可识别漏损。</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Sticky Specification Sheet -->
+        <aside class="spec-drawer" id="spec-drawer">
+          <div class="drawer-header">
+            <div class="drawer-kicker" id="d-kicker">TIER 02 · MODULE SPECIFICATION</div>
+            <h2 class="drawer-title" id="d-title">常驻守护主循环</h2>
+            <span class="drawer-path" id="d-path">cli/live-daemon.mjs</span>
+          </div>
+
+          <p class="drawer-summary" id="d-summary"></p>
+
+          <div class="io-strip">
+            <div class="io-box">
+              <div class="io-label in">← 上游输入 (Inputs)</div>
+              <div class="io-items" id="d-inputs"></div>
+            </div>
+            <div class="io-box">
+              <div class="io-label out">→ 下游驱动 (Outputs)</div>
+              <div class="io-items" id="d-outputs"></div>
+            </div>
+          </div>
+
+          <div class="drawer-section-h">工程约束与设计不变量</div>
+          <ul class="spec-list" id="d-invariants"></ul>
+
+          <div class="drawer-section-h">核心调用签名</div>
+          <pre class="code-plate" id="d-sig"></pre>
+
+          <div class="drawer-actions">
+            <span>正交信号线自动避开卡片正文</span>
+            <button class="ghost-btn" id="btn-show-all">显示全局拓扑脉冲</button>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ==================== VIEW 02: PRECISION CHRONOGRAM ==================== -->
+    <section id="pane-chronogram" class="view-pane">
+      <div class="sheet-panel">
+        <div class="sheet-head">
+          <div>
+            <div class="sheet-kicker">CHRONOGRAM · PRE-UNLOCK STAGED EXECUTION</div>
+            <h2 class="sheet-title">保护期卡点出访：双轨前置时序尺</h2>
+            <p class="sheet-desc">
+              邻居作物成熟后受 <code>1800s</code> 保护期锁定。为避免解锁后串行拉取快照、求规划、换装备错过窗口，所有准备工作均按实测网络往返（RTT）与接口桶冷却左移至 <code>T_unlock</code> 之前完成。
+            </p>
+          </div>
+        </div>
+
+        <!-- Custom Logic-Analyzer SVG Chronogram -->
+        <div class="chronogram-wrap">
+          <svg class="chrono-svg" viewBox="0 0 1080 250" xmlns="http://www.w3.org/2000/svg">
+            <!-- Subtle vertical grid markers -->
+            <g stroke="#e5dfd3" stroke-width="1">
+              <line x1="150" y1="24" x2="150" y2="215" />
+              <line x1="330" y1="24" x2="330" y2="215" />
+              <line x1="520" y1="24" x2="520" y2="215" />
+              <line x1="690" y1="24" x2="690" y2="215" />
+              <line x1="900" y1="24" x2="900" y2="215" />
+              <line x1="1040" y1="24" x2="1040" y2="215" />
+            </g>
+
+            <!-- T_unlock = 0.000s Critical Datum Line -->
+            <line x1="785" y1="14" x2="785" y2="224" stroke="#d64527" stroke-width="2" stroke-dasharray="4 3" />
+            <rect x="722" y="4" width="126" height="20" fill="#d64527" />
+            <text x="785" y="18" text-anchor="middle" fill="#ffffff" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600">T_unlock = 0.000s</text>
+
+            <!-- Time Axis Labels -->
+            <g font-family="IBM Plex Mono, monospace" font-size="11" fill="#4e4c46">
+              <text x="150" y="38" text-anchor="middle">T - 50s</text>
+              <text x="330" y="38" text-anchor="middle">T - T_prep (~12s)</text>
+              <text x="520" y="38" text-anchor="middle">T - T_gear (~5s)</text>
+              <text x="690" y="38" text-anchor="middle">T - 1.0s</text>
+              <text x="900" y="38" text-anchor="middle">T + RTT</text>
+              <text x="1015" y="38" text-anchor="middle">finally</text>
+            </g>
+
+            <!-- Horizontal Ruler -->
+            <line x1="130" y1="48" x2="1055" y2="48" stroke="#161614" stroke-width="1.5" />
+
+            <!-- LANE 1: Background & Worker Thread -->
+            <text x="16" y="92" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600" fill="#161614">WORKER 线程</text>
+            <text x="16" y="108" font-family="Plus Jakarta Sans, sans-serif" font-size="11" fill="#7c786e">后台内政与巡检</text>
+
+            <rect x="150" y="74" width="176" height="38" fill="#e6eff0" stroke="#185c63" stroke-width="1.2" />
+            <text x="238" y="97" text-anchor="middle" font-family="Plus Jakarta Sans, sans-serif" font-size="12" font-weight="600" fill="#185c63">冻结巡检 · 规划设硬截止线</text>
+
+            <rect x="330" y="74" width="710" height="38" fill="#f3efe6" stroke="#b8b0a0" stroke-width="1" stroke-dasharray="4 3" />
+            <text x="685" y="97" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#7c786e">worker.terminate() 已让路挂起（0 CPU 争用 · 0 文件锁占用）</text>
+
+            <!-- LANE 2: Staged Snipe Fast-Lane -->
+            <text x="16" y="166" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600" fill="#d64527">主线程快车道</text>
+            <text x="16" y="182" font-family="Plus Jakarta Sans, sans-serif" font-size="11" fill="#7c786e">锁与装备状态机</text>
+
+            <!-- Step blocks on Lane 2 -->
+            <rect x="330" y="148" width="186" height="40" fill="#ffffff" stroke="#161614" stroke-width="1.3" />
+            <text x="423" y="166" text-anchor="middle" font-family="Plus Jakarta Sans, sans-serif" font-size="12" font-weight="700" fill="#161614">复算期望 + 补体/买道具</text>
+            <text x="423" y="181" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="#4e4c46">POST /world/act (&lt;5ms eval)</text>
+
+            <rect x="520" y="148" width="166" height="40" fill="#ffffff" stroke="#161614" stroke-width="1.3" />
+            <text x="603" y="166" text-anchor="middle" font-family="Plus Jakarta Sans, sans-serif" font-size="12" font-weight="700" fill="#161614">预穿克制战斗装</text>
+            <text x="603" y="181" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="#4e4c46">复用缓存决策 · 0 重复模拟</text>
+
+            <rect x="690" y="148" width="93" height="40" fill="#fbf5ea" stroke="#9c6514" stroke-width="1.3" />
+            <text x="736" y="166" text-anchor="middle" font-family="Plus Jakarta Sans, sans-serif" font-size="11.5" font-weight="700" fill="#9c6514">预写账本等表</text>
+            <text x="736" y="181" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#9c6514">区间时钟零抢跑</text>
+
+            <!-- T+25ms Strike Pulse -->
+            <rect x="787" y="144" width="110" height="48" fill="#d64527" />
+            <text x="842" y="165" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="600" fill="#ffffff">T + 25ms 直发</text>
+            <text x="842" y="182" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="#ffe4dc">POST /visit/:id</text>
+
+            <rect x="901" y="148" width="76" height="40" fill="#ffffff" stroke="#185c63" stroke-width="1.3" />
+            <text x="939" y="166" text-anchor="middle" font-family="Plus Jakarta Sans, sans-serif" font-size="11.5" font-weight="700" fill="#185c63">回执先落盘</text>
+            <text x="939" y="181" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#4e4c46">更新对手面板</text>
+
+            <rect x="981" y="148" width="74" height="40" fill="#e6eff0" stroke="#185c63" stroke-width="1.3" />
+            <text x="1018" y="166" text-anchor="middle" font-family="Plus Jakarta Sans, sans-serif" font-size="11.5" font-weight="700" fill="#185c63">防装归位</text>
+            <text x="1018" y="181" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#185c63">try / finally</text>
+          </svg>
+        </div>
+
+        <div class="phase-ledger">
+          <div class="phase-col">
+            <div class="phase-t">01 · T - 50s</div>
+            <div class="phase-h">巡检与擂台让路</div>
+            <p class="phase-p">后台邻居翻页与擂台场间冷却自动检测近期解锁目标，提前停止后台切片，保留全部接口限流余量。</p>
+          </div>
+          <div class="phase-col">
+            <div class="phase-t">02 · T - T_prep</div>
+            <div class="phase-h">边际估值与补体</div>
+            <p class="phase-p">用最新本岛状态在 <code>&lt;5ms</code> 内重算四分支守卫期望（未发现 2x / 战胜 3x / 平局 / 战败罚款），按需进食或买盗贼增益。</p>
+          </div>
+          <div class="phase-col">
+            <div class="phase-t">03 · T - T_gear</div>
+            <div class="phase-h">战术换装就位</div>
+            <p class="phase-p">直接读取巡检阶段算好的克制出装，按 <code>1.2s/槽</code> 冷却提前穿戴完毕，避免解锁后再跑 2000 次蒙特卡洛模拟。</p>
+          </div>
+          <div class="phase-col">
+            <div class="phase-t">04 · T - 1.0s</div>
+            <div class="phase-h">预落盘与时钟对齐</div>
+            <p class="phase-p">提前写好 <code>reserved-and-durable</code> 账本记录，按无正偏置区间交集时钟睡眠等待整秒保护期结束。</p>
+          </div>
+          <div class="phase-col highlight">
+            <div class="phase-t">05 · T + 0.025s</div>
+            <div class="phase-h">零阻塞直发 POST</div>
+            <p class="phase-p">唤醒后不再发任何 <code>GET</code> 二次试探，仅追加一行 <code>submitted</code> 即刻发出 <code>POST /visit/:id</code>。</p>
+          </div>
+          <div class="phase-col">
+            <div class="phase-t">06 · finally</div>
+            <div class="phase-h">回执存证与防装恢复</div>
+            <p class="phase-p">回执先于二次拉取落盘；无论成功、409 或网络超时，<code>finally</code> 块强制切回驻守防御装看家。</p>
+          </div>
+        </div>
+
+        <div class="latency-compare">
+          <div class="lat-card">
+            <div class="lat-head">
+              <span class="lat-label">传统解锁后串行链路（易被抢空）</span>
+              <span class="lat-num" style="color: var(--ink-muted);">T + 3,800 ~ 9,500 ms</span>
+            </div>
+            <div class="lat-bar-track">
+              <div class="seg" style="width: 16%; background: #8c877c;">GET 600ms</div>
+              <div class="seg" style="width: 28%; background: #6e6a61;">模拟选装 1400ms</div>
+              <div class="seg" style="width: 38%; background: #4e4c46;">换 3 槽装备 3600ms</div>
+              <div class="seg" style="width: 18%; background: #2c2b28;">POST</div>
+            </div>
+            <div class="lat-caption">保护期结束后才拉快照、跑战斗模拟与切装备，请求到达服务端时高价值作物通常已被清空。</div>
+          </div>
+
+          <div class="lat-card">
+            <div class="lat-head">
+              <span class="lat-label">前置备战双轨链路（当前内核）</span>
+              <span class="lat-num" style="color: var(--vermilion);">T + 25 ~ 65 ms</span>
+            </div>
+            <div class="lat-bar-track">
+              <div class="seg" style="width: 4%; background: var(--vermilion);" title="25ms"></div>
+              <div class="seg" style="width: 96%; background: var(--teal-soft); color: var(--teal); font-weight: 600;">
+                全部补体 · 换装 · 账本哈希均已在 T_unlock 前完成
+              </div>
+            </div>
+            <div class="lat-caption">解锁瞬间主线程无任何前置 I/O 或模拟计算负担，同时非幂等请求严格限制单次发送，杜绝超时重发双倍罚款。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== VIEW 03: RESOURCE COUPLING & MATRICES ==================== -->
+    <section id="pane-coupling" class="view-pane">
+      <div class="sheet-panel">
+        <div class="sheet-head">
+          <div>
+            <div class="sheet-kicker">UNIFIED RESOURCE CONSERVATION · CAUSAL PIPELINE &amp; CLOCK DOMAINS</div>
+            <h2 class="sheet-title">跨池资源耦合流向、养成因果链与四时钟矩阵</h2>
+            <p class="sheet-desc">
+              展示为什么单一启发式容易漏钱：农田、货船、体力与出访共享工坊 80 次限额及自然日阶梯配额，必须按统一影子价格联合分配。
+            </p>
+          </div>
+        </div>
+
+        <!-- Clean Vector Resource Coupling Diagram -->
+        <div class="coupling-diagram">
+          <svg viewBox="0 0 1060 240" width="100%" style="min-width: 920px; display: block;" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <marker id="arr-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1.5 L 8.5 5 L 0 8.5 z" fill="#d64527" />
+              </marker>
+              <marker id="arr-teal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1.5 L 8.5 5 L 0 8.5 z" fill="#185c63" />
+              </marker>
+              <marker id="arr-ochre" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1.5 L 8.5 5 L 0 8.5 z" fill="#9c6514" />
+              </marker>
+            </defs>
+
+            <!-- Column Headers -->
+            <g font-family="IBM Plex Mono, monospace" font-size="10.5" fill="#7c786e" letter-spacing="0.08em">
+              <text x="115" y="20" text-anchor="middle">INPUT POOLS (原料与体力源)</text>
+              <text x="520" y="20" text-anchor="middle">SCARCE BOTTLENECKS (全局稀缺耦合瓶颈)</text>
+              <text x="925" y="20" text-anchor="middle">REALIZED ALPHA (净现金实现)</text>
+            </g>
+
+            <!-- Flow Curves -->
+            <g fill="none" stroke-width="1.6">
+              <!-- Inputs to Bottlenecks -->
+              <path d="M 215 62 C 300 62, 315 56, 392 56" stroke="#185c63" marker-end="url(#arr-teal)" />
+              <path d="M 215 62 C 300 62, 315 122, 392 122" stroke="#185c63" marker-end="url(#arr-teal)" />
+              <path d="M 215 114 C 300 114, 315 64, 392 64" stroke="#d64527" marker-end="url(#arr-red)" />
+              <path d="M 215 114 C 300 114, 315 188, 392 188" stroke="#9c6514" marker-end="url(#arr-ochre)" />
+              <path d="M 215 166 C 300 166, 315 198, 392 198" stroke="#185c63" marker-end="url(#arr-teal)" />
+              <path d="M 215 212 C 300 212, 315 72, 392 72" stroke="#d64527" marker-end="url(#arr-red)" />
+              <path d="M 215 212 C 300 212, 315 134, 392 134" stroke="#d64527" marker-end="url(#arr-red)" />
+
+              <!-- Bottlenecks to Realized Alpha -->
+              <path d="M 645 62 C 725 62, 740 78, 812 78" stroke="#d64527" marker-end="url(#arr-red)" />
+              <path d="M 645 128 C 725 128, 740 135, 812 135" stroke="#185c63" marker-end="url(#arr-teal)" />
+              <path d="M 645 194 C 725 194, 740 192, 812 192" stroke="#9c6514" marker-end="url(#arr-ochre)" />
+            </g>
+
+            <!-- Left Nodes: Sources -->
+            <g font-family="Plus Jakarta Sans, sans-serif">
+              <rect x="18" y="42" width="197" height="38" fill="#ffffff" stroke="#161614" />
+              <text x="116" y="65" text-anchor="middle" font-size="12.5" font-weight="700" fill="#161614">本岛农田 / 牧场收成 (q0..q2)</text>
+
+              <rect x="18" y="94" width="197" height="38" fill="#ffffff" stroke="#161614" />
+              <text x="116" y="117" text-anchor="middle" font-size="12.5" font-weight="700" fill="#161614">货船折价原料与口粮采购</text>
+
+              <rect x="18" y="146" width="197" height="38" fill="#ffffff" stroke="#161614" />
+              <text x="116" y="169" text-anchor="middle" font-size="12.5" font-weight="700" fill="#161614">自然回体 · 库存口粮 · 咖啡</text>
+
+              <rect x="18" y="194" width="197" height="36" fill="#fff9f6" stroke="#d64527" />
+              <text x="116" y="216" text-anchor="middle" font-size="12.5" font-weight="700" fill="#d64527">邻居卡点出访战利品 (2x / 3x)</text>
+            </g>
+
+            <!-- Center Nodes: Scarce Bottlenecks -->
+            <g font-family="Plus Jakarta Sans, sans-serif">
+              <rect x="395" y="38" width="250" height="48" fill="#fffdfb" stroke="#d64527" stroke-width="1.6" />
+              <text x="520" y="59" text-anchor="middle" font-size="13" font-weight="700" fill="#161614">工坊稀缺产能 (80 次 / 4h 岛日)</text>
+              <text x="520" y="76" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="#d64527">仅消耗普星 q0 · 按单位槽位净利排序</text>
+
+              <rect x="395" y="104" width="250" height="48" fill="#ffffff" stroke="#185c63" stroke-width="1.5" />
+              <text x="520" y="125" text-anchor="middle" font-size="13" font-weight="700" fill="#161614">自然日全价阶梯 (100% → 85% → 70%)</text>
+              <text x="520" y="142" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="#185c63">q2 金星 → q1 银星优先占满全价档</text>
+
+              <rect x="395" y="170" width="250" height="48" fill="#ffffff" stroke="#9c6514" stroke-width="1.5" />
+              <text x="520" y="191" text-anchor="middle" font-size="13" font-weight="700" fill="#161614">统一体力背包与出访保底锁</text>
+              <text x="520" y="208" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="#9c6514">边际产出 &gt; 补体成本才吃 · 锁保底体力</text>
+            </g>
+
+            <!-- Right Nodes: Outputs -->
+            <g font-family="Plus Jakarta Sans, sans-serif">
+              <rect x="815" y="56" width="225" height="44" fill="#161614" />
+              <text x="927" y="76" text-anchor="middle" font-size="12.5" font-weight="700" fill="#faf8f3">高毛利深加工套利变现</text>
+              <text x="927" y="92" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="#f4a38f">果酱 · 果酒 · 爆米花 · 矿锭皇冠</text>
+
+              <rect x="815" y="114" width="225" height="44" fill="#ffffff" stroke="#161614" />
+              <text x="927" y="134" text-anchor="middle" font-size="12.5" font-weight="700" fill="#161614">跨期峰值锁润与星级溢价</text>
+              <text x="927" y="150" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="#4e4c46">规避次日挤兑折价与抛售砸盘</text>
+
+              <rect x="815" y="172" width="225" height="44" fill="#ffffff" stroke="#161614" />
+              <text x="927" y="192" text-anchor="middle" font-size="12.5" font-weight="700" fill="#161614">炸矿 / 钓鱼 / 正期望出访净赚</text>
+              <text x="927" y="208" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="#4e4c46">杜绝负毛利空转喝咖啡与盲送罚款</text>
+            </g>
+          </svg>
+        </div>
+
+        <!-- Causal Maintenance Pipeline -->
+        <div class="causal-strip">
+          <div class="causal-step">
+            <div class="step-idx">STEP 01 · PET CARE FIRST</div>
+            <div class="step-fn">syncPetCareFirst()</div>
+            <div class="step-title">喂养清洁升级先行</div>
+            <p class="step-body">对齐服务端经验进度并执行喂食、清洁、互动；若触发升级，新增 <code>+3</code> 自由属性点当轮立即对后续配装生效。</p>
+          </div>
+
+          <div class="causal-step">
+            <div class="step-idx">STEP 02 · PROFILES &amp; 2-PASS</div>
+            <div class="step-fn">syncBattleProfilesAndPreparation()</div>
+            <div class="step-title">战报升序同步与断点加点</div>
+            <p class="step-body">按战报 ID 升序增量采集全服对手面板；先开宝箱、穿驻守防装，再两遍观测真实攻速与攻击断点完成加点。</p>
+          </div>
+
+          <div class="causal-step">
+            <div class="step-idx">STEP 03 · LOCK-FREE BOUT</div>
+            <div class="step-fn">runSingleArenaBout()</div>
+            <div class="step-title">锁外可抢占冷却擂台</div>
+            <p class="step-body"><code>8.5s</code> 场间冷却放在装备锁外以 <code>500ms</code> 分片睡眠（遇出访随时秒退）；针对对手模拟换装开战，结束后恢复防装。</p>
+          </div>
+
+          <div class="causal-step">
+            <div class="step-idx">STEP 04 · DAILY FLOOR</div>
+            <div class="step-fn">runHuancaiDailyCheck()</div>
+            <div class="step-title">22:30 幻彩保底校验</div>
+            <p class="step-body">按每日 <code>22:30 CST</code> 轮次核对服务端历史订单防重复购买，在满足周转现金底线前提下自动购入一注 <code>10D</code> 保底。</p>
+          </div>
+        </div>
+
+        <!-- Clock Matrix & Mode Isolation Matrix -->
+        <div class="tables-grid">
+          <div class="spec-table-wrap">
+            <h3>四大异构时钟域对齐矩阵</h3>
+            <table class="spec-table">
+              <thead>
+                <tr>
+                  <th>时钟域</th>
+                  <th>切日与推进规则</th>
+                  <th>受控配额与业务机制</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>岛屿活跃钟</strong></td>
+                  <td><code>4h</code> 一轮，<code>22:00–08:00 CST</code> 静潮期停表（<code>08:00</code> 恢复计时而非切日）</td>
+                  <td>工坊(80)、挖矿(100)、钓鱼(80)、炸矿(10)、岛日出访配额与收购价轮换</td>
+                </tr>
+                <tr>
+                  <td><strong>真实物理钟</strong></td>
+                  <td>24 小时连续流逝（静潮期不冻结，受晴雨天气倍率影响）</td>
+                  <td>在田作物生长、牧场产出、固定成熟保护期 <code>1800s</code>、72h 基建回本窗口</td>
+                </tr>
+                <tr>
+                  <td><strong>自然日钟</strong></td>
+                  <td>每日 <code>00:00:00 CST</code> 归零切日</td>
+                  <td>原作物阶梯配额 <code>sc_&lt;id&gt;</code>、渐进售卖税基、单岛主每日被偷上限、擂台次数</td>
+                </tr>
+                <tr>
+                  <td><strong>幻彩轮次钟</strong></td>
+                  <td>每日 <code>22:30:00 CST</code> 切换开奖轮次</td>
+                  <td>每日 1 注 <code>10D</code> 幻彩保底认购与服务端历史订单去重</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="spec-table-wrap">
+            <h3>运行模式边界对比</h3>
+            <table class="spec-table">
+              <thead>
+                <tr>
+                  <th>策略维度</th>
+                  <th>标准模式（默认）</th>
+                  <th>纯内政模式 (<code>--domestic-only</code>)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>邻居巡检与卡点出访</td>
+                  <td><span class="pill-on">ENABLED</span> · 后台低频切片记录解锁，按统一期望正收益出击</td>
+                  <td><span class="pill-off">DISABLED (0 请求)</span> · 物理关闭邻居列表拉取与岛屿探测</td>
+                </tr>
+                <tr>
+                  <td>盗贼增益道具评估</td>
+                  <td><span class="pill-on">ENABLED</span> · 联合评估 24h 潜行衣与大菜篮跨波次摊销净收益</td>
+                  <td><span class="pill-off">DISABLED</span> · 不购买任何出访类增益道具</td>
+                </tr>
+                <tr>
+                  <td>自动买地与基建升级</td>
+                  <td>默认关闭，可通过 <code>--allow-capex</code> 按 <code>&lt;=72h</code> 回本线开启</td>
+                  <td>可通过 <code>--allow-capex</code> 开启（每 600s 节流评估轨迹净值差）</td>
+                </tr>
+                <tr>
+                  <td>只读演练防火墙</td>
+                  <td colspan="2">均支持附加 <code>--dry-run</code>（底层拦截一切非 <code>GET</code> 请求）与 <code>--once</code> 单轮诊断</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const MODULES = {
+      server: {
+        kicker: 'TIER 01 · REMOTE STATE MACHINE',
+        title: '52dmeme 服务端权威状态机',
+        path: 'https://52dmeme.com/api/pet/*',
+        summary: '权威维护农场状态、乐观锁版本号 rev、岛钟起点 clockStart、邻居岛屿快照及站宠战斗结算。所有本地规划与对账严格服从服务端回执语义。',
+        inputs: ['reconcile (HTTPS POST/GET)'],
+        outputs: ['shadow (只读快照)', 'reconcile (权威 rev / 战报回执)'],
+        invariants: [
+          'GET /api/pet/world/visit/:id 提供固定保护期 rules.protect = 1800s',
+          'POST /api/pet/world/act、/battle、/state 支持 operation UUID 幂等去重',
+          'POST /api/pet/world/visit/:id 非幂等，客户端严格限制单次发送防重复扣罚'
+        ],
+        sig: 'Endpoints:\nGET  /api/pet/world\nPOST /api/pet/world/act        { rev, operation, actions }\nPOST /api/pet/world/visit/:id  { operation, kind: "all", i: 0 }'
+      },
+      rules: {
+        kicker: 'TIER 01 · DYNAMIC TRUTH ADAPTER',
+        title: '动态规则沙箱适配器',
+        path: 'model/rules-adapter.mjs · rules/pet-world-rules.js',
+        summary: '在隔离 VM 沙箱中加载网页原始规则表并计算 SHA-256 rulesHash，动态构建全物品属性、多步配方 DAG、阶梯计税与跨晴雨作物成熟积分。',
+        inputs: ['rules/pet-world-rules.js'],
+        outputs: ['obs (商品与配方图)', 'solver (状态转移模拟)', 'compiler (逐条验真)'],
+        invariants: [
+          '全仓库零硬编码作物、动物、矿产或配方 ID，前端规则表覆盖即自动生效',
+          'exactPlotTimings 从种植时刻跨晴雨天气段逐秒积分，精确还原解锁秒数',
+          '严格对齐工坊 q0→q1→q2 低星优先扣料与售卖 q2→q1→q0 高星优先占阶梯语义'
+        ],
+        sig: 'loadRulesAdapterFromFile(rulesPath)\n-> { R, graph, rulesHash, simulateBatch, exactPlotTimings }'
+      },
+      shadow: {
+        kicker: 'TIER 01 · READ-ONLY OBSERVER',
+        title: '纯只读影子观测器',
+        path: 'cli/shadow-daemon.mjs',
+        summary: '面向预检与离线策略评估的零副作用守护入口：底层网络层硬阻断任何非 GET 请求，定期拉取快照运行统一规划与独立三层反事实审计。',
+        inputs: ['server (只读 GET 快照)', 'rules (规则沙箱)'],
+        outputs: ['audit (反事实遗憾检验报告)'],
+        invariants: [
+          'SHADOW_READ_ONLY_FIREWALL 保证写请求计数恒等于 0',
+          '会话文件与对手画像均以只读方式加载，不在 logs/shadow/ 外产生任何写入',
+          '实时追踪规划首动作稳定性 prefixStable 与事前可识别遗憾下界'
+        ],
+        sig: 'node cli/shadow-daemon.mjs --once\n// writeRequestsSent === 0 guaranteed'
+      },
+      livedaemon: {
+        kicker: 'TIER 02 · ORCHESTRATION ENTRY',
+        title: '常驻守护主循环',
+        path: 'cli/live-daemon.mjs',
+        summary: '生产环境顶层编排器：依据实测 HTTP RTT、接口分桶剩余冷却与需切换装备槽数，动态推导前置备战时刻 T_prep，协调卡点出访、内政规划与后台养成切片。',
+        inputs: ['snipe (最近解锁窗口)', 'asyncplanner (热基线与缓存计划)'],
+        outputs: ['snipe (Phase A 卡点快车道)', 'controller (Phase B 内政步进)', 'pet (Phase C 养成与擂台)'],
+        invariants: [
+          'Phase A：距离目标解锁进入物理备战期即刻接管主循环，零后台任务阻塞',
+          'Phase B：为 Worker 规划设置硬截止时刻，到点中断并无缝移交卡点出访',
+          '空闲等待本岛近期成熟事件（<=30s）时自动后台预热下一跳缓存计划'
+        ],
+        sig: 'runLiveAccountTick({\n  adapter, httpClient, journal,\n  snipeScheduler, asyncPlanner, maxTickSolveMs: 45000\n})'
+      },
+      controller: {
+        kicker: 'TIER 02 · ATOMIC TRANSACTION STEPPER',
+        title: '单步原子事务控制器',
+        path: 'cli/controller.mjs',
+        summary: '贯彻算执解耦原则：耗时的跨期搜索完全在账号文件锁外异步完成，仅在动作提交瞬间进锁复核最新权威 rev 与未决事务对账。',
+        inputs: ['livedaemon (触发步进)', 'asyncplanner (最优计划 Π*)', 'rules (规则校验)'],
+        outputs: ['obs (构建观测信封)', 'compiler (编译安全前缀)', 'reconcile (提交原子事务)'],
+        invariants: [
+          '锁内二次拉取权威状态：一旦 rev 发生变化立即作废旧缓存，绝不盲交过期动作',
+          '检测到大额价格异动时自动扩展 24h vs 32h 双视界稳定性检验',
+          '存在未决 unknown 事务时保守冻结对应岛日配额，直至新状态完成对账'
+        ],
+        sig: 'runControllerStep({\n  adapter, journal, lockRootDir,\n  asyncPlanner, deadlineAtMs, shouldPreemptFn\n})'
+      },
+      asyncplanner: {
+        kicker: 'TIER 02 · WORKER THREAD & PLAN CACHE',
+        title: 'Worker 规划线程与可执行缓存',
+        path: 'execution/async-planner.mjs · planner-worker.mjs',
+        summary: '将 CPU 密集的滚动时域搜索剥离至独立 Worker 线程，维护强绑定的 PlanCache，并向主线程持续同步常驻边际估值上下文 marginalContext。',
+        inputs: ['controller (求解请求与截止线)'],
+        outputs: ['solver (独立线程调用)', 'snipe (共享最新 marginalContext)'],
+        invariants: [
+          '触发截止线或出访抢占时直接调用 worker.terminate()，5ms 内回收长计算',
+          'marginalContext 严格绑定 sourceWorldRev，状态推进后自动失效防过期估值复用',
+          'PlanCache 命中时在 <1ms 内直接返回经沙箱验证的可执行计划'
+        ],
+        sig: 'asyncPlanner.solveOrPreempt({\n  envelope, objectiveCfg, deadlineAtMs, shouldPreemptFn\n}) -> { status: "cache-hit" | "solved" | "aborted" }'
+      },
+      obs: {
+        kicker: 'TIER 03 · OBSERVATION & TERMINAL TAIL',
+        title: '观测脱敏与终端清算估值',
+        path: 'model/observations.mjs · model/objective.mjs',
+        summary: '将原始服务端快照转化为脱敏不可变观测信封，反推市场供需因子区间，并通过构造真实合法 sell 动作结算期末残值。',
+        inputs: ['controller (原始世界快照)', 'rules (价格与税率规则)'],
+        outputs: ['solver (不可变 ObservationEnvelope 与目标函数)'],
+        invariants: [
+          '严格扣除 b12.vault 锁仓物品，绝不误卖或误吃玩家锁定藏品',
+          '落盘前剥离一切 cookie / session / token 字段',
+          '期末库存按截止日真实剩余阶梯与渐进税实证清算，根治滚动视界无限囤货'
+        ],
+        sig: 'buildObservationEnvelope(adapter, {\n  world, neighborTargets, knownSoldByIsleIndex, userConstraints\n})'
+      },
+      solver: {
+        kicker: 'TIER 03 · ROLLING-HORIZON OPTIMIZER',
+        title: '跨池联合规划与弱对偶上界',
+        path: 'planner/solve.mjs · planner/bounds.mjs',
+        summary: '在离散事件桶轴上联合求解种植、工坊多步合成、货船套利、阶梯择时售卖、补体回本线与 72h 基建扩建，同时输出拉格朗日松弛认证上界 U >= L。',
+        inputs: ['asyncplanner (Worker 调度)', 'obs (观测信封)', 'rules (转移真值)'],
+        outputs: ['compiler (最优计划树 Π*)', 'asyncplanner (导出 marginalContext)'],
+        invariants: [
+          '工坊 80/80 饱和时自动归零原料加工溢价，杜绝盲目接盘货船高价原料',
+          '区分普通食物受体力上限截断与咖啡可合法溢出上限的顺序差异',
+          '严格遵守 staminaReserveFloor，防止内政挖矿耗空即将解锁的出访体力'
+        ],
+        sig: 'solveUnifiedPlan(adapter, envelope, objectiveCfg, options)\n-> { trunkBuckets, quality: { L, U }, marginalContext }'
+      },
+      compiler: {
+        kicker: 'TIER 03 · FAIL-CLOSED PREFIX COMPILER',
+        title: '因果依赖前缀编译器',
+        path: 'planner/compile-prefix.mjs',
+        summary: '仅从当前立即可执行的 trunkBuckets[0] 提取动作序列，经规则沙箱逐条验真，并在首次遇到因果依赖随机产出的动作边界处安全截断。',
+        inputs: ['solver (跨期计划 Π*)', 'rules (applyActions 沙箱)'],
+        outputs: ['reconcile (经验证的单批安全指令序列)'],
+        invariants: [
+          '互不依赖的多块成熟农田收割与牧场收取自动合并同批提交（<=40 条）',
+          '任一计划动作若在沙箱验真失败，整批阻断返回 plan-invalid，绝不静默跳步执行',
+          '严禁将随机动作的期望影子状态当作确定性后态继续透支下游加工'
+        ],
+        sig: 'compileExecutablePrefix(adapter, world, plan)\n-> { status: "ready" | "wait" | "plan-invalid", domesticBatch }'
+      },
+      snipe: {
+        kicker: 'TIER 04 · STAGED RAID SCHEDULER',
+        title: '卡点出访调度与增量巡检器',
+        path: 'execution/snipe-scheduler.mjs',
+        summary: '后台按游标低频切片扫描邻居成熟时刻（每 15s 最多翻 2 页、探 4 岛），临近解锁时复用常驻 marginalContext 毫秒级核算四分支守卫期望并在 T+25ms 发包。',
+        inputs: ['livedaemon (快车道授权)', 'asyncplanner (常驻边际基线)'],
+        outputs: ['combat (预穿克制装备)', 'reconcile (提交单发 visit 事务)'],
+        invariants: [
+          '完整核算未发现(2x)、战胜守卫(3x)、平局沉没成本与战败罚款(-fine)，负期望一票否决',
+          '按空地 15m、得手 5m、409 冲突 90s、满上限次日零点分级挂冷却，绝不高频刷同一岛',
+          '遇正在解锁的现货正期望目标立即中断巡检返回出击'
+        ],
+        sig: 'snipeScheduler.executeStagedSnipe({\n  postUnlockOffsetMs: 25\n})'
+      },
+      combat: {
+        kicker: 'TIER 04 · CRN MONTE CARLO LOADOUT',
+        title: '公用随机数战斗配装引擎',
+        path: 'execution/combat-engine.mjs · rules/pet-battle-rules.json',
+        summary: '沉淀历史交手与守卫日志中的真实面板，用相同随机数流（Common Random Numbers）配对模拟 20 回合对战，低方差选出胜率最高的武器/护甲/饰品组合。',
+        inputs: ['snipe (守卫战配装请求)', 'pet (擂台与驻守配装请求)'],
+        outputs: ['reconcile (换装接口调用与跨进程装备锁)'],
+        invariants: [
+          '严格区分擂台模式与守卫战模式（含主场生命加成与助战压制规则）',
+          '穿装动作全程包裹在 try/finally 内，任何异常必自动切回驻守防御装',
+          '若恢复防装时遇瞬时网络故障，自动写入 dirty 标记由下轮维护自愈'
+        ],
+        sig: 'executeWithTacticalLoadout({\n  opponentId, mode, precomputedDecision,\n  getGearFn, equipSlotFn, actionFn\n})'
+      },
+      pet: {
+        kicker: 'TIER 04 · CAUSAL MAINTENANCE CHAIN',
+        title: '站宠养成 · 擂台 · 幻彩流水线',
+        path: 'execution/pet-and-battle.mjs',
+        summary: '在无近期卡点出访时以可抢占方式运行日常养成闭环，严格固定「先喂养升级拿点 → 再开箱穿防装加点 → 锁外睡眠打擂台 → 22:30 幻彩保底」顺序。',
+        inputs: ['livedaemon (空闲后台时间片)'],
+        outputs: ['combat (加点与擂台换装)', 'reconcile (状态提交与订单核验)'],
+        invariants: [
+          '升级带来的 +3 自由属性点保证在当轮配装与擂台开战前已生效',
+          '擂台 8.5s 冷却在装备锁外部按 500ms 分片睡眠，随时可向卡点出访让路',
+          '幻彩严格核对服务端 /api/huancai/orders 历史记录，重启进程绝不重复买单'
+        ],
+        sig: 'syncPetCareFirst()\n-> syncBattleProfilesAndPreparation()\n-> runSingleArenaBout()\n-> runHuancaiDailyCheck()'
+      },
+      reconcile: {
+        kicker: 'TIER 04 · IDEMPOTENT HTTP & RECONCILER',
+        title: '幂等传输网关与事务对账器',
+        path: 'execution/http-client.mjs · execution/reconcile.mjs',
+        summary: '统一承载接口分桶冷却、服务端整秒时间戳区间交集校准、幂等/非幂等分级重试策略以及异常中断后的确定性状态对账。',
+        inputs: ['controller (内政批次)', 'compiler (安全前缀)', 'snipe (卡点出访)', 'combat (装备请求)'],
+        outputs: ['server (HTTPS 请求)', 'journal (预落盘与回执归档)'],
+        invariants: [
+          '非幂等 visit / equip / chest 在超时或 5xx 时严格只发 1 次，交由状态对账收敛',
+          '截断整秒时钟采用区间交集更新，消除 +500ms 居中偏置导致的提前抢跑 409',
+          'HTTP 原始回执严格先于业务回调与二次拉取写入账本，永不丢回执'
+        ],
+        sig: 'executeTransaction({\n  journal, adapter, kind, worldBefore,\n  waitBeforeSendFn, sendFn, onReceiptFn\n})'
+      },
+      journal: {
+        kicker: 'TIER 05 · CONTENT-ADDRESSED LEDGER',
+        title: 'SHA-256 内容寻址不可变账本',
+        path: 'audit/journal.mjs',
+        summary: '通过追加式 events.jsonl 与 SHA-256 内容寻址 Blob 完整留存每笔事务的前后状态、规则哈希与回执，提供崩溃恢复与离线复盘真值源。',
+        inputs: ['reconcile (状态跃迁事件与脱敏快照)'],
+        outputs: ['audit (完整历史轨迹证据链)'],
+        invariants: [
+          '完整记录 reserved-and-durable → submitted → confirmed | rejected | unknown 跃迁',
+          '原子临时文件重命名写入，进程任意时刻断电重启不损坏已有账本',
+          '跨岛日边界附近的未决事务自动覆盖相邻岛日配额索引，防止超额透支'
+        ],
+        sig: 'new ContentAddressedJournal({\n  rootDir: "./logs/live/journal"\n})'
+      },
+      audit: {
+        kicker: 'TIER 05 · COUNTERFACTUAL VERIFIER',
+        title: '三层独立反事实审计器',
+        path: 'audit/replay.mjs · reference-solver.mjs · report.mjs',
+        summary: '与生产求解器物理隔离（0 行 planner/* 导入），独立重放检验账本物理守恒，并在事前同信息集下用分支定界法搜寻反事实改进下界。',
+        inputs: ['journal (历史事务流)', 'shadow (实时影子快照)'],
+        outputs: ['可验证审计报告 (Regret Lower Bound & Drift Check)'],
+        invariants: [
+          '静态架构单测每次扫描源码：audit/* 一旦导入 planner/* 直接判失败',
+          '严格冻结动作发生前的已知价格与随机分布，杜绝用事后掉落倒推马后炮',
+          '显式区分事前可识别决策遗憾、计划兑现偏差与不可识别随机波动'
+        ],
+        sig: 'buildAuditDecisionReport({\n  adapter, worldBefore, actualFirstActions, scenarios\n}) -> { identifiableDecisionRegretLowerBound }'
+      }
+    };
+
+    // Directed edges: [upstreamKey, downstreamKey]
+    const EDGES = [
+      ['rules', 'obs'],
+      ['rules', 'solver'],
+      ['rules', 'compiler'],
+      ['rules', 'controller'],
+      ['server', 'shadow'],
+      ['shadow', 'audit'],
+      ['livedaemon', 'snipe'],
+      ['livedaemon', 'controller'],
+      ['livedaemon', 'pet'],
+      ['controller', 'asyncplanner'],
+      ['controller', 'obs'],
+      ['controller', 'reconcile'],
+      ['asyncplanner', 'solver'],
+      ['asyncplanner', 'snipe'],
+      ['obs', 'solver'],
+      ['solver', 'compiler'],
+      ['compiler', 'reconcile'],
+      ['snipe', 'combat'],
+      ['snipe', 'reconcile'],
+      ['pet', 'combat'],
+      ['pet', 'reconcile'],
+      ['combat', 'reconcile'],
+      ['reconcile', 'server'],
+      ['reconcile', 'journal'],
+      ['journal', 'audit']
+    ];
+
+    let selectedMod = 'livedaemon';
+    let showAllMode = false;
+
+    function modShortTitle(key) {
+      return MODULES[key] ? MODULES[key].title : key;
+    }
+
+    function updateDrawer(key) {
+      const m = MODULES[key];
+      if (!m) return;
+      document.getElementById('d-kicker').textContent = m.kicker;
+      document.getElementById('d-title').textContent = m.title;
+      document.getElementById('d-path').textContent = m.path;
+      document.getElementById('d-summary').textContent = m.summary;
+      document.getElementById('d-inputs').innerHTML = m.inputs.map(s => `<div>· ${s}</div>`).join('');
+      document.getElementById('d-outputs').innerHTML = m.outputs.map(s => `<div>· ${s}</div>`).join('');
+      document.getElementById('d-invariants').innerHTML = m.invariants.map(s => `<li>${s}</li>`).join('');
+      document.getElementById('d-sig').textContent = m.sig;
+    }
+
+    /**
+     * Builds a clean orthogonal rounded-corner SVG path that routes strictly through:
+     * - Inter-tier horizontal gutters (when |tierA - tierB| === 1)
+     * - Outer left/right schematic bus rails (when |tierA - tierB| !== 1)
+     * Guaranteeing ZERO wire segments ever cross over module card text!
+     */
+    function buildOrthogonalPath(pts, radius = 7) {
+      if (pts.length < 2) return '';
+      let d = `M ${pts[0][0].toFixed(1)} ${pts[0][1].toFixed(1)}`;
+      for (let i = 1; i < pts.length - 1; i++) {
+        const [x0, y0] = pts[i - 1];
+        const [x1, y1] = pts[i];
+        const [x2, y2] = pts[i + 1];
+        const dx1 = x1 - x0, dy1 = y1 - y0;
+        const dx2 = x2 - x1, dy2 = y2 - y1;
+        const len1 = Math.hypot(dx1, dy1);
+        const len2 = Math.hypot(dx2, dy2);
+        const r = Math.min(radius, len1 * 0.45, len2 * 0.45);
+        if (r < 1) {
+          d += ` L ${x1.toFixed(1)} ${y1.toFixed(1)}`;
+        } else {
+          const sx = x1 - (dx1 / len1) * r;
+          const sy = y1 - (dy1 / len1) * r;
+          const ex = x1 + (dx2 / len2) * r;
+          const ey = y1 + (dy2 / len2) * r;
+          d += ` L ${sx.toFixed(1)} ${sy.toFixed(1)} Q ${x1.toFixed(1)} ${y1.toFixed(1)} ${ex.toFixed(1)} ${ey.toFixed(1)}`;
+        }
+      }
+      const last = pts[pts.length - 1];
+      d += ` L ${last[0].toFixed(1)} ${last[1].toFixed(1)}`;
+      return d;
+    }
+
+    function renderSchematicTraces() {
+      const svg = document.getElementById('schematic-svg');
+      const portsSvg = document.getElementById('ports-svg');
+      const canvas = document.getElementById('schematic-canvas');
+      if (!svg || !portsSvg || !canvas || canvas.offsetParent === null) return;
+
+      const cRect = canvas.getBoundingClientRect();
+      svg.setAttribute('viewBox', `0 0 ${cRect.width} ${cRect.height}`);
+      portsSvg.setAttribute('viewBox', `0 0 ${cRect.width} ${cRect.height}`);
+      svg.innerHTML = '';
+      portsSvg.innerHTML = '';
+
+      // Compute vertical gutter midpoints between adjacent tier-blocks
+      const tierEls = Array.from(canvas.querySelectorAll('.tier-block'));
+      const tierRects = tierEls.map(el => {
+        const r = el.getBoundingClientRect();
+        const gridEl = el.querySelector('.module-grid');
+        const gr = gridEl.getBoundingClientRect();
+        return {
+          top: r.top - cRect.top,
+          gridTop: gr.top - cRect.top,
+          bottom: gr.bottom - cRect.top
+        };
+      });
+
+      const gutterY = (tierIdxAfterUpper) => {
+        if (tierIdxAfterUpper < 0) return Math.max(10, tierRects[0].top - 10);
+        if (tierIdxAfterUpper >= tierRects.length - 1) return Math.min(cRect.height - 10, tierRects[tierRects.length - 1].bottom + 14);
+        return (tierRects[tierIdxAfterUpper].bottom + tierRects[tierIdxAfterUpper + 1].top) / 2;
+      };
+
+      const upstreamSet = new Set();
+      const downstreamSet = new Set();
+
+      if (!showAllMode && selectedMod) {
+        EDGES.forEach(([u, v]) => {
+          if (v === selectedMod) upstreamSet.add(u);
+          if (u === selectedMod) downstreamSet.add(v);
+        });
+      }
+
+      let railLeftIdx = 0;
+      let railRightIdx = 0;
+
+      EDGES.forEach(([u, v]) => {
+        const isIn = !showAllMode && v === selectedMod;
+        const isOut = !showAllMode && u === selectedMod;
+        if (!showAllMode && !isIn && !isOut) return;
+
+        const elU = document.getElementById(`mod-${u}`);
+        const elV = document.getElementById(`mod-${v}`);
+        if (!elU || !elV) return;
+
+        const rU = elU.getBoundingClientRect();
+        const rV = elV.getBoundingClientRect();
+        const tU = Number(elU.dataset.tier);
+        const tV = Number(elV.dataset.tier);
+
+        const xU = rU.left - cRect.left + (isOut ? rU.width * 0.56 : rU.width * 0.44);
+        const xV = rV.left - cRect.left + (isIn ? rV.width * 0.44 : rV.width * 0.56);
+
+        let pts = [];
+        let startPort, endPort;
+
+        if (tV === tU + 1) {
+          // Adjacent downward: bottom of U -> gutter -> top of V
+          const y1 = rU.bottom - cRect.top;
+          const y2 = rV.top - cRect.top;
+          const gy = (y1 + tierRects[tV].top) / 2;
+          pts = [[xU, y1], [xU, gy], [xV, gy], [xV, y2]];
+          startPort = [xU, y1];
+          endPort = [xV, y2];
+        } else if (tU === tV + 1) {
+          // Adjacent upward: top of U -> gutter -> bottom of V
+          const y1 = rU.top - cRect.top;
+          const y2 = rV.bottom - cRect.top;
+          const gy = (tierRects[tV].bottom + tierRects[tU].top) / 2;
+          pts = [[xU, y1], [xU, gy], [xV, gy], [xV, y2]];
+          startPort = [xU, y1];
+          endPort = [xV, y2];
+        } else if (tU === tV) {
+          // Same tier: route cleanly in the clear strip just below cards of this tier
+          const y1 = rU.bottom - cRect.top;
+          const y2 = rV.bottom - cRect.top;
+          const gy = gutterY(tU) - 5;
+          pts = [[xU, y1], [xU, gy], [xV, gy], [xV, y2]];
+          startPort = [xU, y1];
+          endPort = [xV, y2];
+        } else {
+          // Non-adjacent tiers: route via outer left or right schematic bus rail (100% outside cards!)
+          const useRight = (xU + xV) / 2 > cRect.width / 2;
+          const railX = useRight
+            ? (cRect.width - 16 - (railRightIdx++ % 4) * 6)
+            : (16 + (railLeftIdx++ % 4) * 6);
+
+          const goingDown = tV > tU;
+          const y1 = goingDown ? (rU.bottom - cRect.top) : (rU.top - cRect.top);
+          const g1 = goingDown ? gutterY(tU) : gutterY(tU - 1);
+          const y2 = goingDown ? (rV.top - cRect.top) : (rV.bottom - cRect.top);
+          const g2 = goingDown ? gutterY(tV - 1) : gutterY(tV);
+
+          // For top-of-card entry inside a tier (below tier heading), enter cleanly from gutter above tier
+          if (goingDown) {
+            pts = [[xU, y1], [xU, g1], [railX, g1], [railX, g2], [xV, g2], [xV, y2]];
+          } else {
+            pts = [[xU, y1], [xU, g1], [railX, g1], [railX, g2], [xV, g2], [xV, y2]];
+          }
+          startPort = [xU, y1];
+          endPort = [xV, y2];
+        }
+
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('d', buildOrthogonalPath(pts, 7));
+
+        if (showAllMode) {
+          path.setAttribute('class', 'trace-idle');
+          path.style.stroke = 'rgba(24, 92, 99, 0.28)';
+        } else {
+          path.setAttribute('class', `trace-active ${isOut ? 'trace-out' : 'trace-in'}`);
+        }
+        svg.appendChild(path);
+
+        if (!showAllMode) {
+          const strokeColor = isOut ? '#d64527' : '#185c63';
+          [startPort, endPort].forEach(([px, py], idx) => {
+            const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            c.setAttribute('cx', px.toFixed(1));
+            c.setAttribute('cy', py.toFixed(1));
+            c.setAttribute('r', idx === 1 ? '3.5' : '2.8');
+            c.setAttribute('class', 'port-dot');
+            c.style.stroke = strokeColor;
+            if (idx === 1) c.style.fill = strokeColor;
+            portsSvg.appendChild(c);
+          });
+        }
+      });
+
+      // Apply card state classes
+      document.querySelectorAll('.mod-card').forEach(card => {
+        const k = card.dataset.mod;
+        card.classList.toggle('is-selected', !showAllMode && k === selectedMod);
+        card.classList.toggle('is-upstream', !showAllMode && upstreamSet.has(k));
+        card.classList.toggle('is-downstream', !showAllMode && downstreamSet.has(k));
+        card.classList.toggle(
+          'is-dimmed',
+          !showAllMode && selectedMod && k !== selectedMod && !upstreamSet.has(k) && !downstreamSet.has(k)
+        );
+      });
+    }
+
+    document.querySelectorAll('.mod-card').forEach(card => {
+      card.addEventListener('click', () => {
+        showAllMode = false;
+        selectedMod = card.dataset.mod;
+        document.getElementById('btn-show-all').textContent = '显示全局拓扑脉冲';
+        updateDrawer(selectedMod);
+        renderSchematicTraces();
+      });
+    });
+
+    document.getElementById('btn-show-all').addEventListener('click', (e) => {
+      showAllMode = !showAllMode;
+      e.currentTarget.textContent = showAllMode ? '返回单模块聚焦' : '显示全局拓扑脉冲';
+      renderSchematicTraces();
+    });
+
+    document.querySelectorAll('.view-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        const target = tab.dataset.tab;
+        document.querySelectorAll('.view-tab').forEach(t => t.classList.toggle('active', t === tab));
+        document.querySelectorAll('.view-pane').forEach(p => p.classList.toggle('active', p.id === target));
+        document.getElementById('topology-legend').style.visibility = target === 'pane-topology' ? 'visible' : 'hidden';
+        if (target === 'pane-topology') {
+          requestAnimationFrame(renderSchematicTraces);
+        }
+      });
+    });
+
+    window.addEventListener('resize', () => {
+      if (document.getElementById('pane-topology').classList.contains('active')) {
+        renderSchematicTraces();
+      }
+    });
+
+    updateDrawer(selectedMod);
+    window.addEventListener('load', () => {
+      requestAnimationFrame(renderSchematicTraces);
+    });
+  </script>
+</body>
+</html>

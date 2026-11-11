@@ -1,0 +1,4 @@
+{
+  "_comment": "复制为 .session.json 并填入浏览器登录后的完整 Cookie 字符串即可：",
+  "cookie": "session=YOUR_SESSION_COOKIE_VALUE"
+}

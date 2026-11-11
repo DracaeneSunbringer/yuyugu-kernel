@@ -1,0 +1,1306 @@
+{
+  "domestic": {
+    "now": 1794340000,
+    "clockStart": 1794212939,
+    "nextIsleAt": 1794369600,
+    "rev": 500,
+    "coins": 12000000,
+    "prices": {
+      "turnip": 1193,
+      "carrot": 2057,
+      "wheat": 1580,
+      "strawberry": 5496,
+      "tomato": 2897,
+      "corn": 5405,
+      "grape": 8080,
+      "pumpkin": 21619,
+      "cabbage": 4819,
+      "egg": 1628,
+      "duckegg": 2352,
+      "milk": 7464,
+      "wool": 20520,
+      "truffle": 12273,
+      "sardine": 1373,
+      "carp": 2496,
+      "bass": 4029,
+      "salmon": 8757,
+      "squid": 14492,
+      "tuna": 16997,
+      "puffer": 28832,
+      "whale": 115083,
+      "coal": 499,
+      "copper": 1120,
+      "iron": 1563,
+      "amethyst": 6164,
+      "gold": 5683,
+      "emerald": 12923,
+      "ruby": 23473,
+      "diamond": 33238,
+      "salad": 7679,
+      "flour": 10848,
+      "jam": 17140,
+      "ketchup": 10879,
+      "popcorn": 19502,
+      "wine": 23156,
+      "pie": 31477,
+      "kimchi": 9933,
+      "mayo": 8796,
+      "cheese": 19413,
+      "sweater": 47912,
+      "ironbar": 9475,
+      "ingot": 19381,
+      "jewel": 43807,
+      "crown": 102971
+    },
+    "state": {
+      "v": 2,
+      "en": 20,
+      "enT": 1794339940,
+      "enDay": "2026-11-11",
+      "plotN": 24,
+      "plots": [
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        },
+        {
+          "c": "corn",
+          "t": 1794336400,
+          "w": 0,
+          "g": 0,
+          "h": 0
+        }
+      ],
+      "barnN": 4,
+      "barn": [
+        {
+          "k": "chicken",
+          "f": 1794325600,
+          "p": 1794339400,
+          "m": 100,
+          "held": [],
+          "heldAt": 0
+        },
+        {
+          "k": "duck",
+          "f": 1794325600,
+          "p": 1794339400,
+          "m": 100,
+          "held": [],
+          "heldAt": 0
+        },
+        {
+          "k": "cow",
+          "f": 1794325600,
+          "p": 1794339400,
+          "m": 100,
+          "held": [],
+          "heldAt": 0
+        },
+        {
+          "k": "sheep",
+          "f": 1794325600,
+          "p": 1794339400,
+          "m": 100,
+          "held": [],
+          "heldAt": 0
+        }
+      ],
+      "traps": [
+        {
+          "p": 1794336000
+        },
+        {
+          "p": 1794336000
+        },
+        {
+          "p": 1794336000
+        },
+        {
+          "p": 1794336000
+        }
+      ],
+      "inv": {
+        "feed": [
+          60,
+          0,
+          0
+        ],
+        "bait": [
+          25,
+          0,
+          0
+        ],
+        "coal": [
+          80,
+          0,
+          0
+        ],
+        "copper": [
+          30,
+          0,
+          0
+        ],
+        "iron": [
+          20,
+          0,
+          0
+        ],
+        "gold": [
+          15,
+          0,
+          0
+        ],
+        "ingot": [
+          8,
+          0,
+          0
+        ],
+        "jewel": [
+          8,
+          0,
+          0
+        ],
+        "corn": [
+          60,
+          10,
+          5
+        ],
+        "tomato": [
+          60,
+          10,
+          5
+        ],
+        "turnip": [
+          30,
+          0,
+          0
+        ]
+      },
+      "tools": {
+        "rod": 4,
+        "pick": 4,
+        "spr": 3,
+        "house": 0
+      },
+      "mine": {
+        "max": 30
+      },
+      "earn": {
+        "day": "2026-11-11",
+        "amt": 1500000
+      },
+      "cnt": {
+        "pet0": 1,
+        "pet1": 1,
+        "pet2": 1,
+        "pet3": 1,
+        "harvest": 16,
+        "plant": 16,
+        "sold": 1500000,
+        "fish": 10
+      },
+      "log": 50,
+      "seen": [
+        "turnip",
+        "wheat",
+        "tomato",
+        "corn",
+        "coal",
+        "iron",
+        "gold"
+      ],
+      "goals": {
+        "day": "2026-11-11",
+        "list": [
+          0,
+          1,
+          8,
+          12
+        ]
+      },
+      "vis0": null,
+      "aff": {},
+      "vis": [],
+      "help0": null,
+      "iq": {
+        "d": 124605,
+        "craft": 20,
+        "bomb": 10,
+        "mine": 100,
+        "fish": 10
+      },
+      "b9Rank": {
+        "since": 1794052800,
+        "total": {
+          "earn": 10000000,
+          "steal": 0,
+          "help": 0
+        },
+        "daily": {
+          "earn": 1500000
+        },
+        "day": "2026-11-11"
+      },
+      "thief": {},
+      "whaleFriends": [],
+      "b12": {
+        "v": 1,
+        "vault": {},
+        "keep": {},
+        "guardVersion": 1,
+        "storySeed": 100000002,
+        "opened": 1794052800,
+        "activity": {
+          "season": 1,
+          "mask": 1
+        },
+        "effects": {},
+        "shop": {
+          "d": "2311-02-28",
+          "n": {
+            "wheat": 24,
+            "pumpkin": 24,
+            "grape": 24,
+            "corn": 24,
+            "wool": 8,
+            "truffle": 8,
+            "kimchi": 4,
+            "sweater": 4,
+            "gold": 6,
+            "copper": 6,
+            "bomb": 12,
+            "bait": 12
+          }
+        },
+        "tax": {
+          "day": "2026-11-11",
+          "paid": 0
+        },
+        "chapters": 7
+      },
+      "realm": {
+        "v": 1,
+        "wealthAt": 1794200000
+      }
+    }
+  },
+  "mainBundle": {
+    "capturedAt": "2026-11-10T19:46:40.000Z",
+    "main": {
+      "now": 1794340000,
+      "clockStart": 1794212939,
+      "nextIsleAt": 1794369600,
+      "rev": 1000,
+      "coins": 35000000,
+      "prices": {
+        "turnip": 1193,
+        "carrot": 2057,
+        "wheat": 1580,
+        "strawberry": 5496,
+        "tomato": 2897,
+        "corn": 5405,
+        "grape": 8080,
+        "pumpkin": 21619,
+        "cabbage": 4819,
+        "egg": 1628,
+        "duckegg": 2352,
+        "milk": 7464,
+        "wool": 20520,
+        "truffle": 12273,
+        "sardine": 1373,
+        "carp": 2496,
+        "bass": 4029,
+        "salmon": 8757,
+        "squid": 14492,
+        "tuna": 16997,
+        "puffer": 28832,
+        "whale": 115083,
+        "coal": 499,
+        "copper": 1120,
+        "iron": 1563,
+        "amethyst": 6164,
+        "gold": 5683,
+        "emerald": 12923,
+        "ruby": 23473,
+        "diamond": 33238,
+        "salad": 7679,
+        "flour": 10848,
+        "jam": 17140,
+        "ketchup": 10879,
+        "popcorn": 19502,
+        "wine": 23156,
+        "pie": 31477,
+        "kimchi": 9933,
+        "mayo": 8796,
+        "cheese": 19413,
+        "sweater": 47912,
+        "ironbar": 9475,
+        "ingot": 19381,
+        "jewel": 43807,
+        "crown": 102971
+      },
+      "state": {
+        "v": 2,
+        "en": 30,
+        "enT": 1794339940,
+        "enDay": "2026-11-11",
+        "plotN": 24,
+        "plots": [
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          },
+          {
+            "c": "corn",
+            "t": 1794334000,
+            "w": 0,
+            "g": 0,
+            "h": 0
+          }
+        ],
+        "barnN": 6,
+        "barn": [
+          {
+            "k": "chicken",
+            "f": 1794325600,
+            "p": 1794339400,
+            "m": 100,
+            "held": [],
+            "heldAt": 0
+          },
+          {
+            "k": "duck",
+            "f": 1794325600,
+            "p": 1794339400,
+            "m": 100,
+            "held": [],
+            "heldAt": 0
+          },
+          {
+            "k": "cow",
+            "f": 1794325600,
+            "p": 1794339400,
+            "m": 100,
+            "held": [],
+            "heldAt": 0
+          },
+          {
+            "k": "sheep",
+            "f": 1794325600,
+            "p": 1794339400,
+            "m": 100,
+            "held": [],
+            "heldAt": 0
+          },
+          {
+            "k": "pig",
+            "f": 1794325600,
+            "p": 1794339400,
+            "m": 100,
+            "held": [],
+            "heldAt": 0
+          },
+          {
+            "k": "cow",
+            "f": 1794325600,
+            "p": 1794339400,
+            "m": 100,
+            "held": [],
+            "heldAt": 0
+          }
+        ],
+        "traps": [
+          {
+            "p": 1794336000
+          },
+          {
+            "p": 1794336000
+          },
+          {
+            "p": 1794336000
+          },
+          {
+            "p": 1794336000
+          }
+        ],
+        "inv": {
+          "feed": [
+            80,
+            0,
+            0
+          ],
+          "bait": [
+            20,
+            0,
+            0
+          ],
+          "coal": [
+            100,
+            0,
+            0
+          ],
+          "copper": [
+            40,
+            0,
+            0
+          ],
+          "iron": [
+            30,
+            0,
+            0
+          ],
+          "gold": [
+            20,
+            0,
+            0
+          ],
+          "amethyst": [
+            10,
+            0,
+            0
+          ],
+          "emerald": [
+            10,
+            0,
+            0
+          ],
+          "ruby": [
+            10,
+            0,
+            0
+          ],
+          "diamond": [
+            5,
+            0,
+            0
+          ],
+          "ingot": [
+            10,
+            0,
+            0
+          ],
+          "jewel": [
+            10,
+            0,
+            0
+          ],
+          "truffle": [
+            15,
+            0,
+            0
+          ],
+          "corn": [
+            120,
+            30,
+            10
+          ],
+          "tomato": [
+            100,
+            20,
+            10
+          ],
+          "wheat": [
+            50,
+            0,
+            0
+          ],
+          "turnip": [
+            40,
+            0,
+            0
+          ],
+          "grape": [
+            30,
+            0,
+            0
+          ]
+        },
+        "tools": {
+          "rod": 4,
+          "pick": 4,
+          "spr": 3,
+          "house": 0
+        },
+        "mine": {
+          "max": 30
+        },
+        "earn": {
+          "day": "2026-11-11",
+          "amt": 5000000
+        },
+        "cnt": {
+          "pet0": 1,
+          "pet1": 1,
+          "pet2": 1,
+          "pet3": 1,
+          "pet4": 1,
+          "pet5": 1,
+          "sc_turnip": 400,
+          "harvest": 24,
+          "plant": 24,
+          "sold": 5000000
+        },
+        "log": 100,
+        "seen": [
+          "turnip",
+          "wheat",
+          "tomato",
+          "corn",
+          "coal",
+          "iron",
+          "gold"
+        ],
+        "goals": {
+          "day": "2026-11-11",
+          "list": [
+            0,
+            1,
+            8,
+            12
+          ]
+        },
+        "vis0": null,
+        "aff": {},
+        "vis": [],
+        "help0": null,
+        "iq": {
+          "d": 124605,
+          "craft": 80,
+          "bomb": 10,
+          "fish": 80,
+          "mine": 100
+        },
+        "b9Rank": {
+          "since": 1794052800,
+          "total": {
+            "earn": 30000000,
+            "steal": 0,
+            "help": 0
+          },
+          "daily": {
+            "earn": 5000000
+          },
+          "day": "2026-11-11"
+        },
+        "thief": {},
+        "whaleFriends": [],
+        "b12": {
+          "v": 1,
+          "vault": {},
+          "keep": {},
+          "guardVersion": 1,
+          "storySeed": 100000001,
+          "opened": 1794052800,
+          "activity": {
+            "season": 1,
+            "mask": 1
+          },
+          "effects": {
+            "stealth": {
+              "id": "whistle",
+              "until": 1794426400
+            },
+            "carry": {
+              "id": "sack",
+              "until": 1794426400
+            }
+          },
+          "shop": {
+            "d": "2311-02-28",
+            "n": {
+              "wheat": 24,
+              "pumpkin": 24,
+              "grape": 24,
+              "corn": 24,
+              "wool": 8,
+              "truffle": 8,
+              "kimchi": 4,
+              "sweater": 4,
+              "gold": 6,
+              "copper": 6,
+              "bomb": 12,
+              "bait": 12
+            }
+          },
+          "tax": {
+            "day": "2026-11-11",
+            "paid": 500000
+          },
+          "chapters": 7
+        },
+        "realm": {
+          "v": 1,
+          "wealthAt": 1794200000
+        }
+      }
+    },
+    "sampleVisits": [
+      {
+        "id": 9001,
+        "owner": {
+          "id": 9001,
+          "name": "Sample Neighbor #1",
+          "avatar": "",
+          "level": 10,
+          "guard": true,
+          "boost": 0,
+          "newbie": false
+        },
+        "isle": {
+          "plots": [
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            }
+          ],
+          "barn": [
+            {
+              "k": "chicken",
+              "n": 0,
+              "fed": true,
+              "steal": false
+            },
+            {
+              "k": "cow",
+              "n": 0,
+              "fed": true,
+              "steal": false
+            }
+          ],
+          "house": 0,
+          "plotN": 12,
+          "barnN": 2
+        }
+      },
+      {
+        "id": 9002,
+        "owner": {
+          "id": 9002,
+          "name": "Sample Neighbor #2",
+          "avatar": "",
+          "level": 10,
+          "guard": true,
+          "boost": 0,
+          "newbie": false
+        },
+        "isle": {
+          "plots": [
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            }
+          ],
+          "barn": [
+            {
+              "k": "chicken",
+              "n": 0,
+              "fed": true,
+              "steal": false
+            },
+            {
+              "k": "cow",
+              "n": 0,
+              "fed": true,
+              "steal": false
+            }
+          ],
+          "house": 0,
+          "plotN": 12,
+          "barnN": 2
+        }
+      },
+      {
+        "id": 9003,
+        "owner": {
+          "id": 9003,
+          "name": "Sample Neighbor #3",
+          "avatar": "",
+          "level": 10,
+          "guard": true,
+          "boost": 0,
+          "newbie": false
+        },
+        "isle": {
+          "plots": [
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            },
+            {
+              "c": "corn",
+              "stage": 2,
+              "left": 1200,
+              "steal": false,
+              "stolen": 0
+            }
+          ],
+          "barn": [
+            {
+              "k": "chicken",
+              "n": 0,
+              "fed": true,
+              "steal": false
+            },
+            {
+              "k": "cow",
+              "n": 0,
+              "fed": true,
+              "steal": false
+            }
+          ],
+          "house": 0,
+          "plotN": 12,
+          "barnN": 2
+        }
+      }
+    ]
+  }
+}
