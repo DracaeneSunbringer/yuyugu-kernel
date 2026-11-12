@@ -21,6 +21,7 @@ import {
   TECH_PRICE,
   TECHS,
   act as xsAct,
+  canMax,
   cvNeed,
   fuseKey,
   plotView,
@@ -54,7 +55,19 @@ const HERB_ENTRIES_DESC = Object.entries(HERBS).sort((a, b) => b[1].lv - a[1].lv
 const PURE_CASH_HERBS = new Set(
   Object.keys(HERBS).filter((h) => !Object.values(PILLS).some((p) => Object.hasOwn(p.need, h)))
 )
-const VARIANT_TECH_PRIORITY = ['poison', 'ice', 'thunder', 'lava', 'wind', 'metal', 'water', 'fire', 'earth', 'wood']
+const VARIANT_TECH_PRIORITY = ['poison', 'ice', 'wind', 'fire', 'wood', 'metal', 'earth', 'water', 'thunder', 'lava']
+const EQUIP_TECH_PRIORITY_SUB_LV5 = ['poison', 'fire', 'wind', 'ice', 'wood', 'metal', 'earth', 'water', 'thunder', 'lava']
+const EQUIP_TECH_PRIORITY_LV5 = ['ice', 'poison', 'wind', 'fire', 'metal', 'wood', 'earth', 'water', 'thunder', 'lava']
+
+function selectPreferredEquippedTech(x) {
+  if (!Array.isArray(x?.techs) || x.techs.length === 0) return null
+  const order = (x.lv || 1) < 5 ? EQUIP_TECH_PRIORITY_SUB_LV5 : EQUIP_TECH_PRIORITY_LV5
+  return [...x.techs].sort((a, b) => {
+    const ia = order.indexOf(a)
+    const ib = order.indexOf(b)
+    return (ia >= 0 ? ia : 99) - (ib >= 0 ? ib : 99)
+  })[0]
+}
 
 export function xsDay(nowSec) {
   return Math.floor((Number(nowSec || 0) + 28800) / 86400)
@@ -366,14 +379,15 @@ function computeUpcomingPlotEnergyNeed(x, nowSec, horizonSec = 1800) {
     } else if (p.s === 'soil' && !p.c) {
       need += COST.plant + COST.water
     } else if (p.c && p.g < 3 && p.w) {
-      const v = plotView(p, nowSec)
+      const v = plotView(p, nowSec, x.tech)
       if (v.left <= horizonSec) {
         need += p.g === 2 ? (COST.harvest + COST.plant + COST.water) : COST.water
       }
     }
   }
+  const regenSec = x.tech === 'wind' ? EN_REGEN * 0.75 : EN_REGEN
   const naturalRegenInHorizon = x.en < EN_MAX
-    ? Math.floor((Math.max(0, nowSec - Number(x.enAt || nowSec)) + horizonSec) / EN_REGEN)
+    ? Math.floor((Math.max(0, nowSec - Number(x.enAt || nowSec)) + horizonSec) / regenSec)
     : 0
   return Math.max(0, need - naturalRegenInHorizon)
 }
@@ -416,9 +430,10 @@ function shouldEatHuilingNow(x, nowSec, pendingEnergyNeed = 0) {
   if (dpUsedToday(x, nowSec) >= PILL_DAILY) return false
   const en = Number(x.en || 0)
   if (en >= EN_MAX) return false
-  // Normal zero-waste rule: eat when `en <= 69` (`en + 30 <= 99 < EN_MAX`, preserving `enAt` sub-tick timer!)
+  const gainEn = PILLS.huiling.en + (x.tech === 'poison' ? 10 : 0)
+  // Normal zero-waste rule: eat when `en + gainEn <= 99 < EN_MAX` (preserving `enAt` sub-tick timer!)
   // whenever farm/alchemy work needs energy or after 20:00 CST so daily 3-pill quota never expires.
-  if (en <= EN_MAX - 31 && (en < pendingEnergyNeed || cstSecondsUntilMidnight(nowSec) <= 4 * 3600)) {
+  if (en <= EN_MAX - gainEn - 1 && (en < pendingEnergyNeed || cstSecondsUntilMidnight(nowSec) <= 4 * 3600)) {
     return true
   }
   // Final 25-minute pre-midnight rescue if daily quota would otherwise vanish unused at `00:00` CST
@@ -432,7 +447,7 @@ function projectMeditationAfterRise(x, nowSec) {
   if (!x.med) return null
   const d = Math.min(Math.max(0, nowSec - Number(x.med.t || nowSec)), MED_MAX)
   if (d < MED_MIN) return { d, gainCv: 0, s: x.cv.s, xp: x.cv.xp }
-  const gainCv = Math.floor((d / 60) * 10 * rootMult(x))
+  const gainCv = Math.floor((d / 60) * 10 * rootMult(x) * (x.tech === 'ice' ? 1.2 : 1))
   let s = Number(x.cv?.s || 1)
   let xp = Number(x.cv?.xp || 0) + gainCv
   const r = Number(x.cv?.r || 0)
@@ -505,6 +520,10 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
   const alignLogForDoubleHarvest = (upcomingHarvestCount) => {
     let guard = 0
     while (sim.log % 4 !== 3 && actions.length + 1 < opts.maxActionsPerBatch && guard++ < 6) {
+      const preferredTech = selectPreferredEquippedTech(sim)
+      if (preferredTech && (!sim.tech || (sim.te !== xsDay(t) && preferredTech !== sim.tech))) {
+        if (emit({ a: 'equip', el: preferredTech })) continue
+      }
       if (sim.brew && t - Number(sim.brew.t || 0) >= BREW_READY_SEC) {
         if (emit({ a: 'finish', n: 2 })) continue
       }
@@ -552,12 +571,12 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
         if (emit({ a: 'sell', herb: sellCand.herb, n: 1 })) continue
       }
 
-      // Pre-buy 1 seed for the mature plot we are about to replant if seeds on hand don't already cover it
-      if (sim.en >= COST.harvest + COST.plant) {
+      // Pre-buy 1 seed for the mature plot we are about to replant (`COST.buy = 0` `xs.en`!)
+      if (sim.en >= COST.harvest) {
         const nextCrop = chooseCropForEmptyPlot(sim, t, opts)
         if (nextCrop) {
           const { empty } = countOpenSoilPlots(sim)
-          const neededSeeds = empty + upcomingHarvestCount
+          const neededSeeds = empty + upcomingHarvestCount + 2
           if (Number(sim.seeds?.[nextCrop] || 0) < neededSeeds && sim.stone >= HERBS[nextCrop].seed) {
             if (emit({ a: 'buy', herb: nextCrop, n: 1 })) continue
           }
@@ -569,7 +588,7 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
         if (emit({ a: 'learn', el: techToLearn })) continue
       }
 
-      if (sim.can < CAN_MAX) {
+      if (sim.can < canMax(sim)) {
         if (emit({ a: 'refill' })) continue
       }
 
@@ -577,11 +596,37 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     }
   }
 
+  const isUrgentCauldronReady = () => {
+    if (sim.brew) return false
+    const needHuilingToday = Number(sim.pills?.huiling || 0) < PILL_DAILY - dpUsedToday(sim, t)
+    if (needHuilingToday && hasBrewIngredients(sim, 'huiling')) return true
+    const needPeiyuanUrgently =
+      (sim.lv || 1) < 5 ||
+      Number(sim.pills?.peiyuan || 0) < computeHeldPeiyuanFloorWhileSubLv5(sim, t, opts) ||
+      (shouldAllowBreakPolicy(sim, opts) &&
+        Number(sim.cv?.s || 1) >= 8 &&
+        Number(sim.pills?.peiyuan || 0) < Number(sim.cv?.r || 0) + 1)
+    if (needPeiyuanUrgently && hasBrewIngredients(sim, 'peiyuan')) return true
+    return false
+  }
+
+  const minReservedEnForRipeOrBrew = () => {
+    if (isUrgentCauldronReady()) return COST.brew
+    if (sim.plots.some((pl) => pl?.c && pl.g >= 3)) return COST.harvest
+    return 0
+  }
+
   // 1. Finish ready cauldron immediately if no mature plots are waiting to claim its `log` step (or if `log % 4 !== 3`)
   if (sim.brew && t - Number(sim.brew.t || 0) >= BREW_READY_SEC) {
     const hasRipe = sim.plots.some((p) => p?.c && p.g >= 3)
     if (!hasRipe || sim.log % 4 !== 3) {
-      emit({ a: 'finish', n: 2 })
+      const preferredTech = selectPreferredEquippedTech(sim)
+      if (preferredTech && (!sim.tech || (sim.te !== xsDay(t) && preferredTech !== sim.tech))) {
+        emit({ a: 'equip', el: preferredTech })
+      }
+      if (!hasRipe || sim.log % 4 !== 3) {
+        emit({ a: 'finish', n: 2 })
+      }
     }
   }
 
@@ -597,16 +642,52 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     emit({ a: 'brew', herb: 'huiling' })
   }
 
-  // 2. Harvest mature plots (`g >= 3`), highest-value herb first, aligning onto `sim.log % 4 === 3` (`2x` yield!)
+  // 2. Harvest mature plots (`g >= 3`), prioritizing missing alchemy recipe herbs first, then highest-value herb,
+  //    aligning onto `sim.log % 4 === 3` (`2x` yield!)
+  const needHuilingNow = Number(sim.pills?.huiling || 0) < PILL_DAILY - dpUsedToday(sim, t)
+  const needPeiyuanNow =
+    (sim.lv || 1) < 5 ||
+    Number(sim.pills?.peiyuan || 0) < computeHeldPeiyuanFloorWhileSubLv5(sim, t, opts) ||
+    (shouldAllowBreakPolicy(sim, opts) &&
+      Number(sim.cv?.s || 1) >= 8 &&
+      Number(sim.pills?.peiyuan || 0) < Number(sim.cv?.r || 0) + 1)
+  const isRecipeBottleneckHerb = (herb) => {
+    if (needHuilingNow && PILLS.huiling.need[herb] && Number(sim.bag?.[herb] || 0) < PILLS.huiling.need[herb]) {
+      return 1
+    }
+    if (needPeiyuanNow && PILLS.peiyuan.need[herb] && Number(sim.bag?.[herb] || 0) < PILLS.peiyuan.need[herb]) {
+      return 1
+    }
+    return 0
+  }
+
   const ripeIndices = sim.plots
-    .map((p, idx) => (p?.c && p.g >= 3 ? { idx, sell: HERBS[p.c]?.sell || 0 } : null))
+    .map((p, idx) =>
+      p?.c && p.g >= 3
+        ? { idx, herb: p.c, sell: HERBS[p.c]?.sell || 0, urgentNeed: isRecipeBottleneckHerb(p.c) }
+        : null
+    )
     .filter(Boolean)
-    .sort((a, b) => b.sell - a.sell || a.idx - b.idx)
+    .sort((a, b) => b.urgentNeed - a.urgentNeed || b.sell - a.sell || a.idx - b.idx)
 
   for (let k = 0; k < ripeIndices.length; k++) {
     if (actions.length >= opts.maxActionsPerBatch) {
       truncatedByBatchCap = true
       break
+    }
+    if (isUrgentCauldronReady()) {
+      if (sim.en >= COST.brew && sim.log % 4 !== 3) {
+        const needHuilingToday = Number(sim.pills?.huiling || 0) < PILL_DAILY - dpUsedToday(sim, t)
+        if (needHuilingToday && hasBrewIngredients(sim, 'huiling')) {
+          emit({ a: 'brew', herb: 'huiling' })
+        } else if (hasBrewIngredients(sim, 'peiyuan')) {
+          emit({ a: 'brew', herb: 'peiyuan' })
+        }
+      }
+      if (isUrgentCauldronReady() && sim.en - COST.harvest < COST.brew) {
+        // Hold `sim.en` so it reaches `COST.brew = 5` instead of draining `2` `xs.en` on extra harvests
+        break
+      }
     }
     const { idx } = ripeIndices[k]
     const p = sim.plots[idx]
@@ -631,12 +712,12 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     emit({ a: 'finish', n: 2 })
   }
 
-  // Start urgent today's `huiling` (+85 net `xs.en`) or sub-Lv5 `peiyuan` (+134 Farm XP / 5 `xs.en`) right after harvests!
+  // Start urgent today's `huiling` (+85 net `xs.en`) or sub-Lv5/breakthrough `peiyuan` right after harvests!
   if (!sim.brew && sim.en >= COST.brew && actions.length < opts.maxActionsPerBatch) {
     const needHuilingToday = Number(sim.pills?.huiling || 0) < PILL_DAILY - dpUsedToday(sim, t)
     if (needHuilingToday && hasBrewIngredients(sim, 'huiling')) {
       emit({ a: 'brew', herb: 'huiling' })
-    } else if ((sim.lv || 1) < 5 && sim.en >= COST.brew + 4 && hasBrewIngredients(sim, 'peiyuan')) {
+    } else if (isUrgentCauldronReady() && hasBrewIngredients(sim, 'peiyuan')) {
       emit({ a: 'brew', herb: 'peiyuan' })
     }
   }
@@ -658,7 +739,8 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     if (!emit({ a: 'sell', herb: sellCand.herb, n })) break
   }
 
-  // 5. Water existing growing dry plots FIRST (`p.c && p.g < 3 && !p.w`) so no crop growth timer sits paused
+  // 5. Water existing growing dry plots FIRST (`p.c && p.g < 3 && !p.w`) so no crop growth timer sits paused,
+  //    UNLESS holding `1` `xs.en` for an already-mature plot (`COST.harvest = 2`) or ready cauldron (`COST.brew = 5`)!
   for (let i = 0; i < PLOTS; i++) {
     if (actions.length >= opts.maxActionsPerBatch) {
       truncatedByBatchCap = true
@@ -666,15 +748,15 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     }
     const p = sim.plots[i]
     if (!p?.c || p.g >= 3 || p.w) continue
-    if (sim.en < COST.water && shouldEatHuilingNow(sim, t, COST.water + 4)) {
+    if (sim.en - COST.water < minReservedEnForRipeOrBrew() && shouldEatHuilingNow(sim, t, COST.water + 4)) {
       emit({ a: 'use', herb: 'huiling' })
     }
-    if (sim.en < COST.water) break
+    if (sim.en - COST.water < minReservedEnForRipeOrBrew()) break
     if (sim.can < 1 && !emit({ a: 'refill' })) break
     emit({ a: 'water', i })
   }
 
-  // 6. Plant & water all open empty `soil` plots
+  // 6. Plant & water all open empty `soil` plots (respecting mature-harvest / urgent-cauldron `xs.en` reservation)
   for (let i = 0; i < PLOTS; i++) {
     if (actions.length >= opts.maxActionsPerBatch) {
       truncatedByBatchCap = true
@@ -682,10 +764,10 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     }
     const p = sim.plots[i]
     if (!p || p.s !== 'soil' || p.c) continue
-    if (sim.en < COST.plant + COST.water && shouldEatHuilingNow(sim, t, COST.plant + COST.water + 4)) {
+    if (sim.en - (COST.plant + COST.water) < minReservedEnForRipeOrBrew() && shouldEatHuilingNow(sim, t, COST.plant + COST.water + 4)) {
       emit({ a: 'use', herb: 'huiling' })
     }
-    if (sim.en < COST.plant) break
+    if (sim.en - COST.plant < minReservedEnForRipeOrBrew()) break
     let crop = chooseCropForEmptyPlot(sim, t, opts)
     if (!crop) break
     if (Number(sim.seeds?.[crop] || 0) < 1) {
@@ -695,7 +777,7 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
       if (maxBuy < 1 || !emit({ a: 'buy', herb: crop, n: maxBuy })) break
     }
     if (!emit({ a: 'plant', i, herb: crop })) break
-    if (sim.en >= COST.water) {
+    if (sim.en - COST.water >= minReservedEnForRipeOrBrew()) {
       if (sim.can < 1) emit({ a: 'refill' })
       if (sim.can >= 1) emit({ a: 'water', i })
     }
@@ -765,13 +847,13 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     if (!techEl) break
     if (!emit({ a: 'learn', el: techEl })) break
   }
-  if (!sim.tech && Array.isArray(sim.techs) && sim.techs.length > 0 && actions.length < opts.maxActionsPerBatch) {
-    const preferred = [...sim.techs].sort((a, b) => {
-      const ia = VARIANT_TECH_PRIORITY.indexOf(a)
-      const ib = VARIANT_TECH_PRIORITY.indexOf(b)
-      return (ia >= 0 ? ia : 99) - (ib >= 0 ? ib : 99)
-    })[0]
-    emit({ a: 'equip', el: preferred })
+  const preferredTech = selectPreferredEquippedTech(sim)
+  if (
+    preferredTech &&
+    (!sim.tech || (sim.te !== xsDay(t) && preferredTech !== sim.tech)) &&
+    actions.length < opts.maxActionsPerBatch
+  ) {
+    emit({ a: 'equip', el: preferredTech })
   }
 
   // 11. Tail Stochastic & Meditation Section (`xsBreak` shield -> `xsRise` -> `xsSit` / `xsFuse`)
@@ -889,11 +971,13 @@ export function computeNextXianWakeSec(world, nowSec = Number(world?.now || 0), 
     if (brewReadyAt > t) candidates.push(brewReadyAt)
   }
 
-  let waitingOnPlotEnergy = false
+  const growMult = sim.tech === 'wood' ? 0.8 : 1
+  let waitingOnPlotEnergy =
+    !sim.brew && (hasBrewIngredients(sim, 'huiling') || hasBrewIngredients(sim, 'peiyuan'))
   for (const p of sim.plots || []) {
     if (!p) continue
     if (p.c && p.g < 3 && p.w) {
-      const stageReadyAt = Number(p.w) + HERBS[p.c].grow + 1
+      const stageReadyAt = Math.ceil(Number(p.w) + HERBS[p.c].grow * growMult + 1)
       if (stageReadyAt > t) candidates.push(stageReadyAt)
     } else if ((p.c && p.g >= 3) || (p.c && p.g < 3 && !p.w)) {
       waitingOnPlotEnergy = true
@@ -904,12 +988,13 @@ export function computeNextXianWakeSec(world, nowSec = Number(world?.now || 0), 
 
   if (sim.en < EN_MAX) {
     const enBase = Number(sim.enAt || t)
+    const regenSec = sim.tech === 'wind' ? EN_REGEN * 0.75 : EN_REGEN
     if (waitingOnPlotEnergy) {
-      const nextTick = enBase + EN_REGEN + 1
-      candidates.push(nextTick > t ? nextTick : t + EN_REGEN)
+      const nextTick = Math.ceil(enBase + regenSec + 1)
+      candidates.push(nextTick > t ? nextTick : Math.ceil(t + regenSec))
     }
     const ticksTo88 = Math.max(1, 88 - Number(sim.en || 0))
-    const nearCapAt = enBase + ticksTo88 * EN_REGEN + 1
+    const nearCapAt = Math.ceil(enBase + ticksTo88 * regenSec + 1)
     if (nearCapAt > t) candidates.push(nearCapAt)
   }
 
@@ -924,7 +1009,7 @@ export function computeNextXianWakeSec(world, nowSec = Number(world?.now || 0), 
       const curS = Number(sim.cv?.s || 1)
       for (let s = curS; s <= 9; s++) remXp += cvNeed(curR, s)
       remXp -= Number(sim.cv?.xp || 0)
-      const ratePerSec = (10 * rootMult(sim)) / 60
+      const ratePerSec = (10 * rootMult(sim) * (sim.tech === 'ice' ? 1.2 : 1)) / 60
       if (remXp > 0 && ratePerSec > 0) {
         const secNeeded = Math.max(MED_MIN + 5, Math.ceil((remXp + 1) / ratePerSec))
         if (secNeeded < MED_MAX) {
