@@ -124,6 +124,12 @@ export async function runLiveAccountTick({
   let lastInLockWorld = null
   let stamRes = { staminaReserveFloor: 0, staminaReserveUntilSec: 0 }
   let effectiveConstraints = { ...baseUserConstraints }
+  const forceSkipStability =
+    Number(runtimeState?.consecutivePlanInvalid || 0) >= 1 ||
+    Number(runtimeState?.consecutiveDeferred || 0) >= 1
+  const effectiveSolverOptions = forceSkipStability
+    ? { ...solverOptions, checkHorizonStability: false }
+    : solverOptions
 
   const controllerOut = await runControllerStep({
     adapter,
@@ -212,7 +218,7 @@ export async function runLiveAccountTick({
       }
       return effectiveConstraints
     },
-    solverOptions,
+    solverOptions: effectiveSolverOptions,
     asyncPlanner: activePlanner,
     rulesPath: effectiveRulesPath,
     deadlineAtMs: effectiveDeadlineAtMs,
@@ -226,6 +232,19 @@ export async function runLiveAccountTick({
     nowMsFn: () => httpClient.nowMsFn(),
     dryRun,
   })
+
+  if (runtimeState) {
+    if (controllerOut?.status === 'plan-invalid') {
+      runtimeState.consecutivePlanInvalid = Number(runtimeState.consecutivePlanInvalid || 0) + 1
+    } else if (controllerOut?.status === 'confirmed' || controllerOut?.status === 'waiting') {
+      runtimeState.consecutivePlanInvalid = 0
+    }
+    if (controllerOut?.status === 'deferred-by-deadline') {
+      runtimeState.consecutiveDeferred = Number(runtimeState.consecutiveDeferred || 0) + 1
+    } else if (controllerOut?.status === 'confirmed' || controllerOut?.status === 'waiting') {
+      runtimeState.consecutiveDeferred = 0
+    }
+  }
 
   if (snipeScheduler?.isStealEnabled()) {
     if (
@@ -610,6 +629,8 @@ if (isDirectMain) {
       lastCapexEvalAtSec: 0,
       pendingCapex: false,
       arenaRemaining: null,
+      consecutivePlanInvalid: 0,
+      consecutiveDeferred: 0,
     }
 
     let stopping = false
@@ -645,6 +666,7 @@ if (isDirectMain) {
         phase: res.phase,
         controllerStatus: res.controllerOut?.status ?? null,
         planSource: res.controllerOut?.planSource ?? null,
+        diagnostics: res.controllerOut?.diagnostics ?? null,
         staminaReservation: res.staminaReservation ?? null,
         backgroundReport: res.backgroundReport ?? null,
         nextWakeSec: res.nextWakeSec,
@@ -700,11 +722,32 @@ if (isDirectMain) {
           if (!snipeScheduler.shouldBlockBackgroundWork(nowSec, 50)) {
             updateNotifier.maybeCheckInBackground()
           }
+          const diag = res.controllerOut?.diagnostics
+          const diagParts = []
+          if (diag?.solveElapsedMs != null && res.controllerOut?.planSource === 'solved') {
+            diagParts.push(`solve=${diag.solveElapsedMs}ms`)
+          }
+          if (diag?.recoveredFromCheckpoint) {
+            diagParts.push('ckpt=1')
+          }
+          if (diag?.truncatedByTransition) {
+            diagParts.push('transSalvage=1')
+          }
+          if (res.controllerOut?.status === 'plan-invalid') {
+            diagParts.push(`drift=${diag?.clockDriftSec ?? '?'}s`)
+            diagParts.push(`reason=${diag?.failedReason || 'unknown'}`)
+            if (diag?.failedAction?.a) diagParts.push(`failedAct=${diag.failedAction.a}`)
+          } else if (res.controllerOut?.status === 'deferred-by-deadline' && res.controllerOut?.abortReason) {
+            diagParts.push(`abort=${res.controllerOut.abortReason}`)
+          } else if (res.controllerOut?.status === 'stale-plan-invalidated') {
+            diagParts.push(`rev=${res.controllerOut.expectedRev}->${res.controllerOut.actualRev}`)
+          }
+          const diagTag = diagParts.length > 0 ? ` ${diagParts.join(' ')}` : ''
           const xianTickTag = res.backgroundReport?.xian?.status === 'confirmed'
             ? ` xian=act(${res.backgroundReport.xian.actions?.length || 0})`
             : ''
           console.log(
-            `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${xianTickTag}${updateNotifier.inlineTag()}`
+            `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${diagTag}${xianTickTag}${updateNotifier.inlineTag()}`
           )
         } catch (err) {
           console.error(`[${new Date().toISOString()}] [LIVE:${account}:ERROR] ${err?.stack || err}`)

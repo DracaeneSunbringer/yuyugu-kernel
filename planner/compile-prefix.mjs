@@ -116,10 +116,26 @@ export function computeCausalStochasticPrefix(adapter, worldBefore, rawDomestic 
   }
 }
 
+const URGENT_TRANSITION_SAFE_ACTIONS = new Set([
+  'harvest',
+  'collect',
+  'trap',
+  'clear',
+  'water',
+  'feed',
+  'pet',
+  'goal',
+])
+
 /**
  * Computes the earliest wall-clock timestamp `> atSec` at which a domestic physical event
- * transitions without `world.rev` advancing (plot maturity, manual-water stage end, steal unlock,
- * barn production/hunger/feed cooldown, trap ready, natural-day or isle-day reset, or planned wake).
+ * transitions without `world.rev` advancing (plot maturity, manual-water stage end,
+ * barn production/hunger/feed cooldown/retirement, trap ready, active buff expiry,
+ * natural-day or isle-day reset, or planned wake).
+ *
+ * NOTE: Already-ripe plot `unlockAt` (visitor steal-protection expiry) is intentionally NOT
+ * a domestic invalidation transition — our own `harvest` legality, cost, and yield are invariant
+ * across `unlockAt`, so crossing `unlockAt` must never abort an in-flight harvest!
  */
 export function computeEarliestDomesticTransitionSec(adapter, world, plannedWakeSec = null) {
   const { R } = adapter
@@ -158,9 +174,6 @@ export function computeEarliestDomesticTransitionSec(adapter, world, plannedWake
         const stageEndSec = Number(p.t || atSec) + Math.ceil((Number(st.total || 3600) * (st.stage + 1)) / 3)
         consider(stageEndSec)
       }
-    } else if (st.stage === 3) {
-      const timing = adapter.exactPlotTimings?.(p, isSpr, atSec, cs, { isAlreadyRipe: true })
-      if (timing?.unlockAt) consider(timing.unlockAt)
     }
   }
 
@@ -169,6 +182,7 @@ export function computeEarliestDomesticTransitionSec(adapter, world, plannedWake
     if (!pen) continue
     const age = R.b12AnimalStage(pen, atSec)
     if (age?.retired) continue
+    if (Number.isFinite(age?.retireAt)) consider(age.retireAt)
     const bt = adapter.exactBarnTimings?.(pen, atSec, cs)
     if (bt?.nextOwnUnitAt) consider(bt.nextOwnUnitAt)
     consider(Number(pen.f || 0) + 8 * 3600)
@@ -182,7 +196,46 @@ export function computeEarliestDomesticTransitionSec(adapter, world, plannedWake
     }
   }
 
+  if (s.buffs && typeof s.buffs === 'object') {
+    for (const exp of Object.values(s.buffs)) {
+      if (Number.isFinite(Number(exp))) consider(Number(exp))
+    }
+  }
+
   return earliest
+}
+
+/**
+ * When a lateral domestic transition occurred during `(at0, nowW]` (e.g. a neighboring plot matured
+ * while the planner was computing), discretionary resource-competing actions (`mine`, `fish`, `bomb`,
+ * `sell`, `craft`, `buy`, `stockBuy`, `plant`, `eat`, `coffee`, `visit`, etc.) must be withheld for
+ * fresh re-optimization, while non-regretful urgent collection/care actions (`harvest`, `collect`,
+ * `trap`, `pet`, `goal`, `clear`, `water`, `feed`) that remain legal and respect `staminaReserveFloor`
+ * are preserved so mature crops are never left stranded.
+ */
+function extractTransitionSafeUrgentPrefix(adapter, worldBefore, prefix, constraints = {}) {
+  const candidateUrgent = prefix.filter((act) => URGENT_TRANSITION_SAFE_ACTIONS.has(act?.a))
+  if (candidateUrgent.length === 0) return []
+
+  const nowW = Math.floor(Number(worldBefore?.now || 0))
+  const reserveFloor = Number(constraints?.staminaReserveFloor || 0) > 0 && nowW < Number(constraints?.staminaReserveUntilSec || 0)
+    ? Math.max(0, Math.floor(Number(constraints.staminaReserveFloor || 0)))
+    : 0
+
+  const accepted = []
+  let simWorld = worldBefore
+  for (const act of candidateUrgent) {
+    const step = adapter.simulateBatch(simWorld, [act], {
+      t: nowW,
+      prices: worldBefore.prices || {},
+    })
+    const ok = step.result?.out?.[0]?.ok === true
+    const afterEn = Math.floor(Number(step.afterWorld?.state?.en || 0))
+    if (!ok || afterEn < reserveFloor) continue
+    accepted.push(act)
+    simWorld = step.afterWorld
+  }
+  return accepted
 }
 
 export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}) {
@@ -195,13 +248,17 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
       domesticBatch: [],
       visitOperations: [],
       truncatedAfterStochastic: false,
+      truncatedByTransition: false,
     }
   }
 
   const bucket0 = plan.trunkBuckets[0]
   const at0 = Math.floor(Number(bucket0.atSec))
   const nowW = Math.floor(Number(worldBefore?.now || 0))
-  const maxClockDriftSec = Math.max(0, Number(options.maxClockDriftSec || 0))
+  const maxClockDriftSec =
+    options.maxClockDriftSec === undefined || options.maxClockDriftSec === null
+      ? Infinity
+      : Math.max(0, Number(options.maxClockDriftSec))
   const clockDrift = nowW - at0
   if (clockDrift < 0 || clockDrift > maxClockDriftSec) {
     return {
@@ -212,6 +269,7 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
       domesticBatch: [],
       visitOperations: [],
       truncatedAfterStochastic: false,
+      truncatedByTransition: false,
     }
   }
   if (
@@ -226,30 +284,12 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
       domesticBatch: [],
       visitOperations: [],
       truncatedAfterStochastic: false,
+      truncatedByTransition: false,
     }
   }
 
   const rawDomestic = Array.isArray(bucket0.domesticActions) ? bucket0.domesticActions : []
   const rawVisits = Array.isArray(bucket0.visitActions) ? bucket0.visitActions : []
-  if (clockDrift > 0) {
-    const isWaitBucket0 = rawDomestic.length === 0 && rawVisits.length === 0
-    const earliestTransition = computeEarliestDomesticTransitionSec(
-      adapter,
-      { ...worldBefore, now: at0 },
-      isWaitBucket0 ? plan.nextWakeSec : null
-    )
-    if (nowW >= earliestTransition) {
-      return {
-        status: 'plan-invalid',
-        failedIndex: -1,
-        failedAction: null,
-        failedReason: `bucket0-domestic-transition-crossed:${at0}->${nowW}>=${earliestTransition}`,
-        domesticBatch: [],
-        visitOperations: [],
-        truncatedAfterStochastic: false,
-      }
-    }
-  }
   const maxBatch = adapter.R.WORLD?.maxActions || 40
 
   // Validate visit actions fail-closed before anything else
@@ -264,6 +304,7 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
         domesticBatch: [],
         visitOperations: [],
         truncatedAfterStochastic: false,
+        truncatedByTransition: false,
       }
     }
     if (plan.constraints?.maxStealsPerIsleDay === 0) {
@@ -275,6 +316,7 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
         domesticBatch: [],
         visitOperations: [],
         truncatedAfterStochastic: false,
+        truncatedByTransition: false,
       }
     }
     const minSpots = Number(plan.constraints?.minStealSpots || 0)
@@ -287,19 +329,76 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
         domesticBatch: [],
         visitOperations: [],
         truncatedAfterStochastic: false,
+        truncatedByTransition: false,
       }
     }
   }
 
   // Cap to single server batch limit and batch independent mature `harvest`/`collect` actions together,
   // truncating only when a downstream action causally depends on unobserved stochastic yields!
-  const {
+  let {
     prefix,
     containsStochasticAction,
     truncatedAfterStochastic,
     truncatedByBatchLimit,
     stochasticTriggerAction,
   } = computeCausalStochasticPrefix(adapter, worldBefore, rawDomestic, maxBatch)
+
+  let effectiveRawVisits = rawVisits
+  let truncatedByTransition = false
+
+  if (clockDrift > 0) {
+    const isWaitBucket0 = prefix.length === 0 && rawVisits.length === 0
+    const earliestTransition = computeEarliestDomesticTransitionSec(
+      adapter,
+      { ...worldBefore, now: at0 },
+      isWaitBucket0 ? plan.nextWakeSec : null
+    )
+    if (isWaitBucket0) {
+      const refAt0 = adapter.advanceTimeOnly({ ...worldBefore, now: at0 }, at0)
+      const refNow = adapter.advanceTimeOnly(worldBefore, nowW)
+      const passiveRegenCrossed = Math.floor(Number(refNow.state?.en || 0)) > Math.floor(Number(refAt0.state?.en || 0))
+      if (nowW >= earliestTransition || passiveRegenCrossed) {
+        return {
+          status: 'plan-invalid',
+          failedIndex: -1,
+          failedAction: null,
+          failedReason: nowW >= earliestTransition
+            ? `bucket0-domestic-transition-crossed:${at0}->${nowW}>=${earliestTransition}`
+            : `bucket0-passive-regen-crossed:${at0}->${nowW}`,
+          domesticBatch: [],
+          visitOperations: [],
+          truncatedAfterStochastic: false,
+          truncatedByTransition: false,
+        }
+      }
+    } else if (nowW >= earliestTransition) {
+      // A physical domestic transition occurred during `(at0, nowW]`:
+      // Withhold discretionary resource-competing actions (`mine`/`fish`/`bomb`/`sell`/`craft`/`eat`/`plant`/`stockBuy`/`visit`)
+      // for re-optimization on the post-transition world, while preserving safe urgent mature collection/care!
+      const salvaged = extractTransitionSafeUrgentPrefix(adapter, worldBefore, prefix, plan.constraints || {})
+      if (salvaged.length === 0) {
+        return {
+          status: 'plan-invalid',
+          failedIndex: -1,
+          failedAction: prefix[0] || rawVisits[0] || null,
+          failedReason: `bucket0-domestic-transition-crossed:${at0}->${nowW}>=${earliestTransition}`,
+          domesticBatch: [],
+          visitOperations: [],
+          truncatedAfterStochastic: false,
+          truncatedByTransition: false,
+        }
+      }
+      if (salvaged.length < prefix.length || rawVisits.length > 0) {
+        truncatedByTransition = true
+      }
+      prefix = salvaged
+      effectiveRawVisits = []
+      containsStochasticAction = prefix.some((a) => adapter.isStochasticAction(a))
+      stochasticTriggerAction = prefix.find((a) => adapter.isStochasticAction(a))?.a || null
+      truncatedAfterStochastic = containsStochasticAction && prefix.length < rawDomestic.length
+    }
+  }
 
   if (prefix.length > 0) {
     const sim = adapter.simulateBatch(worldBefore, prefix, {
@@ -317,13 +416,14 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
           domesticBatch: [],
           visitOperations: [],
           truncatedAfterStochastic: false,
+          truncatedByTransition: false,
         }
       }
     }
   }
 
   // Validate first visit operation stamina feasibility if a raid is scheduled before domestic work
-  const visitOperations = rawVisits.map((v) => ({ ...v }))
+  const visitOperations = effectiveRawVisits.map((v) => ({ ...v }))
   if (visitOperations.length > 0 && prefix.length === 0) {
     const refreshed = adapter.advanceTimeOnly(worldBefore, worldBefore.now)
     if (Number(refreshed.state?.en || 0) < Number(visitOperations[0].energyCost || 0)) {
@@ -335,6 +435,7 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
         domesticBatch: [],
         visitOperations: [],
         truncatedAfterStochastic: false,
+        truncatedByTransition: false,
       }
     }
   }
@@ -357,12 +458,43 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
     status: hasImmediateAction ? 'ready' : 'wait',
     nextTransactionKind,
     domesticBatch: prefix,
-    visitOperations: nextTransactionKind === 'visit' ? [visitOperations[0]] : ((containsStochasticAction || truncatedAfterStochastic) ? [] : visitOperations.slice(0, 1)),
+    visitOperations: nextTransactionKind === 'visit'
+      ? [visitOperations[0]]
+      : ((containsStochasticAction || truncatedAfterStochastic || truncatedByTransition) ? [] : visitOperations.slice(0, 1)),
     containsStochasticAction,
     truncatedAfterStochastic,
     truncatedByBatchLimit,
+    truncatedByTransition,
     stochasticTriggerAction,
     plannedNextWakeSec: plan.nextWakeSec ?? null,
     waitReason: hasImmediateAction ? null : (plan.waitReason || 'awaiting-next-event-boundary'),
   }
+}
+
+/**
+ * Canonical signature of the immediate executable commitment of `plan` at `worldBefore`
+ * (compares only the actual transaction batch / visit target or bounded wait wake time,
+ * ignoring post-stochastic unexecutable tail actions in `trunkBuckets[0]`).
+ */
+export function buildExecutablePlanSignature(adapter, worldBefore, plan, { waitHorizonCapSec = null } = {}) {
+  const comp = compileExecutablePrefix(adapter, worldBefore, plan)
+  if (comp.status === 'plan-invalid') {
+    return JSON.stringify({ status: 'invalid', reason: comp.failedReason })
+  }
+  if (comp.status === 'wait') {
+    const rawWake = Number.isFinite(plan?.nextWakeSec) ? Number(plan.nextWakeSec) : null
+    const cappedWake = rawWake != null && Number.isFinite(waitHorizonCapSec)
+      ? Math.min(rawWake, Math.floor(waitHorizonCapSec))
+      : rawWake
+    return JSON.stringify({
+      status: 'wait',
+      nextWakeSec: cappedWake,
+    })
+  }
+  return JSON.stringify({
+    status: 'ready',
+    kind: comp.nextTransactionKind,
+    dom: comp.domesticBatch,
+    vis: (comp.visitOperations || []).map((v) => v.targetId),
+  })
 }

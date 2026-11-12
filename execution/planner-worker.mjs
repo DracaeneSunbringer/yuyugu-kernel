@@ -32,6 +32,8 @@ if (parentPort) {
 
     try {
       const slowMs = Math.floor(Number(simulateSlowSolveMs || solverOptions?.simulateSlowSolveMs || 0))
+      const slowExtMs = Math.floor(Number(solverOptions?.simulateSlowExtendedMs || 0))
+      const simExtErr = Boolean(solverOptions?.simulateExtendedError)
       if (slowMs > 0) {
         // Real worker-thread blocking wait for adversarial preemption verification;
         // `worker.terminate()` interrupts `Atomics.wait` immediately in <5ms with zero CPU spin!
@@ -57,11 +59,30 @@ if (parentPort) {
       }
       delete cleanOptions.rawNeighborEntries
       delete cleanOptions.simulateSlowSolveMs
+      delete cleanOptions.simulateSlowExtendedMs
+      delete cleanOptions.simulateExtendedError
 
       let plan
       let horizonStability = null
       if (runStability) {
-        const stab = solveWithHorizonStability(adapter, envelope, objCfg, cleanOptions)
+        const stab = solveWithHorizonStability(adapter, envelope, objCfg, {
+          ...cleanOptions,
+          onBasePlanReady: (basePlan) => {
+            parentPort.postMessage({
+              jobId,
+              kind: 'base-plan-checkpoint',
+              plan: basePlan,
+            })
+            if (slowExtMs > 0) {
+              const sabExt = new SharedArrayBuffer(4)
+              const viewExt = new Int32Array(sabExt)
+              Atomics.wait(viewExt, 0, 0, slowExtMs)
+            }
+            if (simExtErr) {
+              throw new Error('simulated-extended-worker-crash')
+            }
+          },
+        })
         const adoptExtended = Boolean(!stab.skippedByDeadline && stab.prefixStable === false && stab.extendedPlan)
         plan = adoptExtended ? stab.extendedPlan : stab.basePlan
         horizonStability = {

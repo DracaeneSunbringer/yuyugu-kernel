@@ -154,8 +154,33 @@ export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceTex
   const rulesHash = computeRulesHash(R, rulesSourceText)
   const graph = buildCatalogGraph(R)
 
+  function fastCloneJson(val) {
+    if (val === null || typeof val !== 'object') return val
+    if (Array.isArray(val)) {
+      const len = val.length
+      const arr = new Array(len)
+      for (let i = 0; i < len; i++) {
+        const el = val[i]
+        arr[i] = el !== null && typeof el === 'object' ? fastCloneJson(el) : el
+      }
+      return arr
+    }
+    const proto = Object.getPrototypeOf(val)
+    if (proto !== Object.prototype && proto !== null) {
+      return structuredClone(val)
+    }
+    const out = {}
+    for (const k in val) {
+      if (Object.prototype.hasOwnProperty.call(val, k)) {
+        const v = val[k]
+        out[k] = v !== null && typeof v === 'object' ? fastCloneJson(v) : v
+      }
+    }
+    return out
+  }
+
   function cloneWorld(world) {
-    return structuredClone(world)
+    return fastCloneJson(world)
   }
 
   function nextNaturalDayBoundary(t) {

@@ -23,7 +23,19 @@ import {
   expectedMineYieldPerHit,
 } from './resources.mjs'
 import { computeValidUpperBound } from './bounds.mjs'
-import { computeCausalStochasticPrefix } from './compile-prefix.mjs'
+import { buildExecutablePlanSignature, computeCausalStochasticPrefix } from './compile-prefix.mjs'
+
+function cloneInvSnap(snap) {
+  const out = {}
+  if (!snap) return out
+  for (const k in snap) {
+    if (Object.prototype.hasOwnProperty.call(snap, k)) {
+      const r = snap[k]
+      if (r) out[k] = [r[0] || 0, r[1] || 0, r[2] || 0]
+    }
+  }
+  return out
+}
 
 /**
  * Dynamically discovers rule utility item IDs from `R` tables/initializers
@@ -88,6 +100,7 @@ export function discoverRuleUtilityTokens(adapter) {
  * guaranteeing 100% global optimality across `q2/q1/q0` and `00:00` natural-day resets.
  */
 const slotScheduleWeakCache = new WeakMap()
+const globalSlotItemStructCache = new WeakMap()
 
 function getSlotScheduleItemMeta(R, slots, itemId, needNatDayTable = false) {
   let root = slotScheduleWeakCache.get(slots)
@@ -118,28 +131,56 @@ function getSlotScheduleItemMeta(R, slots, itemId, needNatDayTable = false) {
   let itemMeta = root.byItem.get(itemId)
   if (!itemMeta) {
     const U = root.maxAvailU + 1
-    const bestGlobalSlotIdx = new Int32Array(U * 3).fill(-1)
-    const bestGlobalUnitVal = new Float64Array(U * 3)
-    const quals = [R.QUALITY?.[0] ?? 1, R.QUALITY?.[1] ?? 1, R.QUALITY?.[2] ?? 1]
+    let byR = globalSlotItemStructCache.get(R)
+    if (!byR) {
+      byR = new Map()
+      globalSlotItemStructCache.set(R, byR)
+    }
+    let structMap = byR.get(itemId)
+    if (!structMap) {
+      structMap = new Map()
+      byR.set(itemId, structMap)
+    } else if (structMap.size > 512) {
+      structMap.clear()
+    }
+    let schedKey = `${slots.length}:${U}`
     for (let s = 0; s < slots.length; s++) {
       const sl = slots[s]
       if (!sl.allowSell) continue
-      const p = Number(sl.prices?.[itemId] || 0)
-      if (!(p > 0)) continue
-      const mult = sl.disc * sl.netTaxFactor
-      const maxU = sl.availFromBucket
-      for (let q = 0; q < 3; q++) {
-        const unit = Math.round(p * quals[q]) * mult
-        for (let u = 0; u <= maxU; u++) {
-          const idx = u * 3 + q
-          if (unit > bestGlobalUnitVal[idx] + 1e-9) {
-            bestGlobalUnitVal[idx] = unit
-            bestGlobalSlotIdx[idx] = s
+      schedKey += `|${s},${sl.availFromBucket},${sl.naturalDay},${Number(sl.prices?.[itemId] || 0)},${sl.disc * sl.netTaxFactor}`
+    }
+    itemMeta = structMap.get(schedKey)
+    if (!itemMeta) {
+      const bestGlobalSlotIdx = new Int32Array(U * 3).fill(-1)
+      const bestGlobalUnitVal = new Float64Array(U * 3)
+      const quals = [R.QUALITY?.[0] ?? 1, R.QUALITY?.[1] ?? 1, R.QUALITY?.[2] ?? 1]
+      for (let s = 0; s < slots.length; s++) {
+        const sl = slots[s]
+        if (!sl.allowSell) continue
+        const p = Number(sl.prices?.[itemId] || 0)
+        if (!(p > 0)) continue
+        const mult = sl.disc * sl.netTaxFactor
+        const maxU = sl.availFromBucket
+        for (let q = 0; q < 3; q++) {
+          const unit = Math.round(p * quals[q]) * mult
+          for (let u = 0; u <= maxU; u++) {
+            const idx = u * 3 + q
+            if (unit > bestGlobalUnitVal[idx] + 1e-9) {
+              bestGlobalUnitVal[idx] = unit
+              bestGlobalSlotIdx[idx] = s
+            }
           }
         }
       }
+      itemMeta = {
+        bestGlobalSlotIdx,
+        bestGlobalUnitVal,
+        bestNdSlotIdx: null,
+        flowRevCache: new Map(),
+        flowFullCache: new Map(),
+      }
+      structMap.set(schedKey, itemMeta)
     }
-    itemMeta = { bestGlobalSlotIdx, bestGlobalUnitVal, bestNdSlotIdx: null }
     root.byItem.set(itemId, itemMeta)
   }
 
@@ -331,6 +372,25 @@ function solveExactItemSaleSchedule(adapter, {
     return { sellsBySlot: revenueOnly ? null : slots.map(() => [0, 0, 0]), totalWeightedRevenue: 0 }
   }
 
+  let flowKey = `${initialNatDay}:${initialScCount}`
+  for (let i = 0; i < P; i++) {
+    flowKey += `|${grpQ[i]},${grpRepU[i]},${grpCnt[i]}`
+  }
+  if (revenueOnly) {
+    const revHit = itemMeta.flowRevCache.get(flowKey)
+    if (revHit !== undefined) {
+      return { sellsBySlot: null, totalWeightedRevenue: revHit }
+    }
+  } else {
+    const fullHit = itemMeta.flowFullCache.get(flowKey)
+    if (fullHit !== undefined) {
+      return {
+        sellsBySlot: fullHit.sellsBySlot.map((r) => [r[0], r[1], r[2]]),
+        totalWeightedRevenue: fullHit.totalWeightedRevenue,
+      }
+    }
+  }
+
   // Flat typed-array Min-Cost Max-Flow (costs = -gain; reverse edge index = `e ^ 1`)
   // Nodes: 0 = SRC, 1..P = coalesced supply groups, P+1..P+3*D = (ndIdx, tier), last = SNK
   const SRC = 0
@@ -477,9 +537,20 @@ function solveExactItemSaleSchedule(adapter, {
     }
   }
 
+  const finalWeightedRev = -totalCost
+  if (itemMeta.flowRevCache.size < 8192) {
+    itemMeta.flowRevCache.set(flowKey, finalWeightedRev)
+  }
+  if (!revenueOnly && itemMeta.flowFullCache.size < 2048) {
+    itemMeta.flowFullCache.set(flowKey, {
+      sellsBySlot: sellsBySlot.map((r) => [r[0], r[1], r[2]]),
+      totalWeightedRevenue: finalWeightedRev,
+    })
+  }
+
   return {
     sellsBySlot,
-    totalWeightedRevenue: -totalCost,
+    totalWeightedRevenue: finalWeightedRev,
   }
 }
 
@@ -763,6 +834,7 @@ function solveJointCraftAndSell(adapter, {
   baseEvalOverride = null,
   onlyTouchItemIds = null,
   revenueOnly = false,
+  isPastDeadlineFn = null,
 }) {
   const L = buckets.length
   const baseEval = baseEvalOverride || evaluateSupplyPortfolio(adapter, {
@@ -905,7 +977,7 @@ function solveJointCraftAndSell(adapter, {
     const curCounts = new Int32Array(candidateMoves.length)
 
     const dfs = (startIdx, curSupply, curEval, spentStaminaCost) => {
-      if (++visitedNodes > MAX_EXACT_NODES) {
+      if (++visitedNodes > MAX_EXACT_NODES || ((visitedNodes & 63) === 0 && isPastDeadlineFn?.())) {
         dfsTruncated = true
         return
       }
@@ -998,6 +1070,7 @@ function solveJointCraftAndSell(adapter, {
   const moveMaxChunkCap = new Int32Array(candidateMoves.length).fill(16)
 
   for (let guard = 0; guard < 240; guard++) {
+    if (guard > 0 && isPastDeadlineFn?.()) break
     let bestIdx = -1
     let bestRatio = 0
     let bestChunk = 1
@@ -1170,6 +1243,78 @@ function mergeCraftActionsPreserveTopo(list) {
  * using exact weather-segment timings, regrow season-wither rule (`pet-world-rules.js:411,522`),
  * downstream multi-season marginal item values, and Renewal NPV Rate (`net / occupiedSec`).
  */
+const cropCycleSkeletonMemoByAdapter = new WeakMap()
+
+function getCropCycleSkeleton(adapter, clockStart, isSpr, crop, startSec, cutoffEndSec) {
+  let memo = cropCycleSkeletonMemoByAdapter.get(adapter)
+  if (!memo) {
+    memo = new Map()
+    cropCycleSkeletonMemoByAdapter.set(adapter, memo)
+  } else if (memo.size > 8192) {
+    memo.clear()
+  }
+  const key = `${Number(clockStart || 0)}:${isSpr ? 1 : 0}:${startSec}:${cutoffEndSec}:${crop.id}`
+  let skel = memo.get(key)
+  if (skel !== undefined) return skel
+
+  const { R } = adapter
+  const startSeason = R.seasonOf(R.isleDay(startSec))
+  if (!crop.seasons.includes(startSeason)) {
+    memo.set(key, null)
+    return null
+  }
+  let simT = startSec
+  let h = 0
+  const maxTimes = crop.regrow ? (crop.times || 1) : 1
+  let totalExpectedUnits = 0
+  let totalStaminaSpent = R.WORLD?.cost?.plant ?? 2
+  const harvests = []
+
+  while (h < maxTimes) {
+    const simDay = R.isleDay(simT)
+    if (!crop.seasons.includes(R.seasonOf(simDay))) {
+      totalStaminaSpent += R.WORLD?.cost?.clear ?? 1
+      break
+    }
+    const mockPlot = { c: crop.id, t: simT, w: 0, g: 0, h }
+    const timing = adapter.exactPlotTimings(mockPlot, isSpr, simT, clockStart)
+    if (!timing || (cutoffEndSec >= 0 && timing.matureAt > cutoffEndSec)) break
+    if (!crop.seasons.includes(R.seasonOf(R.isleDay(timing.matureAt)))) {
+      // Crop withers at the season boundary before `timing.matureAt` (`cropStage === -1`)!
+      totalStaminaSpent += R.WORLD?.cost?.clear ?? 1
+      break
+    }
+
+    const isRain = R.weatherOf(simDay) === 1
+    const wateredStages = isSpr || isRain ? 3 : 2
+    if (!isSpr && !isRain) {
+      totalStaminaSpent += wateredStages * (R.WORLD?.cost?.water ?? 1)
+    }
+    totalStaminaSpent += R.WORLD?.cost?.harvest ?? 1
+
+    const yld = expectedHarvestYield(adapter, wateredStages, false)
+    totalExpectedUnits += yld.expectedUnits
+    harvests.push({ matureAt: timing.matureAt, expectedByQuality: yld.expectedByQuality })
+
+    simT = timing.matureAt
+    h++
+  }
+
+  if (h <= 0) {
+    memo.set(key, null)
+    return null
+  }
+  skel = {
+    harvests,
+    occupiedSec: Math.max(60, simT - startSec),
+    endSec: simT,
+    totalExpectedUnits,
+    totalStaminaSpent,
+  }
+  memo.set(key, skel)
+  return skel
+}
+
 function selectBestCropToPlant(adapter, {
   state,
   plotIdx,
@@ -1185,56 +1330,33 @@ function selectBestCropToPlant(adapter, {
   const isSpr = R.sprinkled(state, plotIdx)
 
   const evalCropAt = (crop, startSec, cutoff) => {
-    const startSeason = R.seasonOf(R.isleDay(startSec))
-    if (!crop.seasons.includes(startSeason)) return null
-    let simT = startSec
-    let h = 0
-    const maxTimes = crop.regrow ? (crop.times || 1) : 1
+    const skel = getCropCycleSkeleton(
+      adapter,
+      state?.clockStart,
+      isSpr,
+      crop,
+      startSec,
+      cutoff ? Math.floor(Number(tEnd || 0)) : -1
+    )
+    if (!skel) return null
     let totalExpectedRevenue = 0
-    let totalExpectedUnits = 0
-    let totalStaminaSpent = R.WORLD?.cost?.plant ?? 2
-
-    while (h < maxTimes) {
-      if (!crop.seasons.includes(R.seasonOf(R.isleDay(simT)))) {
-        totalStaminaSpent += R.WORLD?.cost?.clear ?? 1
-        break
-      }
-      const mockPlot = { c: crop.id, t: simT, w: 0, g: 0, h }
-      const timing = adapter.exactPlotTimings(mockPlot, isSpr, simT, state?.clockStart)
-      if (!timing || (cutoff && timing.matureAt > tEnd)) break
-      if (!crop.seasons.includes(R.seasonOf(R.isleDay(timing.matureAt)))) {
-        // Crop withers at the season boundary before `timing.matureAt` (`cropStage === -1`)!
-        totalStaminaSpent += R.WORLD?.cost?.clear ?? 1
-        break
-      }
-
-      const wateredStages = isSpr || R.weatherOf(R.isleDay(simT)) === 1 ? 3 : 2
-      if (!isSpr && R.weatherOf(R.isleDay(simT)) !== 1) {
-        totalStaminaSpent += wateredStages * (R.WORLD?.cost?.water ?? 1)
-      }
-      totalStaminaSpent += R.WORLD?.cost?.harvest ?? 1
-
-      const yld = expectedHarvestYield(adapter, wateredStages, false)
-      totalExpectedUnits += yld.expectedUnits
-      for (let q = 0; q < 3; q++) {
-        totalExpectedRevenue += yld.expectedByQuality[q] * marginalItemValueFn(crop.id, q, timing.matureAt)
-      }
-
-      simT = timing.matureAt
-      h++
+    for (let k = 0; k < skel.harvests.length; k++) {
+      const hv = skel.harvests[k]
+      const eq = hv.expectedByQuality
+      totalExpectedRevenue +=
+        eq[0] * marginalItemValueFn(crop.id, 0, hv.matureAt) +
+        eq[1] * marginalItemValueFn(crop.id, 1, hv.matureAt) +
+        eq[2] * marginalItemValueFn(crop.id, 2, hv.matureAt)
     }
-
-    if (h <= 0) return null
-    const occupiedSec = Math.max(60, simT - startSec)
     const freeSeedAvail = startSec === atSec && adapter.availableInv(state, `sd_${crop.id}`, 0) > 0
     const seedCashCost = freeSeedAvail ? 0 : crop.seed
-    const net = totalExpectedRevenue - seedCashCost - totalStaminaSpent * staminaPointCost
+    const net = totalExpectedRevenue - seedCashCost - skel.totalStaminaSpent * staminaPointCost
     return {
       net,
-      occupiedSec,
-      endSec: simT,
-      totalExpectedUnits,
-      rawRatePerSec: net / occupiedSec,
+      occupiedSec: skel.occupiedSec,
+      endSec: skel.endSec,
+      totalExpectedUnits: skel.totalExpectedUnits,
+      rawRatePerSec: net / skel.occupiedSec,
     }
   }
 
@@ -1474,6 +1596,7 @@ function optimizeAndSimulateSequence(adapter, {
   maxCraftHoldIsleDays = 3,
   hasExplicitPriceOverride = false,
   skipObjectiveEval = false,
+  isPastDeadlineFn = null,
 }) {
   const { R, graph } = adapter
   const L = seqBuckets.length
@@ -1674,6 +1797,15 @@ function optimizeAndSimulateSequence(adapter, {
     rawFreeWorkshopByIsle.set(cs.isleIndex, allowedSet.has('craft') ? (R.WORLD?.daily?.craft || 80) : 0)
   }
 
+  let marginalStateVer = 0
+  const directChoiceMemo = new Map()
+  const marginalValMemo = new Map()
+  const bumpMarginalState = () => {
+    marginalStateVer++
+    directChoiceMemo.clear()
+    marginalValMemo.clear()
+  }
+
   const startNatDay = R.worldDay(startWorld.now)
   const projectedScOnStartDay = {}
   for (const [k, v] of Object.entries(startWorld.state?.cnt || {})) {
@@ -1689,6 +1821,7 @@ function optimizeAndSimulateSequence(adapter, {
       projectedScByNatDay.set(nd, row)
     }
     row[id] = Number(row[id] || 0) + qty
+    bumpMarginalState()
   }
 
   const unreservedInitCounts = {}
@@ -1698,11 +1831,18 @@ function optimizeAndSimulateSequence(adapter, {
   }
 
   const unreservedWorkshopByIsle = new Map(rawFreeWorkshopByIsle)
+  const setUnreservedWorkshop = (iIdx, val) => {
+    const prev = unreservedWorkshopByIsle.get(iIdx)
+    if (prev !== val) {
+      unreservedWorkshopByIsle.set(iIdx, val)
+      bumpMarginalState()
+    }
+  }
   if ((allowedSet.has('craft') || allowedSet.has('sell')) && (L + contCraftBuckets.length) > 0) {
     const craftEn = R.WORLD?.cost?.craft ?? 1
     const initCSBuckets = [...seqBuckets, ...contCraftBuckets]
     const initCS = solveJointCraftAndSell(adapter, {
-      initialSupplyByBucket: [structuredClone(initSnap0), ...initCSBuckets.slice(1).map(() => ({}))],
+      initialSupplyByBucket: [cloneInvSnap(initSnap0), ...initCSBuckets.slice(1).map(() => ({}))],
       buckets: initCSBuckets,
       slots: jointSlots,
       initialNatDay: startNatDay,
@@ -1712,6 +1852,7 @@ function optimizeAndSimulateSequence(adapter, {
       staminaShadowCost: 0,
       allowCraft: allowedSet.has('craft'),
       maxCraftHoldIsleDays: Math.max(maxCraftHoldIsleDays || 3, initCSBuckets.length > 0 ? (initCSBuckets[initCSBuckets.length - 1].isleDayOffset || 0) + 1 : 3),
+      isPastDeadlineFn,
     })
     const producedMid = {}
     for (let u = 0; u < initCSBuckets.length; u++) {
@@ -1767,9 +1908,13 @@ function optimizeAndSimulateSequence(adapter, {
         skipStandingPlots: true,
       }
     )
+    bumpMarginalState()
   }
 
   const findBestDirectSaleChoice = (id, q = 0, atSec = startWorld.now) => {
+    const dKey = `${id}:${q}:${atSec}`
+    const hit = directChoiceMemo.get(dKey)
+    if (hit !== undefined) return hit
     const qual = R.QUALITY?.[q] ?? 1
     let bestDirect = 0
     let bestNatDay = startNatDay
@@ -1786,12 +1931,19 @@ function optimizeAndSimulateSequence(adapter, {
         bestNatDay = sl.naturalDay
       }
     }
-    return { val: bestDirect, natDay: bestNatDay }
+    const out = { val: bestDirect, natDay: bestNatDay }
+    directChoiceMemo.set(dKey, out)
+    return out
   }
 
   const bestDirectUnitValue = (id, q = 0, atSec = startWorld.now) => findBestDirectSaleChoice(id, q, atSec).val
 
   const marginalItemValueFn = (id, q = 0, atSec = startWorld.now, { reserveUnits = 0 } = {}) => {
+    const mKey = reserveUnits > 0 ? null : `${id}:${q}:${atSec}`
+    if (mKey !== null) {
+      const mHit = marginalValMemo.get(mKey)
+      if (mHit !== undefined) return mHit
+    }
     const dirChoice = findBestDirectSaleChoice(id, q, atSec)
     const bestDirect = dirChoice.val
     let best = bestDirect
@@ -1849,7 +2001,7 @@ function optimizeAndSimulateSequence(adapter, {
           if (entry.atSec + 1 >= atSec && (unreservedWorkshopByIsle.get(entry.isleIndex) || 0) > 1e-9) {
             const cur = unreservedWorkshopByIsle.get(entry.isleIndex) || 0
             const tk = Math.min(cur, remSlotsToConsume)
-            unreservedWorkshopByIsle.set(entry.isleIndex, Math.max(0, cur - tk))
+            setUnreservedWorkshop(entry.isleIndex, Math.max(0, cur - tk))
             remSlotsToConsume -= tk
           }
         }
@@ -1858,7 +2010,9 @@ function optimizeAndSimulateSequence(adapter, {
       }
     }
 
-    return Math.max(0, best)
+    const resVal = Math.max(0, best)
+    if (mKey !== null) marginalValMemo.set(mKey, resVal)
+    return resVal
   }
 
   // Step B: Pre-pass over deterministic maintenance, urgent farm/barn care & cargo `stockBuy` to collect exact supply arrivals per bucket!
@@ -2463,7 +2617,7 @@ function optimizeAndSimulateSequence(adapter, {
           curUnreserved[id] = (row[0] || 0) + (row[1] || 0) + (row[2] || 0)
         }
         for (const [iIdx, slFree] of probeFreeSlotsByIsle.entries()) {
-          unreservedWorkshopByIsle.set(iIdx, slFree)
+          setUnreservedWorkshop(iIdx, slFree)
         }
 
         const existingCraftWorkUnits = []
@@ -2482,7 +2636,7 @@ function optimizeAndSimulateSequence(adapter, {
             slots._subSlotsByU[u] = subSlots
           }
           const probeCS = solveJointCraftAndSell(adapter, {
-            initialSupplyByBucket: [structuredClone(curSnapCargo), ...localCargoBuckets.slice(1).map(() => ({}))],
+            initialSupplyByBucket: [cloneInvSnap(curSnapCargo), ...localCargoBuckets.slice(1).map(() => ({}))],
             buckets: localCargoBuckets,
             slots: subSlots,
             initialNatDay: b.naturalDay,
@@ -2493,6 +2647,7 @@ function optimizeAndSimulateSequence(adapter, {
             allowCraft: true,
             maxCraftHoldIsleDays,
             revenueOnly: true,
+            isPastDeadlineFn,
           })
 
           const expandedProbeCrafts = []
@@ -2500,14 +2655,14 @@ function optimizeAndSimulateSequence(adapter, {
             const iIdx = localCargoBuckets[relU].isleIndex
             for (const ca of probeCS.craftsByBucket[relU] || []) {
               const nCraft = Number(ca.n || 1)
-              unreservedWorkshopByIsle.set(iIdx, Math.max(0, (unreservedWorkshopByIsle.get(iIdx) || 0) - nCraft))
+              setUnreservedWorkshop(iIdx, Math.max(0, (unreservedWorkshopByIsle.get(iIdx) || 0) - nCraft))
               for (let k = 0; k < nCraft; k++) {
                 expandedProbeCrafts.push({ id: ca.id, atSec: localCargoBuckets[relU].atSec })
               }
             }
           }
 
-          const simProbeSnap = structuredClone(curSnapCargo)
+          const simProbeSnap = cloneInvSnap(curSnapCargo)
           const recordRawReserve = (deductedMap) => {
             let opp = 0
             for (const [inId, qArr] of Object.entries(deductedMap)) {
@@ -2545,7 +2700,7 @@ function optimizeAndSimulateSequence(adapter, {
                 if (expandedProbeCrafts[scIdx]?.id === entry.id) upIndices.push(scIdx)
               }
               if (upIndices.length === needUp) {
-                const testSnap = structuredClone(simProbeSnap)
+                const testSnap = cloneInvSnap(simProbeSnap)
                 const rawDedList = []
                 let okChain = true
                 for (let sStep = 0; sStep < needUp; sStep++) {
@@ -2761,7 +2916,7 @@ function optimizeAndSimulateSequence(adapter, {
             const cur = unreservedWorkshopByIsle.get(iIdx) || 0
             if (cur > 0) {
               const tk = Math.min(cur, rem)
-              unreservedWorkshopByIsle.set(iIdx, Math.max(0, cur - tk))
+              setUnreservedWorkshop(iIdx, Math.max(0, cur - tk))
               rem -= tk
             }
           }
@@ -3739,6 +3894,7 @@ function optimizeAndSimulateSequence(adapter, {
     staminaShadowCost: 0,
     allowCraft: allowedSet.has('craft'),
     maxCraftHoldIsleDays: jointMaxHoldDays,
+    isPastDeadlineFn,
   })
 
   // Step D: Unified Integer Bounded Knapsack Stamina Competition + Exact Marginal Stamina Top-Up (`eat` / `coffee`)!
@@ -3910,10 +4066,18 @@ function optimizeAndSimulateSequence(adapter, {
       if (!anyRecipeHasInputs) return craftItems
 
       const craftEn = R.WORLD?.cost?.craft ?? 1
+      let localCraftSlots = slots._localCraftSlotsByU?.[u]
+      if (!localCraftSlots) {
+        if (!slots._localCraftSlotsByU) slots._localCraftSlotsByU = []
+        localCraftSlots = slots
+          .filter((sl) => sl.availFromBucket >= u)
+          .map((sl) => ({ ...sl, availFromBucket: Math.max(0, sl.availFromBucket - u) }))
+        slots._localCraftSlotsByU[u] = localCraftSlots
+      }
       const localCS = solveJointCraftAndSell(adapter, {
         initialSupplyByBucket: [snapAvail, ...seqBuckets.slice(u + 1).map(() => ({}))],
         buckets: seqBuckets.slice(u),
-        slots: slots.filter((sl) => sl.availFromBucket >= u).map((sl) => ({ ...sl, availFromBucket: Math.max(0, sl.availFromBucket - u) })),
+        slots: localCraftSlots,
         initialNatDay: b.naturalDay,
         initialCnt: s.cnt || {},
         craftCapByIsle: new Map([[b.isleIndex, freeSlotsNow]]),
@@ -3921,6 +4085,7 @@ function optimizeAndSimulateSequence(adapter, {
         staminaShadowCost: 0,
         allowCraft: true,
         maxCraftHoldIsleDays,
+        isPastDeadlineFn,
       })
 
       const plannedActs = localCS.craftsByBucket[0] || []
@@ -3928,7 +4093,7 @@ function optimizeAndSimulateSequence(adapter, {
       for (const ca of plannedActs) {
         for (let k = 0; k < (ca.n || 1); k++) expandedSingle.push(ca.id)
       }
-      const simSnap = structuredClone(snapAvail)
+      const simSnap = cloneInvSnap(snapAvail)
       let idxC = 0
       while (idxC < expandedSingle.length) {
         const rId = expandedSingle[idxC]
@@ -3953,7 +4118,7 @@ function optimizeAndSimulateSequence(adapter, {
             if (expandedSingle[scan] === rId) upIndices.push(scan)
           }
           if (upIndices.length === needUp) {
-            const testSnap = structuredClone(simSnap)
+            const testSnap = cloneInvSnap(simSnap)
             let rawCost = 0
             let okChain = true
             for (let uStep = 0; uStep < needUp; uStep++) {
@@ -6222,6 +6387,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         initialCashEvents: autoInitCashEvents,
         maxCraftHoldIsleDays,
         hasExplicitPriceOverride,
+        isPastDeadlineFn: isPastDeadline,
       })
       return {
         expectedValue: res.objectiveEval.totalObjectiveValue,
@@ -6305,6 +6471,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       maxCraftHoldIsleDays,
       hasExplicitPriceOverride,
       skipObjectiveEval: true,
+      isPastDeadlineFn: isPastDeadline,
     })
 
     // Replay ONLY the shared trunk actions `0..K-1` identically to obtain the exact common `worldAtBranchStart`!
@@ -6368,6 +6535,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         maxCraftHoldIsleDays,
         hasExplicitPriceOverride,
         skipObjectiveEval: true,
+        isPastDeadlineFn: isPastDeadline,
       })
       if (branchRes.discretizationMeta) {
         mergedDisc.maxDpCells = Math.max(mergedDisc.maxDpCells, branchRes.discretizationMeta.maxDpCells || 0)
@@ -6482,7 +6650,11 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     const b0 = cand.trunkBucketsUsed?.[0]
     const dom0 = cand.trunkActionsByBucket?.[0] || []
     const firstStochIdx = dom0.findIndex((a) => adapter.isStochasticAction(a))
-    const contMode = cand.policyMeta?.trunkPolicyMode === 'hold-in-first-bucket' ? 'hold-in-first-bucket' : 'optimal'
+    const rawContMode = cand.policyMeta?.trunkPolicyMode === 'hold-in-first-bucket' ? 'hold-in-first-bucket' : 'optimal'
+    // When `firstStochIdx >= 0`, execution commits `compiledPrefix` at `t0` and re-enters the unified planner
+    // fresh after receiving the stochastic receipt (`t0 + minGap`), so post-receipt recourse is unified (`'optimal'`).
+    // When `firstStochIdx === -1` (deterministic bucket 0), preserve candidate-specific `rawContMode`!
+    const contMode = firstStochIdx >= 0 ? 'optimal' : rawContMode
     let causalPref = dom0
     if (firstStochIdx >= 0 && b0) {
       const p0Tmp = makePricesFn(scenarios[0])(b0, baseSoldByIsle)
@@ -6492,7 +6664,11 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     }
     const compiledPrefix = firstStochIdx >= 0 ? causalPref : dom0
     const cacheKey = b0
-      ? JSON.stringify({ k: firstStochIdx >= 0 ? 'pref' : 'det0', contMode, pref: compiledPrefix })
+      ? JSON.stringify(
+          firstStochIdx >= 0
+            ? { k: 'pref', pref: compiledPrefix }
+            : { k: 'det0', contMode, pref: compiledPrefix }
+        )
       : JSON.stringify({ k: 'full', meta: cand.policyMeta, acts: cand.trunkActionsByBucket })
 
     if (scoredPrefixCache.has(cacheKey)) {
@@ -6733,7 +6909,24 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     ([id, q]) => sellableIdSet.has(id) && Array.isArray(q) && ((q[0] || 0) + (q[1] || 0) + (q[2] || 0)) > 0
   )
 
+  const getDomesticPrefixSig = (cand) => {
+    const b0 = cand.trunkBucketsUsed?.[0]
+    const dom0 = cand.trunkActionsByBucket?.[0] || []
+    if (!b0) return JSON.stringify({ k: 'full', meta: cand.policyMeta, acts: cand.trunkActionsByBucket })
+    const firstStochIdx = dom0.findIndex((a) => adapter.isStochasticAction(a))
+    if (firstStochIdx >= 0) {
+      const p0Tmp = makePricesFn(scenarios[0])(b0, baseSoldByIsle)
+      let w0Tmp = adapter.advanceTimeOnly(world0, b0.atSec, { futurePrices: p0Tmp })
+      w0Tmp = applyExogenousArrivals(w0Tmp, b0.exogenousArrivalsAtStart)
+      const pref = computeCausalStochasticPrefix(adapter, w0Tmp, dom0, adapter.R.WORLD?.maxActions || 40).prefix
+      return JSON.stringify({ k: 'pref', pref })
+    }
+    const contMode = cand.policyMeta?.trunkPolicyMode === 'hold-in-first-bucket' ? 'hold-in-first-bucket' : 'optimal'
+    return JSON.stringify({ k: 'det0', contMode, pref: dom0 })
+  }
+
   let bestDomestic = null
+  let bestDomPrefixSig = null
   for (const mode of candidateModes) {
     if (bestDomestic && isPastDeadline()) break
     if (mode === 'hold-in-first-bucket' && bestDomestic) {
@@ -6745,9 +6938,20 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       if (!optActs0.some((a) => a.a === 'harvest' || a.a === 'collect' || a.a === 'stockBuy')) continue
     }
     const rawCand = evaluateTrunkPolicy(mode, world0, world0)
-    const cand = hasImmediatePrefixStochastic(rawCand) ? scoreDomesticCandidate(rawCand) : rawCand
-    if (!bestDomestic || cand.policyExpectedValue > bestDomestic.policyExpectedValue + 1e-6) {
-      bestDomestic = cand
+    const candSig = getDomesticPrefixSig(rawCand)
+    if (!bestDomestic) {
+      bestDomestic = rawCand
+      bestDomPrefixSig = candSig
+      continue
+    }
+    if (candSig === bestDomPrefixSig) continue
+    if (hasImmediatePrefixStochastic(bestDomestic) || hasImmediatePrefixStochastic(rawCand)) {
+      if (bestDomestic.valueInterpretation == null) scoreDomesticCandidate(bestDomestic)
+      scoreDomesticCandidate(rawCand)
+    }
+    if (rawCand.policyExpectedValue > bestDomestic.policyExpectedValue + 1e-6) {
+      bestDomestic = rawCand
+      bestDomPrefixSig = candSig
     }
   }
 
@@ -6765,13 +6969,16 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
   }
   for (const uv of upstreamVariants) {
     if (isPastDeadline()) break
+    const rawCand = evaluateTrunkPolicy('optimal', world0, world0, uv)
+    const candSig = getDomesticPrefixSig(rawCand)
+    if (candSig === bestDomPrefixSig) continue
     if (bestDomestic && bestDomestic.valueInterpretation == null) {
       scoreDomesticCandidate(bestDomestic)
     }
-    const rawCand = evaluateTrunkPolicy('optimal', world0, world0, uv)
     const cand = scoreDomesticCandidate(rawCand)
     if (cand.policyExpectedValue > bestDomestic.policyExpectedValue + 1e-6) {
       bestDomestic = cand
+      bestDomPrefixSig = candSig
     }
   }
 
@@ -7125,9 +7332,10 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
  */
 export function solveWithHorizonStability(adapter, envelope, objectiveCfgInput = {}, options = {}) {
   const nowMsFn = typeof options.nowMsFn === 'function' ? options.nowMsFn : Date.now
+  const startWallMs = nowMsFn()
   const deadlineAtMs = Number.isFinite(options.deadlineAtMs)
     ? Number(options.deadlineAtMs)
-    : (Number.isFinite(options.maxSolveMs) ? nowMsFn() + Number(options.maxSolveMs) : Infinity)
+    : (Number.isFinite(options.maxSolveMs) ? startWallMs + Number(options.maxSolveMs) : Infinity)
 
   const baseCfg = objectiveCfgInput?.objectiveHash
     ? objectiveCfgInput
@@ -7137,19 +7345,40 @@ export function solveWithHorizonStability(adapter, envelope, objectiveCfgInput =
     horizonSec: baseCfg.horizonSec + (baseCfg.extendedHorizonDeltaSec || 2 * 14400),
   })
 
+  const worldObs = envelope?.observed?.world
+  const t0 = Number(worldObs?.now || 0)
+  const cs = worldObs?.clockStart
+  let effectiveDeadlineAtMs = deadlineAtMs
+  if (Number.isFinite(deadlineAtMs) && worldObs) {
+    const nextIsleSec = adapter.nextIsleBoundary?.(t0, cs) ?? Infinity
+    const nextNatSec = adapter.nextNaturalDayBoundary?.(t0) ?? Infinity
+    const secToEpoch = Math.max(0, Math.min(nextIsleSec, nextNatSec) - t0)
+    if (Number.isFinite(secToEpoch)) {
+      const epochWallDeadlineMs = startWallMs + Math.max(250, secToEpoch * 1000 - 1500)
+      effectiveDeadlineAtMs = Math.min(effectiveDeadlineAtMs, epochWallDeadlineMs)
+    }
+  }
+
   const baseMaxBuckets = options.maxBuckets || 16
   const basePlan = solveUnifiedPlan(adapter, envelope, baseCfg, {
     ...options,
     nowMsFn,
-    deadlineAtMs,
+    deadlineAtMs: effectiveDeadlineAtMs,
     _exposeCapexForStability: true,
   })
   const reusedCapex = basePlan._selectedCapexActions
   delete basePlan._selectedCapexActions
 
-  if (Number.isFinite(deadlineAtMs)) {
-    const minExtBudgetMs = Math.max(50, Number(basePlan.quality?.elapsedMs || 0) * 0.7)
-    if (nowMsFn() + minExtBudgetMs >= deadlineAtMs || basePlan.quality?.pruning?.deadlineReached) {
+  // Stream `basePlan` checkpoint immediately so caller/Worker host retains a valid executable plan
+  // even if the subsequent extended-horizon verification times out, errors, or is hard-terminated!
+  if (typeof options.onBasePlanReady === 'function') {
+    options.onBasePlanReady(basePlan)
+  }
+
+  const extScale = extCfg.horizonSec / Math.max(1, baseCfg.horizonSec)
+  if (Number.isFinite(effectiveDeadlineAtMs)) {
+    const minExtBudgetMs = Math.max(50, Number(basePlan.quality?.elapsedMs || 0) * Math.max(1.2, extScale))
+    if (nowMsFn() + minExtBudgetMs >= effectiveDeadlineAtMs || basePlan.quality?.pruning?.deadlineReached) {
       return {
         prefixStable: null,
         skippedByDeadline: true,
@@ -7163,28 +7392,53 @@ export function solveWithHorizonStability(adapter, envelope, objectiveCfgInput =
   const basePaybackSec = Math.max(baseCfg.horizonSec || 3600, maxCapexCapSec)
   const extPaybackSec = Math.max(extCfg.horizonSec || 3600, maxCapexCapSec)
 
-  const extScale = extCfg.horizonSec / Math.max(1, baseCfg.horizonSec)
   const extMaxBuckets = Math.max(baseMaxBuckets + 4, Math.ceil(baseMaxBuckets * extScale))
-  const t0 = Number(envelope.observed?.world?.now || 0)
-  const extendedPlan = solveUnifiedPlan(adapter, envelope, extCfg, {
-    ...options,
-    nowMsFn,
-    deadlineAtMs,
-    maxBuckets: extMaxBuckets,
-    preservePrefixThroughSec: t0 + Math.max(0, Math.floor(baseCfg.horizonSec || 0)),
-    prefixMaxBuckets: baseMaxBuckets,
-    preselectedCapexActionsOverride: extPaybackSec === basePaybackSec ? reusedCapex : undefined,
-    skipPostSelectionScoring: true,
-  })
+  let extendedPlan = null
+  try {
+    extendedPlan = solveUnifiedPlan(adapter, envelope, extCfg, {
+      ...options,
+      nowMsFn,
+      deadlineAtMs: effectiveDeadlineAtMs,
+      maxBuckets: extMaxBuckets,
+      preservePrefixThroughSec: t0 + Math.max(0, Math.floor(baseCfg.horizonSec || 0)),
+      prefixMaxBuckets: baseMaxBuckets,
+      preselectedCapexActionsOverride: extPaybackSec === basePaybackSec ? reusedCapex : undefined,
+      skipPostSelectionScoring: true,
+    })
+  } catch (extErr) {
+    return {
+      prefixStable: null,
+      skippedByDeadline: true,
+      extendedError: extErr?.message || String(extErr),
+      basePlan,
+      extendedPlan: null,
+    }
+  }
 
-  const sig0 = JSON.stringify({
-    dom: basePlan.trunkBuckets[0]?.domesticActions || [],
-    vis: (basePlan.trunkBuckets[0]?.visitActions || []).map((v) => v.targetId),
-  })
-  const sig1 = JSON.stringify({
-    dom: extendedPlan.trunkBuckets[0]?.domesticActions || [],
-    vis: (extendedPlan.trunkBuckets[0]?.visitActions || []).map((v) => v.targetId),
-  })
+  // Never discard a complete `basePlan` in favor of a deadline-truncated `extendedPlan`!
+  if (!basePlan.quality?.pruning?.deadlineReached && extendedPlan.quality?.pruning?.deadlineReached) {
+    delete extendedPlan._finalizePostSelectionQuality
+    return {
+      prefixStable: null,
+      skippedByDeadline: true,
+      basePlan,
+      extendedPlan: null,
+    }
+  }
+
+  const waitCapSec = t0 + Math.max(0, Math.floor(baseCfg.horizonSec || 0))
+  const sig0 = worldObs
+    ? buildExecutablePlanSignature(adapter, worldObs, basePlan, { waitHorizonCapSec: waitCapSec })
+    : JSON.stringify({
+        dom: basePlan.trunkBuckets[0]?.domesticActions || [],
+        vis: (basePlan.trunkBuckets[0]?.visitActions || []).map((v) => v.targetId),
+      })
+  const sig1 = worldObs
+    ? buildExecutablePlanSignature(adapter, worldObs, extendedPlan, { waitHorizonCapSec: waitCapSec })
+    : JSON.stringify({
+        dom: extendedPlan.trunkBuckets[0]?.domesticActions || [],
+        vis: (extendedPlan.trunkBuckets[0]?.visitActions || []).map((v) => v.targetId),
+      })
   const isStable = sig0 === sig1
   if (!isStable && typeof extendedPlan._finalizePostSelectionQuality === 'function') {
     extendedPlan._finalizePostSelectionQuality()

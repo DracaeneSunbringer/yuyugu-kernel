@@ -72,7 +72,7 @@ export async function runControllerStep({
   rulesPath = null,
   deadlineAtMs = Infinity,
   shouldPreemptFn = null,
-  maxCachedPlanDriftSec = 25,
+  maxCachedPlanDriftSec = Infinity,
   nowMsFn = Date.now,
   dryRun = false,
 }) {
@@ -109,10 +109,24 @@ export async function runControllerStep({
     horizonStability,
     compiled,
     planSource = 'inline',
+    solveElapsedMs = null,
     observedNeighbors = [],
     observedPartnerWorld = null,
   }) => {
+    const at0Diag = Math.floor(Number(plan?.trunkBuckets?.[0]?.atSec ?? effectiveWorldBefore?.now ?? 0))
+    const nowDiag = Math.floor(Number(effectiveWorldBefore?.now ?? rawWorld?.now ?? 0))
+    const diagnostics = {
+      solveElapsedMs: Number.isFinite(solveElapsedMs) ? Math.round(solveElapsedMs) : null,
+      clockDriftSec: nowDiag - at0Diag,
+      failedReason: compiled.failedReason || null,
+      failedAction: compiled.failedAction || null,
+      failedIndex: compiled.failedIndex ?? null,
+      recoveredFromCheckpoint: Boolean(horizonStability?.recoveredFromCheckpoint),
+      truncatedByTransition: Boolean(compiled.truncatedByTransition),
+    }
+
     if (compiled.status === 'plan-invalid') {
+      asyncPlanner?.cache?.invalidate(account)
       return {
         status: 'plan-invalid',
         planSource,
@@ -120,7 +134,8 @@ export async function runControllerStep({
         plan,
         horizonStability,
         compiled,
-        nextWakeSec: Number(rawWorld.now || 0) + 30,
+        diagnostics,
+        nextWakeSec: Number(rawWorld.now || 0) + (adapter.R.WORLD?.minGap || 2),
       }
     }
 
@@ -153,6 +168,7 @@ export async function runControllerStep({
         plan,
         horizonStability,
         compiled,
+        diagnostics,
         nextWakeSec: plan.nextWakeSec,
       }
     }
@@ -184,6 +200,7 @@ export async function runControllerStep({
         plan,
         horizonStability,
         compiled,
+        diagnostics,
         nextWakeSec: plan.nextWakeSec,
       }
     }
@@ -230,6 +247,7 @@ export async function runControllerStep({
         plan,
         horizonStability,
         compiled,
+        diagnostics,
         txResult: txRes,
         nextWakeSec: txRes.status === 'confirmed'
           ? (txRes.worldAfter?.now ?? rawWorld.now) + (adapter.R.WORLD?.minGap || 2)
@@ -275,6 +293,7 @@ export async function runControllerStep({
         compiled.containsStochasticAction ||
         compiled.truncatedAfterStochastic ||
         compiled.truncatedByBatchLimit ||
+        compiled.truncatedByTransition ||
         (plan.trunkBuckets[0]?.visitActions?.length || 0) > 0
       )
 
@@ -327,6 +346,7 @@ export async function runControllerStep({
       plan,
       horizonStability,
       compiled,
+      diagnostics,
       txResult: txRes,
       nextWakeSec: needsContinuation
         ? (txRes.worldAfter?.now ?? rawWorld.now) + (adapter.R.WORLD?.minGap || 2)
@@ -415,6 +435,7 @@ export async function runControllerStep({
     const runStability = solverOptions.checkHorizonStability === true
       || (solverOptions.checkHorizonStability !== false && neighborTargets.length === 0)
 
+    const tSolveStartMs = nowMsFn()
     const asyncOut = await asyncPlanner.solveOrPreempt({
       rulesPath,
       adapter,
@@ -429,12 +450,14 @@ export async function runControllerStep({
       maxClockDriftSec: maxCachedPlanDriftSec,
       nowMsFn,
     })
+    const solveElapsedMs = Math.max(0, nowMsFn() - tSolveStartMs)
 
     if (asyncOut.status === 'aborted-by-deadline') {
       return {
         status: 'deferred-by-deadline',
         abortReason: asyncOut.reason,
         account,
+        diagnostics: { solveElapsedMs: Math.round(solveElapsedMs) },
         nextWakeSec: Number(rawWorld.now || 0) + 1,
       }
     }
@@ -444,10 +467,11 @@ export async function runControllerStep({
 
     const { plan, horizonStability } = asyncOut
     const planSource = asyncOut.status
+    const effectiveMaxDriftSec = planSource === 'cache-hit' ? maxCachedPlanDriftSec : Infinity
 
     if (dryRun) {
       const compiledDry = compileExecutablePrefix(adapter, envelope.observed.world, plan, {
-        maxClockDriftSec: maxCachedPlanDriftSec,
+        maxClockDriftSec: effectiveMaxDriftSec,
       })
       return commitCompiledPlan({
         heldLock: false,
@@ -459,6 +483,7 @@ export async function runControllerStep({
         horizonStability,
         compiled: compiledDry,
         planSource,
+        solveElapsedMs,
         observedNeighbors: neighborTargets,
         observedPartnerWorld: partnerWorld,
       })
@@ -473,6 +498,7 @@ export async function runControllerStep({
           account,
           plan,
           horizonStability,
+          diagnostics: { solveElapsedMs: Math.round(solveElapsedMs) },
           nextWakeSec: Number(rawWorld.now || 0) + 1,
         }
       }
@@ -506,13 +532,14 @@ export async function runControllerStep({
           account,
           expectedRev: rawWorld.rev,
           actualRev: inLockWorld.rev,
+          diagnostics: { solveElapsedMs: Math.round(solveElapsedMs) },
           nextWakeSec: Number(inLockWorld.now || 0) + 1,
         }
       }
 
       const effectiveInLockWorld = applyUnknownReservations(inLockWorld, inLockReconcile)
       const compiledInLock = compileExecutablePrefix(adapter, effectiveInLockWorld, plan, {
-        maxClockDriftSec: maxCachedPlanDriftSec,
+        maxClockDriftSec: effectiveMaxDriftSec,
       })
       return commitCompiledPlan({
         heldLock,
@@ -524,6 +551,7 @@ export async function runControllerStep({
         horizonStability,
         compiled: compiledInLock,
         planSource,
+        solveElapsedMs,
         observedNeighbors: neighborTargets,
         observedPartnerWorld: partnerWorld,
       })
@@ -602,6 +630,7 @@ export async function runControllerStep({
     const objCfg = buildObjectiveConfig(objectiveCfg)
     const runStability = solverOptions.checkHorizonStability === true
       || (solverOptions.checkHorizonStability !== false && neighborTargets.length === 0)
+    const tSolveStartMs = nowMsFn()
     let plan
     let horizonStability = null
     if (runStability) {
@@ -628,6 +657,7 @@ export async function runControllerStep({
         nowMsFn,
       })
     }
+    const solveElapsedMs = Math.max(0, nowMsFn() - tSolveStartMs)
 
     const compiled = compileExecutablePrefix(adapter, envelope.observed.world, plan)
     return commitCompiledPlan({
@@ -640,6 +670,7 @@ export async function runControllerStep({
       horizonStability,
       compiled,
       planSource: 'inline',
+      solveElapsedMs,
       observedNeighbors: neighborTargets,
       observedPartnerWorld: partnerWorld,
     })

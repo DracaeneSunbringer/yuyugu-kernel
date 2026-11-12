@@ -76,7 +76,7 @@ export class PlanCache {
     constraintsHash,
     objectiveHash,
     neighborSig = 'none',
-    maxClockDriftSec = 25,
+    maxClockDriftSec = Infinity,
   }) {
     const entry = this.byAccount.get(account)
     if (!entry || !world) return null
@@ -87,6 +87,8 @@ export class PlanCache {
       return null
     }
     const nowW = Math.floor(Number(world.now || 0))
+    const driftSec = nowW - entry.atSec
+    if (driftSec < 0 || driftSec > maxClockDriftSec) return null
     if (nowW >= entry.invalidateAtSec) {
       this.byAccount.delete(account)
       return null
@@ -97,8 +99,11 @@ export class PlanCache {
     if (objectiveHash && entry.objectiveHash !== objectiveHash) return null
     if (entry.neighborSig !== neighborSig) return null
     if (Number(world.coins || 0) !== entry.coins) return null
-    if (Number(world.state?.en || 0) < entry.en) return null
-    if (entry.isWaitPlan && Number(world.state?.en || 0) > entry.en) return null
+    const refreshedEn = adapter.advanceTimeOnly
+      ? Number(adapter.advanceTimeOnly(world, world.now).state?.en || 0)
+      : Number(world.state?.en || 0)
+    if (refreshedEn < entry.en) return null
+    if (entry.isWaitPlan && refreshedEn > entry.en) return null
     if (JSON.stringify(world.state?.iq || {}) !== entry.iqJson) return null
 
     const compiled = compileExecutablePrefix(adapter, world, entry.plan, { maxClockDriftSec })
@@ -138,19 +143,35 @@ export class AsyncPlanManager {
       cacheHits: 0,
       preemptedJobs: 0,
       backgroundPrecomputes: 0,
+      checkpointRecoveries: 0,
     }
   }
 
   _ensureWorker() {
     if (this.worker) return this.worker
-    const w = new Worker(new URL('./planner-worker.mjs', import.meta.url))
+    const w = new Worker(new URL('./planner-worker.mjs', import.meta.url), { execArgv: [] })
     w.unref()
     w.on('error', (err) => {
       if (this.activeJob && this.activeJob.worker === w) {
         const job = this.activeJob
         this.activeJob = null
         this.worker = null
-        job.settle({ status: 'worker-error', error: err?.message || String(err) })
+        if (job.checkpointPlan) {
+          this.stats.checkpointRecoveries++
+          job.settle({
+            status: 'solved',
+            plan: job.checkpointPlan,
+            horizonStability: {
+              prefixStable: null,
+              adoptedExtendedPlan: false,
+              skippedByDeadline: true,
+              recoveredFromCheckpoint: true,
+              recoveryReason: err?.message || String(err),
+            },
+          })
+        } else {
+          job.settle({ status: 'worker-error', error: err?.message || String(err) })
+        }
       } else if (this.worker === w) {
         this.worker = null
       }
@@ -160,16 +181,55 @@ export class AsyncPlanManager {
         const job = this.activeJob
         this.activeJob = null
         this.worker = null
-        job.settle({
-          status: 'aborted-by-deadline',
-          reason: job.abortReason || `worker-exited:${code}`,
-        })
+        if (!job.abortReason && job.checkpointPlan) {
+          this.stats.checkpointRecoveries++
+          job.settle({
+            status: 'solved',
+            plan: job.checkpointPlan,
+            horizonStability: {
+              prefixStable: null,
+              adoptedExtendedPlan: false,
+              skippedByDeadline: true,
+              recoveredFromCheckpoint: true,
+              recoveryReason: `worker-exited:${code}`,
+            },
+          })
+        } else {
+          job.settle({
+            status: 'aborted-by-deadline',
+            reason: job.abortReason || `worker-exited:${code}`,
+          })
+        }
       } else if (this.worker === w) {
         this.worker = null
       }
     })
     w.on('message', (msg) => {
       if (!this.activeJob || msg?.jobId !== this.activeJob.jobId) return
+      if (msg.kind === 'base-plan-checkpoint') {
+        const job = this.activeJob
+        if (msg.plan) {
+          job.checkpointPlan = msg.plan
+          if (job.adapter && job.envelope) {
+            this.cache.put({
+              adapter: job.adapter,
+              account: job.account,
+              worldBefore: job.envelope.observed.world,
+              envelope: job.envelope,
+              objectiveCfg: job.objCfg,
+              neighborSig: job.neighborSig,
+              plan: msg.plan,
+              horizonStability: {
+                prefixStable: null,
+                adoptedExtendedPlan: false,
+                skippedByDeadline: true,
+                recoveredFromCheckpoint: true,
+              },
+            })
+          }
+        }
+        return
+      }
       const job = this.activeJob
       this.activeJob = null
       w.unref()
@@ -178,6 +238,19 @@ export class AsyncPlanManager {
           status: 'solved',
           plan: msg.plan,
           horizonStability: msg.horizonStability,
+        })
+      } else if (job.checkpointPlan) {
+        this.stats.checkpointRecoveries++
+        job.settle({
+          status: 'solved',
+          plan: job.checkpointPlan,
+          horizonStability: {
+            prefixStable: null,
+            adoptedExtendedPlan: false,
+            skippedByDeadline: true,
+            recoveredFromCheckpoint: true,
+            recoveryReason: msg.error || 'extended-worker-error',
+          },
         })
       } else {
         job.settle({
@@ -282,9 +355,28 @@ export class AsyncPlanManager {
     const jobInvalidateAtSec = adapter
       ? computeEarliestDomesticTransitionSec(adapter, jobWorld, null)
       : Infinity
+    const nowStartMs = nowMsFn()
+    const rawTotalBudgetMs = Number.isFinite(deadlineAtMs)
+      ? Math.max(0, deadlineAtMs - nowStartMs)
+      : Infinity
+    const commitMarginMs = Number.isFinite(rawTotalBudgetMs)
+      ? (rawTotalBudgetMs > 1500
+          ? Math.min(2500, Math.floor(rawTotalBudgetMs * 0.15))
+          : (rawTotalBudgetMs > 300 ? Math.floor(rawTotalBudgetMs * 0.2) : 0))
+      : 0
+    const workerCutoffAtMs = Number.isFinite(deadlineAtMs)
+      ? deadlineAtMs - commitMarginMs
+      : Infinity
+    const workerDeadlineBudgetMs = Number.isFinite(workerCutoffAtMs)
+      ? Math.max(0, workerCutoffAtMs - nowStartMs)
+      : null
+
     this.activeJob = {
       jobId,
       worker: w,
+      adapter,
+      envelope,
+      objCfg,
       account,
       matchKey,
       rev: Number(jobWorld?.rev ?? -1),
@@ -299,16 +391,14 @@ export class AsyncPlanManager {
       neighborSig,
       invalidateAtSec: jobInvalidateAtSec,
       isBackground,
+      checkpointPlan: null,
+      workerCutoffAtMs,
       abortReason: null,
       promise,
       settle: settleFn,
     }
     if (isBackground) this.stats.backgroundPrecomputes++
     else this.stats.workerSolves++
-
-    const workerDeadlineBudgetMs = Number.isFinite(deadlineAtMs)
-      ? Math.max(0, deadlineAtMs - nowMsFn())
-      : null
 
     w.postMessage({
       jobId,
@@ -317,7 +407,7 @@ export class AsyncPlanManager {
       objectiveCfg: objCfg,
       solverOptions: serializableOptions,
       runStability,
-      deadlineAtMs,
+      deadlineAtMs: workerCutoffAtMs,
       workerDeadlineBudgetMs,
       simulateSlowSolveMs: solverOptions?.simulateSlowSolveMs || 0,
     })
@@ -337,7 +427,7 @@ export class AsyncPlanManager {
     deadlineAtMs = Infinity,
     shouldPreemptFn = null,
     pollIntervalMs = 25,
-    maxClockDriftSec = 25,
+    maxClockDriftSec = Infinity,
     nowMsFn = Date.now,
   }) {
     const objCfg = objectiveCfg?.objectiveHash
@@ -431,27 +521,43 @@ export class AsyncPlanManager {
 
     // 4. Race worker job against hard deadline & `shouldPreemptFn` with `worker.terminate()`
     let timerId = null
+    const effectiveCutoffMs = Math.min(
+      Number.isFinite(deadlineAtMs) ? deadlineAtMs : Infinity,
+      Number.isFinite(job.workerCutoffAtMs) ? job.workerCutoffAtMs : Infinity
+    )
     try {
       const watchPromise = new Promise((resolve) => {
         const check = () => {
           const dynReason = shouldPreemptFn?.()
           if (dynReason) {
-            resolve({ preempt: true, reason: String(dynReason) })
+            resolve({ preempt: true, urgent: true, recoverCheckpoint: false, reason: String(dynReason) })
             return
           }
-          if (nowMsFn() >= deadlineAtMs) {
-            resolve({ preempt: true, reason: 'solver-deadline-exceeded' })
+          const curMs = nowMsFn()
+          if (job.checkpointPlan && curMs >= effectiveCutoffMs) {
+            resolve({ preempt: true, urgent: false, recoverCheckpoint: true, reason: 'extended-deadline-exceeded' })
             return
           }
-          const rem = Number.isFinite(deadlineAtMs)
-            ? Math.max(5, Math.min(pollIntervalMs, deadlineAtMs - nowMsFn()))
+          if (curMs >= deadlineAtMs) {
+            resolve({
+              preempt: true,
+              urgent: false,
+              recoverCheckpoint: Boolean(job.checkpointPlan),
+              reason: 'solver-deadline-exceeded',
+            })
+            return
+          }
+          const nextBound = job.checkpointPlan ? effectiveCutoffMs : deadlineAtMs
+          const rem = Number.isFinite(nextBound)
+            ? Math.max(5, Math.min(pollIntervalMs, nextBound - curMs))
             : pollIntervalMs
           timerId = setTimeout(check, rem)
           if (typeof timerId?.unref === 'function') timerId.unref()
         }
         if (Number.isFinite(deadlineAtMs) || typeof shouldPreemptFn === 'function') {
-          const firstWait = Number.isFinite(deadlineAtMs)
-            ? Math.max(5, Math.min(pollIntervalMs, deadlineAtMs - nowMsFn()))
+          const firstBound = job.checkpointPlan ? effectiveCutoffMs : deadlineAtMs
+          const firstWait = Number.isFinite(firstBound)
+            ? Math.max(5, Math.min(pollIntervalMs, firstBound - nowMsFn()))
             : pollIntervalMs
           timerId = setTimeout(check, firstWait)
           if (typeof timerId?.unref === 'function') timerId.unref()
@@ -464,7 +570,22 @@ export class AsyncPlanManager {
       ])
 
       if (winner.preempt) {
+        const savedCheckpoint = job.checkpointPlan
         await this.abortActiveJob(winner.reason)
+        if (winner.recoverCheckpoint && savedCheckpoint && !winner.urgent) {
+          this.stats.checkpointRecoveries++
+          return {
+            status: 'solved',
+            plan: savedCheckpoint,
+            horizonStability: {
+              prefixStable: null,
+              adoptedExtendedPlan: false,
+              skippedByDeadline: true,
+              recoveredFromCheckpoint: true,
+              recoveryReason: winner.reason,
+            },
+          }
+        }
         return {
           status: 'aborted-by-deadline',
           reason: winner.reason,
@@ -534,7 +655,6 @@ export class AsyncPlanManager {
       constraintsHash: envelope.constraintsHash,
       objectiveHash: objCfg.objectiveHash,
       neighborSig,
-      maxClockDriftSec: 25,
     })
     if (already) return Promise.resolve({ status: 'cache-hit', plan: already.plan })
 
