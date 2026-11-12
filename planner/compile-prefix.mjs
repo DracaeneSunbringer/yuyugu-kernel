@@ -206,36 +206,105 @@ export function computeEarliestDomesticTransitionSec(adapter, world, plannedWake
 }
 
 /**
- * When a lateral domestic transition occurred during `(at0, nowW]` (e.g. a neighboring plot matured
+ * When a lateral transition occurred during `(at0, nowW]` (e.g. a neighboring plot matured
  * while the planner was computing), discretionary resource-competing actions (`mine`, `fish`, `bomb`,
- * `sell`, `craft`, `buy`, `stockBuy`, `plant`, `eat`, `coffee`, `visit`, etc.) must be withheld for
- * fresh re-optimization, while non-regretful urgent collection/care actions (`harvest`, `collect`,
- * `trap`, `pet`, `goal`, `clear`, `water`, `feed`) that remain legal and respect `staminaReserveFloor`
- * are preserved so mature crops are never left stranded.
+ * `sell`, `craft`, `buy`, `stockBuy`, `plant`, `visit`, and surplus `eat`/`coffee`) must be withheld
+ * for fresh re-optimization, while non-regretful urgent collection/care actions (`harvest`, `collect`,
+ * `trap`, `pet`, `goal`, `clear`, `water`, `feed`) that remain legal and respect BOTH `staminaReserveFloor`
+ * AND the planner's committed post-bucket stamina floor (`plannedPostBucketEnFloor`) are preserved.
+ *
+ * Strictly pulls ONLY the minimal prefix of *already-planned* `eat`/`coffee` actions in `prefix`
+ * needed for those salvaged urgent actions (zero economic food selection in `compile-prefix.mjs`!).
  */
-function extractTransitionSafeUrgentPrefix(adapter, worldBefore, prefix, constraints = {}) {
+function extractTransitionSafeUrgentPrefix(adapter, worldBefore, prefix, plan = null) {
   const candidateUrgent = prefix.filter((act) => URGENT_TRANSITION_SAFE_ACTIONS.has(act?.a))
   if (candidateUrgent.length === 0) return []
 
+  const plannedTopUps = prefix.filter((act) => act?.a === 'eat' || act?.a === 'coffee')
+  const constraints = plan?.constraints || {}
   const nowW = Math.floor(Number(worldBefore?.now || 0))
-  const reserveFloor = Number(constraints?.staminaReserveFloor || 0) > 0 && nowW < Number(constraints?.staminaReserveUntilSec || 0)
+  const userReserveFloor = Number(constraints?.staminaReserveFloor || 0) > 0 && nowW < Number(constraints?.staminaReserveUntilSec || 0)
     ? Math.max(0, Math.floor(Number(constraints.staminaReserveFloor || 0)))
     : 0
 
-  const accepted = []
-  let simWorld = worldBefore
-  for (const act of candidateUrgent) {
-    const step = adapter.simulateBatch(simWorld, [act], {
-      t: nowW,
-      prices: worldBefore.prices || {},
-    })
-    const ok = step.result?.out?.[0]?.ok === true
-    const afterEn = Math.floor(Number(step.afterWorld?.state?.en || 0))
-    if (!ok || afterEn < reserveFloor) continue
-    accepted.push(act)
-    simWorld = step.afterWorld
+  let adjustedPlannedFloor = 0
+  const committedRaids = Array.isArray(plan?.committedUpcomingRaids) ? plan.committedUpcomingRaids : []
+  let earliestCommittedRaidSec = Infinity
+  for (const r of committedRaids) {
+    const uSec = Math.floor(Number(r?.unlockAtSec))
+    if (Number.isFinite(uSec) && nowW < uSec && uSec < earliestCommittedRaidSec) {
+      earliestCommittedRaidSec = uSec
+    }
   }
-  return accepted
+  const rawPlannedFloor0 = Math.max(0, Math.floor(Number(plan?.trunkBuckets?.[0]?.plannedPostBucketEnFloor || 0)))
+  if (Number.isFinite(earliestCommittedRaidSec) && rawPlannedFloor0 > 0) {
+    const at0 = Math.floor(Number(plan?.trunkBuckets?.[0]?.atSec ?? nowW))
+    const regenEvery = Math.max(1, Number(adapter.R?.WORLD?.regen || 180))
+    const plannedAtEnT = Number.isFinite(Number(plan?.trunkBuckets?.[0]?.plannedAtEnT))
+      ? Math.floor(Number(plan.trunkBuckets[0].plannedAtEnT))
+      : at0
+    const refNow = adapter.advanceTimeOnly(worldBefore, nowW)
+    const nowEnT = Math.max(nowW - regenEvery, Math.floor(Number(refNow.state?.enT ?? nowW)))
+    const remRegenAt0 = Math.max(0, Math.floor((earliestCommittedRaidSec - plannedAtEnT) / regenEvery))
+    const remRegenNow = Math.max(0, Math.floor((earliestCommittedRaidSec - nowEnT) / regenEvery))
+    const passiveTicksElapsed = Math.max(0, remRegenAt0 - remRegenNow)
+    const rawCap = Number(adapter.R.energyMax(refNow.state))
+    const enMax = Number.isFinite(rawCap) && rawCap > 0 ? rawCap : 100
+    adjustedPlannedFloor = Math.min(enMax, rawPlannedFloor0 + passiveTicksElapsed)
+  }
+  const effectiveFloor = Math.max(userReserveFloor, adjustedPlannedFloor)
+
+  const salvagedBatch = []
+  let urgentCount = 0
+  let topUpCursor = 0
+  let simWorld = worldBefore
+  const pricesNow = worldBefore?.prices || {}
+
+  for (const act of candidateUrgent) {
+    const directStep = adapter.simulateBatch(simWorld, [act], {
+      t: nowW,
+      prices: pricesNow,
+    })
+    const directOk = directStep.result?.out?.[0]?.ok === true
+    const directAfterEn = Math.floor(Number(directStep.afterWorld?.state?.en || 0))
+    if (directOk && directAfterEn >= effectiveFloor) {
+      salvagedBatch.push(act)
+      simWorld = directStep.afterWorld
+      urgentCount++
+      continue
+    }
+
+    if (topUpCursor < plannedTopUps.length) {
+      let tryWorld = simWorld
+      for (let tryIdx = topUpCursor; tryIdx < plannedTopUps.length; tryIdx++) {
+        const topStep = adapter.simulateBatch(tryWorld, [plannedTopUps[tryIdx]], {
+          t: nowW,
+          prices: pricesNow,
+        })
+        if (topStep.result?.out?.[0]?.ok !== true) break
+        tryWorld = topStep.afterWorld
+
+        const actStep = adapter.simulateBatch(tryWorld, [act], {
+          t: nowW,
+          prices: pricesNow,
+        })
+        const actOk = actStep.result?.out?.[0]?.ok === true
+        const actAfterEn = Math.floor(Number(actStep.afterWorld?.state?.en || 0))
+        if (actOk && actAfterEn >= effectiveFloor) {
+          for (let k = topUpCursor; k <= tryIdx; k++) {
+            salvagedBatch.push(plannedTopUps[k])
+          }
+          salvagedBatch.push(act)
+          topUpCursor = tryIdx + 1
+          simWorld = actStep.afterWorld
+          urgentCount++
+          break
+        }
+      }
+    }
+  }
+
+  return urgentCount > 0 ? salvagedBatch : []
 }
 
 export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}) {
@@ -349,11 +418,19 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
 
   if (clockDrift > 0) {
     const isWaitBucket0 = prefix.length === 0 && rawVisits.length === 0
-    const earliestTransition = computeEarliestDomesticTransitionSec(
+    let earliestTransition = computeEarliestDomesticTransitionSec(
       adapter,
       { ...worldBefore, now: at0 },
       isWaitBucket0 ? plan.nextWakeSec : null
     )
+    if (Array.isArray(plan.committedUpcomingRaids)) {
+      for (const r of plan.committedUpcomingRaids) {
+        const uSec = Math.floor(Number(r?.unlockAtSec))
+        if (Number.isFinite(uSec) && uSec > at0 && uSec < earliestTransition) {
+          earliestTransition = uSec
+        }
+      }
+    }
     if (isWaitBucket0) {
       const refAt0 = adapter.advanceTimeOnly({ ...worldBefore, now: at0 }, at0)
       const refNow = adapter.advanceTimeOnly(worldBefore, nowW)
@@ -373,10 +450,11 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
         }
       }
     } else if (nowW >= earliestTransition) {
-      // A physical domestic transition occurred during `(at0, nowW]`:
-      // Withhold discretionary resource-competing actions (`mine`/`fish`/`bomb`/`sell`/`craft`/`eat`/`plant`/`stockBuy`/`visit`)
-      // for re-optimization on the post-transition world, while preserving safe urgent mature collection/care!
-      const salvaged = extractTransitionSafeUrgentPrefix(adapter, worldBefore, prefix, plan.constraints || {})
+      // A physical transition occurred during `(at0, nowW]`:
+      // Withhold discretionary resource-competing actions (`mine`/`fish`/`bomb`/`sell`/`craft`/`plant`/`stockBuy`/`visit`
+      // and surplus `eat`/`coffee`) for re-optimization on the post-transition world, while preserving safe urgent
+      // mature collection/care along with only the minimal already-planned top-up prefix they require!
+      const salvaged = extractTransitionSafeUrgentPrefix(adapter, worldBefore, prefix, plan)
       if (salvaged.length === 0) {
         return {
           status: 'plan-invalid',

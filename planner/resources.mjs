@@ -1,6 +1,7 @@
 export function buildEventBuckets(adapter, world, {
   horizonSec = 6 * 14400,
   deterministicArrivals = [],
+  upcomingRaidSecs = [],
   maxBuckets = 20,
   coalesceWindowSec = 5,
   preservePrefixThroughSec = null,
@@ -136,6 +137,14 @@ export function buildEventBuckets(adapter, world, {
   for (const arr of deterministicArrivals || []) {
     if (Number.isFinite(arr?.atSec) && arr.atSec >= t0 && arr.atSec <= tEnd) {
       addPoint(Math.floor(arr.atSec), 'deterministic-arrival', true)
+    }
+  }
+
+  // 6b. Exact upcoming neighbor raid unlock timestamps (`hardBoundary = true` so they never coalesce away)
+  for (const rSec of upcomingRaidSecs || []) {
+    const sec = Math.floor(Number(rSec))
+    if (Number.isFinite(sec) && sec > t0 && sec <= tEnd) {
+      addPoint(sec, 'upcoming-raid-unlock', true)
     }
   }
 

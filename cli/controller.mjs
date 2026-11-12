@@ -60,6 +60,7 @@ export async function runControllerStep({
   account = 'main',
   fetchWorldFn,
   fetchNeighborsFn = null,
+  fetchUpcomingNeighborsFn = null,
   fetchPartnerWorldFn = null,
   sendActFn = null,
   sendVisitFn = null,
@@ -111,6 +112,7 @@ export async function runControllerStep({
     planSource = 'inline',
     solveElapsedMs = null,
     observedNeighbors = [],
+    observedUpcomingNeighbors = [],
     observedPartnerWorld = null,
   }) => {
     const at0Diag = Math.floor(Number(plan?.trunkBuckets?.[0]?.atSec ?? effectiveWorldBefore?.now ?? 0))
@@ -195,6 +197,7 @@ export async function runControllerStep({
         account,
         world: effectiveWorldBefore,
         observedNeighbors,
+        observedUpcomingNeighbors,
         observedPartnerWorld,
         soldLedger: buildSoldLedger(),
         plan,
@@ -309,12 +312,18 @@ export async function runControllerStep({
       const preWorld = adapter.advanceTimeOnly(txRes.worldAfter, nextAt)
       preWorld.rev = txRes.worldAfter.rev
       Promise.resolve(typeof userConstraints === 'function' ? userConstraints(preWorld) : userConstraints)
-        .then((nextU) => {
+        .then(async (nextU) => {
           const nextStealUsed = journal ? journal.countOccupiedBudget('steal', adapter.R.isleIndex(preWorld.now)) : 0
+          const nextUpcoming = typeof fetchUpcomingNeighborsFn === 'function'
+            ? (await Promise.resolve(fetchUpcomingNeighborsFn(preWorld))) || []
+            : (observedUpcomingNeighbors || []).filter(
+                (u) => Number(u?.unlockAtSec ?? u?.expectedUnlockAt ?? 0) > preWorld.now
+              )
           const preEnv = buildObservationEnvelope(adapter, {
             account,
             world: preWorld,
             neighborTargets: observedNeighbors,
+            upcomingNeighborTargets: nextUpcoming,
             partnerWorld: observedPartnerWorld,
             knownSoldByIsleIndex: buildSoldLedger(),
             userConstraints: nextU || {},
@@ -341,6 +350,7 @@ export async function runControllerStep({
       transactionKind: 'act',
       account,
       observedNeighbors,
+      observedUpcomingNeighbors,
       observedPartnerWorld,
       soldLedger: buildSoldLedger(),
       plan,
@@ -414,6 +424,9 @@ export async function runControllerStep({
     const neighborTargets = (typeof fetchNeighborsFn === 'function' && preReconcile.remainingUnknown === 0)
       ? (await fetchNeighborsFn(rawWorld)) || []
       : []
+    const upcomingNeighborTargets = (typeof fetchUpcomingNeighborsFn === 'function' && preReconcile.remainingUnknown === 0)
+      ? (await fetchUpcomingNeighborsFn(planningWorld)) || []
+      : []
     const partnerWorld = typeof fetchPartnerWorldFn === 'function'
       ? await fetchPartnerWorldFn()
       : null
@@ -426,6 +439,7 @@ export async function runControllerStep({
       account,
       world: planningWorld,
       neighborTargets,
+      upcomingNeighborTargets,
       partnerWorld,
       knownSoldByIsleIndex,
       userConstraints: resolvedUserConstraints,
@@ -485,6 +499,7 @@ export async function runControllerStep({
         planSource,
         solveElapsedMs,
         observedNeighbors: neighborTargets,
+        observedUpcomingNeighbors: upcomingNeighborTargets,
         observedPartnerWorld: partnerWorld,
       })
     }
@@ -553,6 +568,7 @@ export async function runControllerStep({
         planSource,
         solveElapsedMs,
         observedNeighbors: neighborTargets,
+        observedUpcomingNeighbors: upcomingNeighborTargets,
         observedPartnerWorld: partnerWorld,
       })
     }
@@ -602,6 +618,9 @@ export async function runControllerStep({
     const neighborTargets = (typeof fetchNeighborsFn === 'function' && reconcileSummary.remainingUnknown === 0)
       ? (await fetchNeighborsFn(rawWorld)) || []
       : []
+    const upcomingNeighborTargets = (typeof fetchUpcomingNeighborsFn === 'function' && reconcileSummary.remainingUnknown === 0)
+      ? (await fetchUpcomingNeighborsFn(planningWorld)) || []
+      : []
     const partnerWorld = typeof fetchPartnerWorldFn === 'function'
       ? await fetchPartnerWorldFn()
       : null
@@ -621,6 +640,7 @@ export async function runControllerStep({
       account,
       world: planningWorld,
       neighborTargets,
+      upcomingNeighborTargets,
       partnerWorld,
       knownSoldByIsleIndex,
       userConstraints: resolvedUserConstraints,
@@ -672,6 +692,7 @@ export async function runControllerStep({
       planSource: 'inline',
       solveElapsedMs,
       observedNeighbors: neighborTargets,
+      observedUpcomingNeighbors: upcomingNeighborTargets,
       observedPartnerWorld: partnerWorld,
     })
   }

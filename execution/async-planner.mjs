@@ -3,18 +3,78 @@ import { Worker } from 'node:worker_threads'
 import { buildObjectiveConfig } from '../model/objective.mjs'
 import { compileExecutablePrefix, computeEarliestDomesticTransitionSec } from '../planner/compile-prefix.mjs'
 
-export function buildNeighborSignature(neighborTargets = []) {
-  if (!Array.isArray(neighborTargets) || neighborTargets.length === 0) return 'none'
-  const canonical = neighborTargets
-    .map((nt) => ({
-      id: String(nt?.id ?? nt?.owner?.id ?? ''),
-      rev: nt?.rev ?? null,
-      plots: (nt?.state?.plots || nt?.plots || []).length,
-      barn: (nt?.state?.barn || nt?.barn || []).length,
-      guardUntil: nt?.guard?.until ?? nt?.state?.guardUntil ?? 0,
-    }))
-    .sort((a, b) => a.id.localeCompare(b.id))
-  return crypto.createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex').slice(0, 16)
+function canonicalizeBeliefItem(b) {
+  return {
+    targetId: String(b?.targetId ?? b?.id ?? ''),
+    unlockAtSec: Number(b?.unlockAtSec ?? b?.expectedUnlockAt ?? 0),
+    exactUnlockKnown: Boolean(b?.exactUnlockKnown),
+    totalSpots: Number(b?.totalSpots ?? b?.upcomingSpots ?? 0),
+    spotCounts: b?.spotCounts || null,
+    lootBag: b?.lootBag || null,
+    energyCost: Number(b?.energyCost ?? b?.projectedEnergyCost ?? 0),
+    hasGuard: Boolean(b?.hasGuard ?? b?.guard),
+    detectionProb: Number(b?.detectionProb ?? 0),
+    ownerAlertId: b?.ownerAlertId || null,
+    winInterval: b?.winInterval || null,
+    lossInterval: b?.lossInterval || null,
+    estimatedFineOnLoss: Number(b?.estimatedFineOnLoss ?? 0),
+  }
+}
+
+export function buildNeighborSignature(neighborTargets = [], upcomingOrEnvelope = null) {
+  const readyList = Array.isArray(neighborTargets) ? neighborTargets : []
+  const envReadyBeliefs = Array.isArray(upcomingOrEnvelope?.beliefs?.visitBeliefs)
+    ? upcomingOrEnvelope.beliefs.visitBeliefs
+    : null
+  const upcomingList = Array.isArray(upcomingOrEnvelope)
+    ? upcomingOrEnvelope
+    : (Array.isArray(upcomingOrEnvelope?.beliefs?.upcomingVisitBeliefs)
+        ? upcomingOrEnvelope.beliefs.upcomingVisitBeliefs
+        : [])
+
+  if (readyList.length === 0 && (!envReadyBeliefs || envReadyBeliefs.length === 0) && upcomingList.length === 0) {
+    return 'none'
+  }
+
+  const canonicalReady = envReadyBeliefs && envReadyBeliefs.length > 0
+    ? envReadyBeliefs.map(canonicalizeBeliefItem).sort((a, b) => a.targetId.localeCompare(b.targetId))
+    : readyList
+        .map((nt) => {
+          const rawPlots = nt?.isle?.plots || nt?.state?.plots || nt?.plots || []
+          const rawBarn = nt?.isle?.barn || nt?.state?.barn || nt?.barn || []
+          return {
+            id: String(nt?.id ?? nt?.owner?.id ?? ''),
+            rev: nt?.rev ?? null,
+            plots: rawPlots.map((p) => (p ? [p.c ?? null, p.stage ?? null, Boolean(p.steal), p.stolen ?? 0] : null)),
+            barn: rawBarn.map((p) => (p ? [p.k ?? null, Boolean(p.steal), p.stolen ?? 0] : null)),
+            guard: Boolean(nt?.owner?.guard ?? nt?.isle?.guard ?? nt?.guard),
+            guardUntil: nt?.guard?.until ?? nt?.state?.guardUntil ?? 0,
+            posterior: nt?.posterior
+              ? { winInterval: nt.posterior.winInterval || null, lossInterval: nt.posterior.lossInterval || null }
+              : null,
+          }
+        })
+        .sort((a, b) => a.id.localeCompare(b.id))
+
+  const canonicalUpcoming = upcomingList
+    .map(canonicalizeBeliefItem)
+    .sort((a, b) => (a.unlockAtSec - b.unlockAtSec) || a.targetId.localeCompare(b.targetId))
+
+  const payload = canonicalUpcoming.length > 0
+    ? { ready: canonicalReady, upcoming: canonicalUpcoming }
+    : canonicalReady
+  return crypto.createHash('sha256').update(JSON.stringify(payload), 'utf8').digest('hex').slice(0, 16)
+}
+
+function computeEarliestUpcomingUnlockSec(envelope) {
+  const list = envelope?.beliefs?.upcomingVisitBeliefs
+  if (!Array.isArray(list) || list.length === 0) return Infinity
+  let earliest = Infinity
+  for (const b of list) {
+    const u = Number(b?.unlockAtSec)
+    if (Number.isFinite(u) && u > 0 && u < earliest) earliest = u
+  }
+  return earliest
 }
 
 /**
@@ -43,9 +103,10 @@ export class PlanCache {
     if (!account || !worldBefore || !plan) return null
     const bucket0 = plan.trunkBuckets?.[0]
     const isWaitPlan = (bucket0?.domesticActions?.length || 0) === 0 && (bucket0?.visitActions?.length || 0) === 0
-    const invalidateAtSec = adapter
+    const domesticInvalidateAtSec = adapter
       ? computeEarliestDomesticTransitionSec(adapter, worldBefore, isWaitPlan ? plan.nextWakeSec : null)
       : Infinity
+    const invalidateAtSec = Math.min(domesticInvalidateAtSec, computeEarliestUpcomingUnlockSec(envelope))
     const entry = {
       account,
       rev: Number(worldBefore.rev ?? -1),
@@ -352,9 +413,10 @@ export class AsyncPlanManager {
 
     const jobWorld = envelope.observed.world
     const jobAtSec = Math.floor(Number(jobWorld?.now || 0))
-    const jobInvalidateAtSec = adapter
-      ? computeEarliestDomesticTransitionSec(adapter, jobWorld, null)
-      : Infinity
+    const jobInvalidateAtSec = Math.min(
+      adapter ? computeEarliestDomesticTransitionSec(adapter, jobWorld, null) : Infinity,
+      computeEarliestUpcomingUnlockSec(envelope)
+    )
     const nowStartMs = nowMsFn()
     const rawTotalBudgetMs = Number.isFinite(deadlineAtMs)
       ? Math.max(0, deadlineAtMs - nowStartMs)
@@ -433,7 +495,7 @@ export class AsyncPlanManager {
     const objCfg = objectiveCfg?.objectiveHash
       ? objectiveCfg
       : buildObjectiveConfig(objectiveCfg || {})
-    const neighborSig = buildNeighborSignature(neighborTargets)
+    const neighborSig = buildNeighborSignature(neighborTargets, envelope)
     const world = envelope.observed.world
 
     // 1. Fast-path PlanCache hit (< 1ms, zero worker overhead!)
@@ -647,7 +709,7 @@ export class AsyncPlanManager {
     const objCfg = objectiveCfg?.objectiveHash
       ? objectiveCfg
       : buildObjectiveConfig(objectiveCfg || {})
-    const neighborSig = buildNeighborSignature(neighborTargets)
+    const neighborSig = buildNeighborSignature(neighborTargets, envelope)
     const already = this.cache.getValid({
       adapter,
       account,

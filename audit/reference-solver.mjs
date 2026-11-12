@@ -5,7 +5,10 @@ import {
   discountFactor,
   evaluateTrajectoryObjective,
 } from '../model/objective.mjs'
-import { quoteFutureItemUnderScenario } from '../model/observations.mjs'
+import {
+  quoteFutureItemUnderScenario,
+  recomputeVisitBeliefForVisitor,
+} from '../model/observations.mjs'
 
 /**
  * Layer 2 Independent Reference & Counterfactual Solver (`audit/reference-solver.mjs`)
@@ -22,6 +25,7 @@ import { quoteFutureItemUnderScenario } from '../model/observations.mjs'
 function buildIndependentDecisionTimes(adapter, world, {
   horizonSec,
   deterministicArrivals = [],
+  upcomingRaidSecs = [],
   maxSteps = 8,
 } = {}) {
   adapter.syncClock(world?.clockStart)
@@ -32,6 +36,11 @@ function buildIndependentDecisionTimes(adapter, world, {
   for (const arr of deterministicArrivals || []) {
     if (Number.isFinite(arr?.atSec) && arr.atSec >= t0 && arr.atSec <= tEnd) {
       pts.add(Math.floor(arr.atSec))
+    }
+  }
+  for (const rSec of upcomingRaidSecs || []) {
+    if (Number.isFinite(rSec) && rSec > t0 && rSec <= tEnd) {
+      pts.add(Math.floor(rSec))
     }
   }
 
@@ -102,6 +111,145 @@ function addArrivalsToWorld(world, arrivals) {
     next.state.inv[g.id][q] += Math.floor(g.n)
   }
   return next
+}
+
+function applyIndependentRaidAtStep(adapter, worldAtStep, raidBelief, {
+  atSec,
+  prices = {},
+  allowedSet,
+  constraints = {},
+} = {}) {
+  const { R } = adapter
+  const eff = raidBelief && (raidBelief.plotEntries || raidBelief.penEntries)
+    ? recomputeVisitBeliefForVisitor(adapter, raidBelief, worldAtStep)
+    : raidBelief
+  const neededEn = Math.max(0, Math.floor(Number(eff?.energyCost || 0)))
+  if (!(neededEn > 0) || !(Number(eff?.totalSpots || 0) > 0)) {
+    return { feasible: false }
+  }
+
+  let prepWorld = adapter.advanceTimeOnly(worldAtStep, atSec, { futurePrices: prices })
+  const prepActs = []
+  let curEn = Math.max(0, Math.floor(Number(prepWorld.state?.en || 0)))
+  const rawMax = Number(R.energyMax(prepWorld.state))
+  const enMax = Number.isFinite(rawMax) && rawMax > 0 ? rawMax : 100
+
+  if (curEn < neededEn) {
+    const unitPool = []
+    if (allowedSet.has('eat')) {
+      const specs = typeof adapter.listDeterministicEdibleSpecs === 'function'
+        ? adapter.listDeterministicEdibleSpecs()
+        : []
+      for (const sp of specs) {
+        const have = sp.kind === 'snack'
+          ? Math.min(
+              adapter.availableInv(prepWorld.state, sp.id, 0),
+              sp.dailyCap != null ? Math.max(0, sp.dailyCap - Number(prepWorld.state.cnt?.[sp.id] || 0)) : 999
+            )
+          : adapter.availableInv(prepWorld.state, sp.id, sp.q)
+        if (!(have > 0) || !(sp.energyGain > 0)) continue
+        const pUnit = sp.kind === 'snack'
+          ? 0
+          : Math.round(Number(prices?.[sp.id] || R.BASE_PRICE?.[sp.id] || 0) * (R.QUALITY?.[sp.q] ?? 1))
+        unitPool.push({
+          kind: 'eat',
+          act: sp.kind === 'snack' ? { a: 'eat', id: sp.id } : { a: 'eat', id: sp.id, q: sp.q },
+          rem: have,
+          gain: sp.energyGain,
+          cpe: pUnit / sp.energyGain,
+        })
+      }
+    }
+    if (allowedSet.has('coffee')) {
+      const cPrice = R.WORLD?.coffee?.price || 15000
+      const cGain = R.WORLD?.coffee?.energy || 60
+      const cLeft = Math.max(0, (R.WORLD?.daily?.coffee || 3) - Number(prepWorld.state.cnt?.coffee || 0))
+      const freeCash = Math.max(0, Number(prepWorld.coins || 0) - Number(constraints.cashReserveFloor || 0))
+      const canC = Math.min(cLeft, Math.floor(freeCash / cPrice))
+      if (canC > 0 && cGain > 0) {
+        unitPool.push({
+          kind: 'coffee',
+          act: { a: 'coffee' },
+          rem: canC,
+          gain: cGain,
+          cpe: cPrice / cGain,
+        })
+      }
+    }
+    unitPool.sort((a, b) => a.cpe - b.cpe)
+
+    while (curEn < neededEn) {
+      let picked = null
+      for (const u of unitPool) {
+        if (u.rem <= 0) continue
+        if (u.kind === 'eat' && curEn >= enMax) continue
+        picked = u
+        break
+      }
+      if (!picked) break
+      const step = adapter.simulateBatch(prepWorld, [picked.act], { t: atSec, prices })
+      if (!step.allOk) {
+        picked.rem = 0
+        continue
+      }
+      picked.rem -= 1
+      prepActs.push(picked.act)
+      prepWorld = step.afterWorld
+      curEn = Math.max(0, Math.floor(Number(prepWorld.state?.en || 0)))
+    }
+  }
+
+  if (curEn < neededEn) {
+    return { feasible: false }
+  }
+
+  const raidWorld = structuredClone(prepWorld)
+  raidWorld.state.en = Math.max(0, curEn - neededEn)
+  raidWorld.state.inv ||= {}
+
+  const pCatch = Math.max(0, Math.min(1, Number(eff.detectionProb || 0)))
+  const pWin = eff.hasGuard ? Math.max(0, Math.min(1, Number(eff.winProbGivenCatch || 0))) : 0
+  const fineRate = R.WORLD?.fine?.rate ?? 0.08
+  const fineCap = R.WORLD?.fine?.cap ?? 500
+  const expFine = pCatch * (1 - pWin) * Math.min(fineCap, Math.round(Number(raidWorld.coins || 0) * fineRate))
+  const fineCoins = Math.round(expFine)
+  if (fineCoins > 0) {
+    raidWorld.coins = Math.max(0, Number(raidWorld.coins || 0) - fineCoins)
+  }
+
+  const allIds = new Set([
+    ...Object.keys(eff.lootBag || {}),
+    ...Object.keys(eff.guardWinLootBag || {}),
+  ])
+  let fracCash = 0
+  for (const id of allIds) {
+    const uQty = Number(eff.lootBag?.[id] || 0)
+    const gQty = Number(eff.guardWinLootBag?.[id] ?? uQty)
+    const expQty = (1 - pCatch) * uQty + pCatch * pWin * gQty
+    if (!(expQty > 0)) continue
+    const intN = Math.floor(expQty + 1e-9)
+    const frac = Math.max(0, expQty - intN)
+    if (intN > 0) {
+      raidWorld.state.inv[id] ||= [0, 0, 0]
+      raidWorld.state.inv[id][0] += intN
+    }
+    if (frac > 1e-9) {
+      fracCash += frac * Number(prices?.[id] || R.BASE_PRICE?.[id] || 0)
+    }
+  }
+
+  const extraCashEvents = []
+  const prepCoinDelta = Number(prepWorld.coins || 0) - Number(worldAtStep.coins || 0)
+  if (prepCoinDelta !== 0) extraCashEvents.push({ atSec, netCashDelta: prepCoinDelta })
+  if (expFine !== 0) extraCashEvents.push({ atSec, netCashDelta: -expFine })
+  if (fracCash > 1e-9) extraCashEvents.push({ atSec, netCashDelta: fracCash })
+
+  return {
+    feasible: true,
+    prepActs,
+    afterRaidWorld: raidWorld,
+    extraCashEvents,
+  }
 }
 
 /**
@@ -349,7 +497,7 @@ export function enumerateIndependentCandidateBatches(adapter, world, {
       const av = adapter.availableInvSnapshot(simF.afterWorld.state)
       const tot = (id) => (av[id]?.[0] || 0) + (av[id]?.[1] || 0) + (av[id]?.[2] || 0)
       const isleIdx = R.isleIndex(atSec)
-      const cLeft = Math.max(0, (R.WORLD?.daily?.craft || 80) - (simF.afterWorld.state?.iq?.d === isleIdx ? Number(simF.afterWorld.state.iq.craft || 0) : 0))
+      const cLeft = Math.max(0, (R.WORLD?.daily?.craft || 80) - (simF.afterWorld.state?.iq?.d === isleIdx ? Number(simF.state?.iq?.craft ?? simF.afterWorld.state.iq.craft ?? 0) : 0))
       for (const r of R.RECIPES || []) {
         if (!(r.price > 0)) continue
         const maxN = Math.min(
@@ -439,6 +587,53 @@ export function enumerateIndependentCandidateBatches(adapter, world, {
         addCandidate('farm-ready+sell', [...farmActs, ...makeSellAllActions(simFm.afterWorld.state)])
       }
     }
+    const farmNeedsStamina = farmActs.some((a) => a.a === 'harvest' || a.a === 'clear')
+    if (farmNeedsStamina && (can('eat') || can('coffee'))) {
+      const farmFoodStarters = []
+      const rawCap = Number(R.energyMax(refreshed.state))
+      const enMaxRef = Number.isFinite(rawCap) && rawCap > 0 ? rawCap : 100
+      if (can('eat') && refreshed.state.en < enMaxRef) {
+        const edibleSpecs = typeof adapter.listDeterministicEdibleSpecs === 'function'
+          ? adapter.listDeterministicEdibleSpecs()
+          : []
+        const seenEdibleIds = new Set()
+        for (const spec of edibleSpecs) {
+          if (seenEdibleIds.has(spec.id)) continue
+          const capLeft = spec.dailyCap != null
+            ? Math.max(0, spec.dailyCap - Number(refreshed.state.cnt?.[spec.id] || 0))
+            : 999
+          const avail = Math.min(capLeft, adapter.availableInv(refreshed.state, spec.id, spec.q))
+          if (avail > 0) {
+            seenEdibleIds.add(spec.id)
+            const singleAct = spec.kind === 'snack' ? { a: 'eat', id: spec.id } : { a: 'eat', id: spec.id, q: spec.q }
+            farmFoodStarters.push([singleAct])
+            if (avail >= 2 && Number(refreshed.state.en || 0) + Number(spec.energyGain || 0) < enMaxRef) {
+              farmFoodStarters.push([singleAct, singleAct])
+            }
+          }
+        }
+      }
+      if (
+        can('coffee') &&
+        Number(refreshed.state.cnt?.coffee || 0) < (R.WORLD?.daily?.coffee || 3) &&
+        Number(refreshed.coins || 0) - Number(constraints.cashReserveFloor || 0) >= (R.WORLD?.coffee?.price || 15000)
+      ) {
+        farmFoodStarters.push([{ a: 'coffee' }])
+      }
+      for (const fActs of farmFoodStarters) {
+        const combo = [...fActs, ...farmActs]
+        addCandidate(`stamina+farm-ready:${fActs[0].id || fActs[0].a}x${fActs.length}`, combo)
+        if (can('sell')) {
+          const simSF = adapter.simulateBatch(refreshed, combo, { t: atSec, prices })
+          if (simSF.allOk) {
+            addCandidate(
+              `stamina+farm-ready+sell:${fActs[0].id || fActs[0].a}x${fActs.length}`,
+              [...combo, ...makeSellAllActions(simSF.afterWorld.state)]
+            )
+          }
+        }
+      }
+    }
   }
 
   return candidates
@@ -461,16 +656,47 @@ export function auditDecisionAgainstReference(adapter, {
   scenarios = [{ id: 'baseline', weight: 1.0, externalSupplyFactor: 0.96 }],
   explicitPricesByStep = null,
   deterministicArrivals = [],
+  upcomingVisitBeliefs = [],
+  reservedStealUsedThisIsleDay = 0,
   objectiveCfg = buildObjectiveConfig(),
   allowedActionTypes = ['sell', 'craft', 'wait', 'stockBuy', 'eat', 'coffee'],
   constraints = {},
   maxSteps = 4,
   maxSearchNodes = 2500,
 } = {}) {
+  const t0Ref = Math.floor(Number(worldBefore?.now || 0))
+  const tEndRef = t0Ref + Math.max(0, Math.floor(objectiveCfg.horizonSec || 0))
+  const allowedRefSet = new Set(allowedActionTypes)
+  const minStealSpotsRef = Number(constraints?.minStealSpots || 0)
+  const upcomingRaidsBySec = new Map()
+  if (
+    allowedRefSet.has('visit') &&
+    constraints?.maxStealsPerIsleDay !== 0 &&
+    Array.isArray(upcomingVisitBeliefs)
+  ) {
+    for (const ub of upcomingVisitBeliefs) {
+      const uSec = Math.floor(Number(ub?.unlockAtSec))
+      if (
+        !ub ||
+        ub.targetId == null ||
+        !Number.isFinite(uSec) ||
+        uSec <= t0Ref ||
+        uSec > tEndRef ||
+        !(Number(ub.totalSpots || 0) > 0) ||
+        Number(ub.totalSpots || 0) < minStealSpotsRef
+      ) {
+        continue
+      }
+      if (!upcomingRaidsBySec.has(uSec)) upcomingRaidsBySec.set(uSec, [])
+      upcomingRaidsBySec.get(uSec).push(ub)
+    }
+  }
+
   const timeline = buildIndependentDecisionTimes(adapter, worldBefore, {
     horizonSec: objectiveCfg.horizonSec,
     deterministicArrivals,
-    maxSteps,
+    upcomingRaidSecs: [...upcomingRaidsBySec.keys()],
+    maxSteps: Math.max(maxSteps, maxSteps + Math.min(3, upcomingRaidsBySec.size)),
   })
   const steps = timeline.steps
   const tEnd = timeline.tEnd
@@ -506,11 +732,40 @@ export function auditDecisionAgainstReference(adapter, {
 
   let nodesVisited = 0
   let hitNodeCap = false
+  const maxPerIsleStealRef = constraints?.maxStealsPerIsleDay == null
+    ? Infinity
+    : Math.max(0, Number(constraints.maxStealsPerIsleDay))
 
-  const allowedRefSet = new Set(allowedActionTypes)
+  const buildStepRaidPreStates = (baseW, st, prices, baseCash, baseStealsByIsle) => {
+    const preStates = [{ world: baseW, cash: baseCash, stealsByIsle: baseStealsByIsle, raidTag: null }]
+    const raidsAtSt = upcomingRaidsBySec.get(st.atSec)
+    if (!raidsAtSt || raidsAtSt.length === 0 || !allowedRefSet.has('visit')) return preStates
+
+    const curUsed = baseStealsByIsle.get(st.isleIndex) || 0
+    if (curUsed >= maxPerIsleStealRef) return preStates
+
+    for (const rb of raidsAtSt) {
+      const rRes = applyIndependentRaidAtStep(adapter, baseW, rb, {
+        atSec: st.atSec,
+        prices,
+        allowedSet: allowedRefSet,
+        constraints,
+      })
+      if (!rRes.feasible) continue
+      const nextSteals = new Map(baseStealsByIsle)
+      nextSteals.set(st.isleIndex, curUsed + 1)
+      preStates.push({
+        world: rRes.afterRaidWorld,
+        cash: [...baseCash, ...rRes.extraCashEvents],
+        stealsByIsle: nextSteals,
+        raidTag: { a: 'visit', targetId: rb.targetId, prepActs: rRes.prepActs },
+      })
+    }
+    return preStates
+  }
 
   // Recursive best-continuation evaluator for a single scenario from `stepIdx` onwards
-  const evalBestContinuationSingleScenario = (curWorld, subSteps, idx, sc, cashEvents, soldByIsle) => {
+  const evalBestContinuationSingleScenario = (curWorld, subSteps, idx, sc, cashEvents, soldByIsle, stealsByIsle) => {
     if (idx >= subSteps.length) {
       const prevSoldAtEnd = soldByIsle.get(adapter.R.isleIndex(tEnd) - 1) || null
       const termPrices = sc.explicitTerminalPrices
@@ -554,35 +809,39 @@ export function auditDecisionAgainstReference(adapter, {
     let wAtStep = adapter.advanceTimeOnly(curWorld, st.atSec, { futurePrices: prices })
     wAtStep = addArrivalsToWorld(wAtStep, st.arrivals)
 
-    const cands = enumerateIndependentCandidateBatches(adapter, wAtStep, {
-      atSec: st.atSec,
-      prices,
-      allowedActionTypes,
-      constraints,
-    })
-
+    const preStates = buildStepRaidPreStates(wAtStep, st, prices, cashEvents, stealsByIsle)
     let bestVal = -Infinity
     let bestTrace = []
 
-    for (const c of cands) {
+    for (const ps of preStates) {
       if (hitNodeCap && bestVal > -Infinity) break
-      const nextCash = [...cashEvents]
-      const deltaC = Number(c.simAfterWorld.coins || 0) - Number(wAtStep.coins || 0)
-      if (deltaC !== 0) nextCash.push({ atSec: st.atSec, netCashDelta: deltaC })
+      const cands = enumerateIndependentCandidateBatches(adapter, ps.world, {
+        atSec: st.atSec,
+        prices,
+        allowedActionTypes,
+        constraints,
+      })
+      for (const c of cands) {
+        if (hitNodeCap && bestVal > -Infinity) break
+        const nextCash = [...ps.cash]
+        const deltaC = Number(c.simAfterWorld.coins || 0) - Number(ps.world.coins || 0)
+        if (deltaC !== 0) nextCash.push({ atSec: st.atSec, netCashDelta: deltaC })
 
-      const nextSold = new Map(soldByIsle)
-      for (const a of c.actions) {
-        if (a.a === 'sell') {
-          const m = { ...(nextSold.get(st.isleIndex) || {}) }
-          m[a.id] = (m[a.id] || 0) + Number(a.n || 0)
-          nextSold.set(st.isleIndex, m)
+        const nextSold = new Map(soldByIsle)
+        for (const a of c.actions) {
+          if (a.a === 'sell') {
+            const m = { ...(nextSold.get(st.isleIndex) || {}) }
+            m[a.id] = (m[a.id] || 0) + Number(a.n || 0)
+            nextSold.set(st.isleIndex, m)
+          }
         }
-      }
 
-      const sub = evalBestContinuationSingleScenario(c.simAfterWorld, subSteps, idx + 1, sc, nextCash, nextSold)
-      if (sub.bestVal > bestVal) {
-        bestVal = sub.bestVal
-        bestTrace = [{ atSec: st.atSec, actions: c.actions }, ...sub.bestTrace]
+        const sub = evalBestContinuationSingleScenario(c.simAfterWorld, subSteps, idx + 1, sc, nextCash, nextSold, ps.stealsByIsle)
+        if (sub.bestVal > bestVal) {
+          bestVal = sub.bestVal
+          const recActs = ps.raidTag ? [ps.raidTag, ...c.actions] : c.actions
+          bestTrace = [{ atSec: st.atSec, actions: recActs }, ...sub.bestTrace]
+        }
       }
     }
 
@@ -590,12 +849,12 @@ export function auditDecisionAgainstReference(adapter, {
   }
 
   // Recursive evaluator over shared non-anticipative trunk steps `trunkList[tIdx..]`, then branching across scenarios!
-  const evalSharedTrunkList = (curWorld, trunkList, tIdx, cashEvents, soldByIsle) => {
+  const evalSharedTrunkList = (curWorld, trunkList, tIdx, cashEvents, soldByIsle, stealsByIsle) => {
     if (tIdx >= trunkList.length) {
       let expVal = 0
       const byScenario = {}
       for (const sc of normScenarios) {
-        const res = evalBestContinuationSingleScenario(curWorld, branchSteps, 0, sc, cashEvents, soldByIsle)
+        const res = evalBestContinuationSingleScenario(curWorld, branchSteps, 0, sc, cashEvents, soldByIsle, stealsByIsle)
         expVal += sc.weight * res.bestVal
         byScenario[sc.id] = res
       }
@@ -606,7 +865,7 @@ export function auditDecisionAgainstReference(adapter, {
       hitNodeCap = true
       let expVal = 0
       for (const sc of normScenarios) {
-        const res = evalBestContinuationSingleScenario(curWorld, branchSteps, 0, sc, cashEvents, soldByIsle)
+        const res = evalBestContinuationSingleScenario(curWorld, branchSteps, 0, sc, cashEvents, soldByIsle, stealsByIsle)
         expVal += sc.weight * res.bestVal
       }
       return { bestVal: expVal, bestTrunkTrace: [], byScenario: {} }
@@ -617,37 +876,41 @@ export function auditDecisionAgainstReference(adapter, {
     let wAtStep = adapter.advanceTimeOnly(curWorld, st.atSec, { futurePrices: prices })
     wAtStep = addArrivalsToWorld(wAtStep, st.arrivals)
 
-    const cands = enumerateIndependentCandidateBatches(adapter, wAtStep, {
-      atSec: st.atSec,
-      prices,
-      allowedActionTypes,
-      constraints,
-    })
-
+    const preStates = buildStepRaidPreStates(wAtStep, st, prices, cashEvents, stealsByIsle)
     let bestVal = -Infinity
     let bestTrunkTrace = []
     let bestScen = {}
 
-    for (const c of cands) {
+    for (const ps of preStates) {
       if (hitNodeCap && bestVal > -Infinity) break
-      const nextCash = [...cashEvents]
-      const deltaC = Number(c.simAfterWorld.coins || 0) - Number(wAtStep.coins || 0)
-      if (deltaC !== 0) nextCash.push({ atSec: st.atSec, netCashDelta: deltaC })
+      const cands = enumerateIndependentCandidateBatches(adapter, ps.world, {
+        atSec: st.atSec,
+        prices,
+        allowedActionTypes,
+        constraints,
+      })
+      for (const c of cands) {
+        if (hitNodeCap && bestVal > -Infinity) break
+        const nextCash = [...ps.cash]
+        const deltaC = Number(c.simAfterWorld.coins || 0) - Number(ps.world.coins || 0)
+        if (deltaC !== 0) nextCash.push({ atSec: st.atSec, netCashDelta: deltaC })
 
-      const nextSold = new Map(soldByIsle)
-      for (const a of c.actions) {
-        if (a.a === 'sell') {
-          const m = { ...(nextSold.get(st.isleIndex) || {}) }
-          m[a.id] = (m[a.id] || 0) + Number(a.n || 0)
-          nextSold.set(st.isleIndex, m)
+        const nextSold = new Map(soldByIsle)
+        for (const a of c.actions) {
+          if (a.a === 'sell') {
+            const m = { ...(nextSold.get(st.isleIndex) || {}) }
+            m[a.id] = (m[a.id] || 0) + Number(a.n || 0)
+            nextSold.set(st.isleIndex, m)
+          }
         }
-      }
 
-      const sub = evalSharedTrunkList(c.simAfterWorld, trunkList, tIdx + 1, nextCash, nextSold)
-      if (sub.bestVal > bestVal) {
-        bestVal = sub.bestVal
-        bestTrunkTrace = [{ atSec: st.atSec, actions: c.actions }, ...sub.bestTrunkTrace]
-        bestScen = sub.byScenario
+        const sub = evalSharedTrunkList(c.simAfterWorld, trunkList, tIdx + 1, nextCash, nextSold, ps.stealsByIsle)
+        if (sub.bestVal > bestVal) {
+          bestVal = sub.bestVal
+          const recActs = ps.raidTag ? [ps.raidTag, ...c.actions] : c.actions
+          bestTrunkTrace = [{ atSec: st.atSec, actions: recActs }, ...sub.bestTrunkTrace]
+          bestScen = sub.byScenario
+        }
       }
     }
 
@@ -661,6 +924,10 @@ export function auditDecisionAgainstReference(adapter, {
   w0 = addArrivalsToWorld(w0, step0.arrivals)
   const minGapSec = adapter.R.WORLD?.minGap || 2
   const baseIsle = adapter.R.isleIndex(timeline.t0)
+  const initStealsByIsle = new Map()
+  if (Number(reservedStealUsedThisIsleDay || 0) > 0) {
+    initStealsByIsle.set(baseIsle, Math.max(0, Math.floor(Number(reservedStealUsedThisIsleDay))))
+  }
 
   const rootCandidates = enumerateIndependentCandidateBatches(adapter, w0, {
     atSec: step0.atSec,
@@ -724,7 +991,7 @@ export function auditDecisionAgainstReference(adapter, {
       }
     }
     const remTrunk = buildRemainingTrunkForFirstBatch(actions0)
-    const cont = evalSharedTrunkList(sim0.afterWorld, remTrunk, 0, cash0, sold0)
+    const cont = evalSharedTrunkList(sim0.afterWorld, remTrunk, 0, cash0, sold0, initStealsByIsle)
     return {
       legal: true,
       afterStep0World: sim0.afterWorld,
@@ -752,7 +1019,7 @@ export function auditDecisionAgainstReference(adapter, {
     }
   }
 
-  const hasStochasticAllowed = (allowedActionTypes || []).some((a) => adapter.isStochasticAction({ a }))
+  const hasStochasticAllowed = (allowedActionTypes || []).some((a) => a === 'visit' || adapter.isStochasticAction({ a }))
 
   // Compute an independent, untruncated weak-duality upper bound U(a_actual) >= sup_{π after a_actual} E[J(π)]
   // over ALL legal multi-batch continuations (immune to batch-grid discretization, candidate pruning, and maxSteps!)

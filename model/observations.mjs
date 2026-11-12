@@ -312,11 +312,117 @@ export function recomputeVisitBeliefForVisitor(adapter, baseBelief, visitorWorld
   }
 }
 
+export function buildUpcomingVisitBelief(adapter, visitorWorld, upcomingTarget) {
+  if (!upcomingTarget || !visitorWorld) return null
+  const unlockAtSec = Math.floor(Number(
+    upcomingTarget.unlockAtSec ?? upcomingTarget.expectedUnlockAt ?? visitorWorld.now ?? 0
+  ))
+  if (!Number.isFinite(unlockAtSec) || unlockAtSec <= 0) return null
+  const exactUnlockKnown = Boolean(upcomingTarget.exactUnlockKnown ?? false)
+  const futureVisitor = unlockAtSec > Number(visitorWorld.now || 0)
+    ? adapter.advanceTimeOnly(visitorWorld, unlockAtSec)
+    : visitorWorld
+
+  let base = null
+  if (upcomingTarget.waveBundle?.isle) {
+    base = buildVisitTargetBelief(adapter, futureVisitor, upcomingTarget.waveBundle, unlockAtSec)
+  } else if (upcomingTarget.isle) {
+    const rawPlots = upcomingTarget.isle.plots || []
+    const rawBarn = upcomingTarget.isle.barn || []
+    const statePlots = upcomingTarget.state?.plots || rawPlots
+    const stateBarn = upcomingTarget.state?.barn || rawBarn
+    const protectSec = Number(adapter.R?.WORLD?.steal?.delay ?? 1800)
+    const nowRef = Math.floor(Number(visitorWorld.now || 0))
+    const sprLvl = Number(upcomingTarget.state?.tools?.spr ?? upcomingTarget.isle?.spr ?? 0)
+    const sprCover = sprLvl > 0 ? Number(adapter.R?.SPRINKLER?.[sprLvl]?.cover ?? 999) : 0
+
+    const projectedPlots = rawPlots.map((p, idx) => {
+      if (!p || !p.c) return p
+      if (p.steal) return p
+      if (Number(p.stolen || 0) >= Number(adapter.R?.WORLD?.steal?.perPlotCap ?? 2)) return p
+      const rp = statePlots[idx] || p
+      if (rp?.t != null && typeof adapter.exactPlotTimings === 'function') {
+        const pt = adapter.exactPlotTimings(rp, Boolean(p.auto) || idx < sprCover, nowRef, visitorWorld.clockStart, {
+          protectSec,
+          isAlreadyRipe: p.stage === 3,
+        })
+        if (pt && pt.unlockAt <= unlockAtSec) {
+          return { ...p, stage: 3, steal: true, stolen: Number(p.stolen || 0) }
+        }
+        return p
+      }
+      if (p.stage === 3 && upcomingTarget.unlockAtSec != null) {
+        return { ...p, stage: 3, steal: true, stolen: Number(p.stolen || 0) }
+      }
+      return p
+    })
+
+    const projectedBarn = rawBarn.map((pen, idx) => {
+      if (!pen || !pen.k) return pen
+      if (pen.steal) return pen
+      const rPen = stateBarn[idx] || pen
+      if (rPen?.t != null && typeof adapter.exactBarnTimings === 'function') {
+        const bt = adapter.exactBarnTimings(rPen, nowRef, visitorWorld.clockStart, { protectSec })
+        if (bt?.stealUnlockAt != null && bt.stealUnlockAt <= unlockAtSec) {
+          return { ...pen, steal: true, stolen: Number(pen.stolen || 0) }
+        }
+      }
+      return pen
+    })
+
+    const projectedBundle = {
+      ...upcomingTarget,
+      isle: { ...upcomingTarget.isle, plots: projectedPlots, barn: projectedBarn },
+    }
+    base = buildVisitTargetBelief(adapter, futureVisitor, projectedBundle, unlockAtSec)
+  } else {
+    const summary = upcomingTarget.upcomingBeliefSummary || upcomingTarget.beliefSummary || upcomingTarget
+    if (
+      summary &&
+      (Number(summary.totalSpots || 0) > 0 ||
+        (summary.spotCounts && Object.keys(summary.spotCounts).length > 0) ||
+        (summary.lootBag && Object.keys(summary.lootBag).length > 0))
+    ) {
+      base = recomputeVisitBeliefForVisitor(adapter, {
+        targetId: summary.targetId ?? upcomingTarget.targetId ?? upcomingTarget.id ?? null,
+        targetName: summary.targetName || upcomingTarget.targetName || upcomingTarget.name || String(upcomingTarget.id || ''),
+        totalSpots: Number(summary.totalSpots || upcomingTarget.upcomingSpots || 0),
+        spotCounts: summary.spotCounts || null,
+        lootBag: summary.lootBag || null,
+        unitsPerSpot: Number(summary.unitsPerSpot || 1),
+        hasGuard: Boolean(summary.hasGuard ?? upcomingTarget.guard),
+        ownerAlertId: summary.ownerAlertId || null,
+        winInterval: Array.isArray(summary.winInterval)
+          ? [...summary.winInterval]
+          : (Boolean(summary.hasGuard ?? upcomingTarget.guard) ? [0.25, 0.85] : [1, 1]),
+        lossInterval: Array.isArray(summary.lossInterval)
+          ? [...summary.lossInterval]
+          : (Boolean(summary.hasGuard ?? upcomingTarget.guard) ? [0.15, 0.75] : [0, 0]),
+        sampleCount: Number(summary.sampleCount || 0),
+        estimationSource: summary.estimationSource || (Boolean(summary.hasGuard ?? upcomingTarget.guard) ? 'unobserved-wide-prior' : 'no-guard-deterministic'),
+        tacticalDecision: summary.tacticalDecision || null,
+        optimalLoadout: summary.optimalLoadout || upcomingTarget.optimalLoadout || null,
+        numGearChanges: Number(summary.numGearChanges ?? upcomingTarget.numGearChanges ?? 0),
+      }, futureVisitor, unlockAtSec)
+    }
+  }
+  if (!base || !(Number(base.totalSpots || 0) > 0)) return null
+  const resolvedId = base.targetId ?? upcomingTarget.targetId ?? upcomingTarget.id ?? null
+  return {
+    ...base,
+    targetId: resolvedId,
+    targetName: base.targetName || upcomingTarget.targetName || upcomingTarget.name || String(resolvedId ?? ''),
+    unlockAtSec,
+    exactUnlockKnown,
+  }
+}
+
 export function buildObservationEnvelope(adapter, {
   account = 'main',
   world,
   observedAtMs = Date.now(),
   neighborTargets = [],
+  upcomingNeighborTargets = [],
   partnerWorld = null,
   knownSoldByIsleIndex = null,
   scenarios = DEFAULT_EXTERNAL_SUPPLY_SCENARIOS,
@@ -338,6 +444,10 @@ export function buildObservationEnvelope(adapter, {
 
   const constraints = normalizeUserConstraints(userConstraints, account)
   const visitBeliefs = (neighborTargets || []).map((t) => buildVisitTargetBelief(adapter, cleanWorld, t, cleanWorld.now))
+  const upcomingVisitBeliefs = (upcomingNeighborTargets || [])
+    .map((t) => buildUpcomingVisitBelief(adapter, cleanWorld, t))
+    .filter((b) => b && Number(b.unlockAtSec || 0) > cleanWorld.now)
+    .sort((a, b) => (a.unlockAtSec - b.unlockAtSec) || (Number(a.targetId || 0) - Number(b.targetId || 0)))
 
   const cleanSoldByIsle = {}
   if (knownSoldByIsleIndex && typeof knownSoldByIsleIndex === 'object') {
@@ -369,6 +479,7 @@ export function buildObservationEnvelope(adapter, {
       supplyInferences,
       scenarios: scenarios.map((s) => ({ ...s })),
       visitBeliefs,
+      upcomingVisitBeliefs,
     },
     constraints,
     constraintsHash: computeConstraintsHash(constraints),

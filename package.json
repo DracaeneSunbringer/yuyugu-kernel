@@ -1,6 +1,6 @@
 {
   "name": "yuyugu-unified-kernel",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "license": "MIT",
   "type": "module",
   "repository": "https://github.com/DracaeneSunbringer/yuyugu-kernel",
@@ -8,7 +8,7 @@
   "releaseNotes": {
     "date": "2026-11-12",
     "severity": "normal",
-    "summary": "统一作物物理生命周期与跨季口径（rules-adapter 单一真源）：修正单茬/多茬跨季合法收成判定、显式传入 clockStart 与跨长夜换季边界、消除续期估值清苗体力重复扣算，并打通跨季收获后即时清苗与复种闭环",
+    "summary": "统一即将解锁偷菜、自家农事与补体资源时间轴（v1.4.2）：移除固定体力保底对自家收菜的压制，改为在完整轨迹目标下联合比较不偷与未来出击子集、口粮/咖啡机会成本及缺体等待损失，并补齐过渡前缀口粮最小挽救与独立反事实审计",
     "upgradeCommand": "git pull"
   },
   "engines": {

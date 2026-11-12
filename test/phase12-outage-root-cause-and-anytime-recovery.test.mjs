@@ -149,8 +149,12 @@ test('Phase 12.1: Reproduces 2026-11-12 high-stock 24-plot outage snapshot — f
     assert.equal(out.planSource, 'solved')
     assert.equal(out.diagnostics.clockDriftSec, 38)
     assert.ok(
-      out.plan.quality.elapsedMs < 15000,
-      `Expected base solver compute time < 15000ms (~5.5s standalone), got ${out.plan.quality.elapsedMs}ms`
+      out.plan.quality.cpuMs < 12000,
+      `Expected base solver CPU compute time < 12000ms (~5.5s actual), got ${out.plan.quality.cpuMs}ms`
+    )
+    assert.ok(
+      out.plan.quality.elapsedMs < 22000,
+      `Expected base solver wall-clock < 22000ms even under 4x concurrent test load (~5.5s standalone), got ${out.plan.quality.elapsedMs}ms`
     )
     assert.ok(
       out.diagnostics.solveElapsedMs < 30000,

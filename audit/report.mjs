@@ -29,6 +29,8 @@ export async function buildAuditDecisionReport({
   scenarios = null,
   explicitPricesByStep = null,
   deterministicArrivals = [],
+  upcomingVisitBeliefs = null,
+  reservedStealUsedThisIsleDay = null,
   objectiveCfg = null,
   allowedActionTypes = ['sell', 'craft', 'wait', 'stockBuy', 'eat', 'coffee'],
   constraints = null,
@@ -76,6 +78,12 @@ export async function buildAuditDecisionReport({
       const archivedEnvelope = journal.readBlob(tx.envelopeRef)
       if (!scenarios && Array.isArray(archivedEnvelope?.beliefs?.scenarios) && archivedEnvelope.beliefs.scenarios.length > 0) {
         scenarios = archivedEnvelope.beliefs.scenarios
+      }
+      if (!upcomingVisitBeliefs && Array.isArray(archivedEnvelope?.beliefs?.upcomingVisitBeliefs)) {
+        upcomingVisitBeliefs = archivedEnvelope.beliefs.upcomingVisitBeliefs
+      }
+      if (reservedStealUsedThisIsleDay == null && archivedEnvelope?.reservedBudgets?.stealUsedOrReservedThisIsleDay != null) {
+        reservedStealUsedThisIsleDay = Number(archivedEnvelope.reservedBudgets.stealUsedOrReservedThisIsleDay || 0)
       }
       if (!constraints && archivedEnvelope?.constraints) {
         constraints = archivedEnvelope.constraints
@@ -133,6 +141,8 @@ export async function buildAuditDecisionReport({
     scenarios,
     explicitPricesByStep,
     deterministicArrivals,
+    upcomingVisitBeliefs: upcomingVisitBeliefs || [],
+    reservedStealUsedThisIsleDay: Number(reservedStealUsedThisIsleDay || 0),
     objectiveCfg,
     allowedActionTypes,
     constraints,
@@ -172,6 +182,8 @@ export async function buildAuditDecisionReport({
       scenarios: [{ ...exPostRealizedScenario, weight: 1.0 }],
       explicitPricesByStep: exPostRealizedScenario.explicitPricesByStep || explicitPricesByStep,
       deterministicArrivals,
+      upcomingVisitBeliefs: upcomingVisitBeliefs || [],
+      reservedStealUsedThisIsleDay: Number(reservedStealUsedThisIsleDay || 0),
       objectiveCfg,
       allowedActionTypes,
       constraints,

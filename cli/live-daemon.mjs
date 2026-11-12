@@ -148,6 +148,9 @@ export async function runLiveAccountTick({
           cashReserveFloor: Number(baseUserConstraints.cashReserveFloor || 0),
         })
       : null,
+    fetchUpcomingNeighborsFn: snipeScheduler?.isStealEnabled()
+      ? (w) => snipeScheduler.collectUpcomingTargetsForController(adapter, w)
+      : null,
     fetchPartnerWorldFn,
     sendActFn: async ({ operation, actions, worldBefore }) => {
       const r = await httpClient.postJson('/api/pet/world/act', {
@@ -193,9 +196,6 @@ export async function runLiveAccountTick({
     },
     objectiveCfg,
     userConstraints: (inLockWorld) => {
-      stamRes = snipeScheduler?.isStealEnabled()
-        ? snipeScheduler.computeImminentSnipeStaminaReservation(adapter, inLockWorld, inLockWorld.now)
-        : { staminaReserveFloor: 0, staminaReserveUntilSec: 0 }
       const nowW = Number(inLockWorld?.now || httpClient.estimatedServerNowSec())
       const capexDue = Boolean(baseUserConstraints.allowCapex) && (
         Boolean(runtimeState?.pendingCapex) ||
@@ -207,14 +207,8 @@ export async function runLiveAccountTick({
       effectiveConstraints = {
         ...baseUserConstraints,
         allowCapex: capexDue,
-        staminaReserveFloor: Math.max(
-          Number(baseUserConstraints.staminaReserveFloor || 0),
-          stamRes.staminaReserveFloor
-        ),
-        staminaReserveUntilSec: Math.max(
-          Number(baseUserConstraints.staminaReserveUntilSec || 0),
-          stamRes.staminaReserveUntilSec
-        ),
+        staminaReserveFloor: Number(baseUserConstraints.staminaReserveFloor || 0),
+        staminaReserveUntilSec: Number(baseUserConstraints.staminaReserveUntilSec || 0),
       }
       return effectiveConstraints
     },
@@ -232,6 +226,16 @@ export async function runLiveAccountTick({
     nowMsFn: () => httpClient.nowMsFn(),
     dryRun,
   })
+
+  if (controllerOut?.plan) {
+    stamRes = {
+      mode: 'unified-timeline',
+      committedUpcomingRaids: controllerOut.plan.committedUpcomingRaids?.length || 0,
+      plannedPostBucketEnFloor: Number(controllerOut.plan.trunkBuckets?.[0]?.plannedPostBucketEnFloor || 0),
+      staminaReserveFloor: Number(baseUserConstraints.staminaReserveFloor || 0),
+      staminaReserveUntilSec: Number(baseUserConstraints.staminaReserveUntilSec || 0),
+    }
+  }
 
   if (runtimeState) {
     if (controllerOut?.status === 'plan-invalid') {
@@ -441,6 +445,9 @@ export async function runLiveAccountTick({
       preWorld.rev = prewarmSourceWorld.rev
       const preStealUsed = journal ? journal.countOccupiedBudget('steal', adapter.R.isleIndex(preWorld.now)) : 0
       const preNeighbors = controllerOut.observedNeighbors || []
+      const preUpcomingNeighbors = snipeScheduler?.isStealEnabled()
+        ? snipeScheduler.collectUpcomingTargetsForController(adapter, preWorld)
+        : (controllerOut.observedUpcomingNeighbors || [])
       const prePartnerWorld = controllerOut.observedPartnerWorld || null
       const preSoldLedger = controllerOut.soldLedger || new Map()
       const preConstraints = typeof effectiveConstraints === 'object' && effectiveConstraints !== null
@@ -450,24 +457,15 @@ export async function runLiveAccountTick({
               Boolean(runtimeState?.pendingCapex) ||
               (Number(preWorld.now) - Number(runtimeState?.lastCapexEvalAtSec || 0)) >= 600
             ),
-            staminaReserveFloor: Math.max(
-              Number(baseUserConstraints.staminaReserveFloor || 0),
-              snipeScheduler?.isStealEnabled()
-                ? snipeScheduler.computeImminentSnipeStaminaReservation(adapter, preWorld, preWorld.now).staminaReserveFloor
-                : 0
-            ),
-            staminaReserveUntilSec: Math.max(
-              Number(baseUserConstraints.staminaReserveUntilSec || 0),
-              snipeScheduler?.isStealEnabled()
-                ? snipeScheduler.computeImminentSnipeStaminaReservation(adapter, preWorld, preWorld.now).staminaReserveUntilSec
-                : 0
-            ),
+            staminaReserveFloor: Number(baseUserConstraints.staminaReserveFloor || 0),
+            staminaReserveUntilSec: Number(baseUserConstraints.staminaReserveUntilSec || 0),
           }
         : effectiveConstraints
       const preEnv = buildObservationEnvelope(adapter, {
         account,
         world: preWorld,
         neighborTargets: preNeighbors,
+        upcomingNeighborTargets: preUpcomingNeighbors,
         partnerWorld: prePartnerWorld,
         knownSoldByIsleIndex: preSoldLedger,
         userConstraints: preConstraints,
