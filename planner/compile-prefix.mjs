@@ -559,6 +559,12 @@ export function buildExecutablePlanSignature(adapter, worldBefore, plan, { waitH
   if (comp.status === 'plan-invalid') {
     return JSON.stringify({ status: 'invalid', reason: comp.failedReason })
   }
+  const rawCommitted = Array.isArray(plan?.raidSchedule?.committedRaids)
+    ? plan.raidSchedule.committedRaids
+    : (Array.isArray(plan?.committedUpcomingRaids) ? plan.committedUpcomingRaids : [])
+  const raidsSig = rawCommitted
+    .filter((r) => r && (!Number.isFinite(waitHorizonCapSec) || Number(r.unlockAtSec) <= waitHorizonCapSec))
+    .map((r) => `${r.targetId}@${r.unlockAtSec}`)
   if (comp.status === 'wait') {
     const rawWake = Number.isFinite(plan?.nextWakeSec) ? Number(plan.nextWakeSec) : null
     const cappedWake = rawWake != null && Number.isFinite(waitHorizonCapSec)
@@ -567,6 +573,7 @@ export function buildExecutablePlanSignature(adapter, worldBefore, plan, { waitH
     return JSON.stringify({
       status: 'wait',
       nextWakeSec: cappedWake,
+      ...(raidsSig.length > 0 ? { raids: raidsSig } : {}),
     })
   }
   return JSON.stringify({
@@ -574,5 +581,6 @@ export function buildExecutablePlanSignature(adapter, worldBefore, plan, { waitH
     kind: comp.nextTransactionKind,
     dom: comp.domesticBatch,
     vis: (comp.visitOperations || []).map((v) => v.targetId),
+    ...(raidsSig.length > 0 ? { raids: raidsSig } : {}),
   })
 }

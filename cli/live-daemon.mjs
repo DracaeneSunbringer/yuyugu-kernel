@@ -2,7 +2,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadRulesAdapterFromFile } from '../model/rules-adapter.mjs'
-import { buildObservationEnvelope } from '../model/observations.mjs'
+import {
+  buildObservationEnvelope,
+  computeStaticFarmStateDigest,
+} from '../model/observations.mjs'
 import { ContentAddressedJournal } from '../audit/journal.mjs'
 import { AsyncPlanManager } from '../execution/async-planner.mjs'
 import { KernelHttpClient } from '../execution/http-client.mjs'
@@ -214,6 +217,7 @@ export async function runLiveAccountTick({
     },
     solverOptions: effectiveSolverOptions,
     asyncPlanner: activePlanner,
+    snipeScheduler,
     rulesPath: effectiveRulesPath,
     deadlineAtMs: effectiveDeadlineAtMs,
     shouldPreemptFn: () => {
@@ -230,6 +234,7 @@ export async function runLiveAccountTick({
   if (controllerOut?.plan) {
     stamRes = {
       mode: 'unified-timeline',
+      committedRaids: controllerOut.plan.raidSchedule?.committedRaids?.length || 0,
       committedUpcomingRaids: controllerOut.plan.committedUpcomingRaids?.length || 0,
       plannedPostBucketEnFloor: Number(controllerOut.plan.trunkBuckets?.[0]?.plannedPostBucketEnFloor || 0),
       staminaReserveFloor: Number(baseUserConstraints.staminaReserveFloor || 0),
@@ -252,11 +257,21 @@ export async function runLiveAccountTick({
 
   if (snipeScheduler?.isStealEnabled()) {
     if (
+      !dryRun &&
+      controllerOut?.plan &&
+      controllerOut?.transactionKind !== 'visit' &&
+      snipeScheduler.activeRaidSchedule?.planId !== controllerOut.plan.planId
+    ) {
+      snipeScheduler.syncCommittedRaidSchedule(controllerOut.plan, lastInLockWorld || controllerOut.world)
+    }
+    if (
       controllerOut?.status !== 'confirmed' &&
       lastInLockWorld &&
       controllerOut?.plan?.marginalContext &&
-      (controllerOut.plan.marginalContext.sourceWorldRev == null ||
-        controllerOut.plan.marginalContext.sourceWorldRev === (lastInLockWorld.rev ?? null))
+      (controllerOut.plan.marginalContext.sourceFarmDigest != null
+        ? controllerOut.plan.marginalContext.sourceFarmDigest === computeStaticFarmStateDigest(lastInLockWorld)
+        : (controllerOut.plan.marginalContext.sourceWorldRev == null ||
+            controllerOut.plan.marginalContext.sourceWorldRev === (lastInLockWorld.rev ?? null)))
     ) {
       snipeScheduler.primeUnifiedBaseline(adapter, lastInLockWorld, controllerOut.plan.marginalContext, effectiveConstraints)
     } else if (controllerOut?.status === 'confirmed') {
@@ -275,14 +290,33 @@ export async function runLiveAccountTick({
     }
   }
 
-  // If an urgent Domestic/Visit transaction just fired, re-enter loop promptly before background slices
+  // If an urgent Domestic/Visit transaction just fired, re-enter loop promptly before background slices,
+  // while strictly clamping `nextWakeSec` to any committed upcoming snipe's physical staging lead (and xian wake)!
   if (!dryRun && controllerOut.status === 'confirmed') {
+    const nowAfterTxSec = httpClient.estimatedServerNowSec()
+    let confirmedWakeSec = Number(controllerOut.nextWakeSec || (nowAfterTxSec + (adapter.R.WORLD?.minGap || 2)))
+    const nextSnipeAfterTx = snipeScheduler?.nextExactUnlockInfo(nowAfterTxSec)
+    if (nextSnipeAfterTx) {
+      const prepLeadAfterTx = snipeScheduler.computePhysicalPrepLeadSec(nextSnipeAfterTx.entry, adapter, httpClient)
+      confirmedWakeSec = Math.min(
+        confirmedWakeSec,
+        Math.max(nowAfterTxSec + 1, nextSnipeAfterTx.unlockAt - Math.ceil(prepLeadAfterTx + 1))
+      )
+    }
+    if (snipeScheduler?.needsScheduleRefresh?.()) {
+      confirmedWakeSec = nowAfterTxSec
+    } else if (normalizedXian.enabled) {
+      const xianWakeAfterTx = computeNextXianWakeSec(lastInLockWorld || controllerOut.world, nowAfterTxSec, normalizedXian)
+      if (Number.isFinite(xianWakeAfterTx)) {
+        confirmedWakeSec = Math.min(confirmedWakeSec, Math.max(nowAfterTxSec + 1, xianWakeAfterTx))
+      }
+    }
     return {
       phase: 'controller-executed',
       account,
       controllerOut,
       staminaReservation: stamRes,
-      nextWakeSec: controllerOut.nextWakeSec,
+      nextWakeSec: confirmedWakeSec,
     }
   }
 
@@ -383,11 +417,8 @@ export async function runLiveAccountTick({
         dryRun,
       })
       backgroundReport.xian = xianOut
-      if (xianOut?.status === 'confirmed') {
-        snipeScheduler?.invalidateUnifiedBaseline?.()
-        if (xianOut.worldAfter) {
-          lastInLockWorld = xianOut.worldAfter
-        }
+      if (xianOut?.status === 'confirmed' && xianOut.worldAfter) {
+        lastInLockWorld = xianOut.worldAfter
       }
     }
 
@@ -403,15 +434,19 @@ export async function runLiveAccountTick({
     }
   }
 
-  // Compute earliest wake timestamp across domestic schedule, physical snipe staging (`unlockAt - ceil(T_prep + 1)`), arena, and discovery
+  // Compute earliest wake timestamp across domestic schedule (`farmWakeSec`), physical snipe staging, arena, xian, and discovery
   const nowEndSec = httpClient.estimatedServerNowSec()
-  let nextWakeSec = Number(controllerOut.nextWakeSec || (nowEndSec + 60))
+  const farmWakeSec = Number(controllerOut.nextWakeSec || (nowEndSec + 60))
+  let nextWakeSec = farmWakeSec
   const nextSnipe = snipeScheduler?.nextExactUnlockInfo(nowEndSec)
   if (nextSnipe) {
     const prepLeadSec = snipeScheduler.computePhysicalPrepLeadSec(nextSnipe.entry, adapter, httpClient)
     nextWakeSec = Math.min(nextWakeSec, Math.max(nowEndSec + 1, nextSnipe.unlockAt - Math.ceil(prepLeadSec + 1)))
   }
-  if (backgroundReport.discovery?.status === 'ready-target-found') {
+  const scheduleRefreshReason = snipeScheduler?.needsScheduleRefresh?.()
+    ? (snipeScheduler.getScheduleRefreshReason?.() || 'schedule-refresh-due')
+    : null
+  if (backgroundReport.discovery?.status === 'ready-target-found' || scheduleRefreshReason) {
     nextWakeSec = nowEndSec
   } else if ((runtimeState.arenaRemaining || 0) > 0) {
     nextWakeSec = Math.min(nextWakeSec, nowEndSec + 9)
@@ -427,8 +462,8 @@ export async function runLiveAccountTick({
     }
   }
 
-  // Proactive Idle PlanCache Pre-Warming: when waiting for an upcoming domestic maturity within 45s and
-  // no snipe is imminent, pre-compute the next plan in the background Worker with authoritative neighbors/partner/ledger!
+  // Proactive Idle PlanCache Pre-Warming: ONLY when `farmWakeSec` itself (never `xianWake` / `arenaWake`!) is within 45s
+  // and no snipe / schedule refresh is pending, pre-compute the farm wake plan in the background Worker!
   const prewarmSourceWorld = backgroundReport.xian?.worldAfter || controllerOut.world
   if (
     !dryRun &&
@@ -436,12 +471,14 @@ export async function runLiveAccountTick({
     effectiveRulesPath &&
     controllerOut.status === 'waiting' &&
     prewarmSourceWorld &&
-    nextWakeSec > nowEndSec &&
-    (nextWakeSec - nowEndSec) <= 45 &&
+    !scheduleRefreshReason &&
+    Number.isFinite(farmWakeSec) &&
+    farmWakeSec > nowEndSec &&
+    (farmWakeSec - nowEndSec) <= 45 &&
     !snipeScheduler?.shouldBlockBackgroundWork(nowEndSec)
   ) {
     try {
-      const preWorld = adapter.advanceTimeOnly(prewarmSourceWorld, nextWakeSec)
+      const preWorld = adapter.advanceTimeOnly(prewarmSourceWorld, farmWakeSec)
       preWorld.rev = prewarmSourceWorld.rev
       const preStealUsed = journal ? journal.countOccupiedBudget('steal', adapter.R.isleIndex(preWorld.now)) : 0
       const preNeighbors = controllerOut.observedNeighbors || []
@@ -493,6 +530,8 @@ export async function runLiveAccountTick({
     staminaReservation: stamRes,
     backgroundReport,
     nextSnipe,
+    farmWakeSec,
+    scheduleRefreshReason,
     nextWakeSec,
   }
 }

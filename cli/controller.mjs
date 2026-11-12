@@ -3,7 +3,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadRulesAdapterFromFile } from '../model/rules-adapter.mjs'
-import { buildObservationEnvelope } from '../model/observations.mjs'
+import {
+  buildObservationEnvelope,
+  computeStaticFarmStateDigest,
+  isFarmDomainPassiveCompatible,
+} from '../model/observations.mjs'
 import { buildObjectiveConfig } from '../model/objective.mjs'
 import { solveUnifiedPlan, solveWithHorizonStability } from '../planner/solve.mjs'
 import { compileExecutablePrefix } from '../planner/compile-prefix.mjs'
@@ -70,6 +74,7 @@ export async function runControllerStep({
   userConstraints = {},
   solverOptions = {},
   asyncPlanner = null,
+  snipeScheduler = null,
   rulesPath = null,
   deadlineAtMs = Infinity,
   shouldPreemptFn = null,
@@ -111,6 +116,7 @@ export async function runControllerStep({
     compiled,
     planSource = 'inline',
     solveElapsedMs = null,
+    reusedAcrossNonFarmRev = false,
     observedNeighbors = [],
     observedUpcomingNeighbors = [],
     observedPartnerWorld = null,
@@ -125,6 +131,7 @@ export async function runControllerStep({
       failedIndex: compiled.failedIndex ?? null,
       recoveredFromCheckpoint: Boolean(horizonStability?.recoveredFromCheckpoint),
       truncatedByTransition: Boolean(compiled.truncatedByTransition),
+      reusedAcrossNonFarmRev: Boolean(reusedAcrossNonFarmRev),
     }
 
     if (compiled.status === 'plan-invalid') {
@@ -151,6 +158,7 @@ export async function runControllerStep({
       horizonStability,
       trunkBuckets: plan.trunkBuckets,
       scenarioBranches: plan.scenarioBranches,
+      raidSchedule: plan.raidSchedule || null,
       plannedSalesCommitments: extractPlannedSalesCommitments(plan),
       compiledStatus: compiled.status,
       nextTransactionKind: compiled.nextTransactionKind,
@@ -174,6 +182,8 @@ export async function runControllerStep({
         nextWakeSec: plan.nextWakeSec,
       }
     }
+
+    snipeScheduler?.syncCommittedRaidSchedule?.(plan, effectiveWorldBefore)
 
     if (compiled.status === 'wait') {
       if (journal) {
@@ -290,6 +300,9 @@ export async function runControllerStep({
       fetchAfterWorldFn: fetchWorldFn,
     })
     asyncPlanner?.cache?.invalidate(account)
+    if (txRes.status === 'confirmed' && txRes.worldAfter && snipeScheduler?.activeRaidSchedule) {
+      snipeScheduler.activeRaidSchedule.sourceFarmDigest = computeStaticFarmStateDigest(txRes.worldAfter)
+    }
 
     const needsContinuation = txRes.status === 'confirmed'
       && (
@@ -339,6 +352,7 @@ export async function runControllerStep({
             solverOptions,
             runStability: false,
             deadlineAtMs,
+            nowMsFn,
           })
         })
         .catch(() => {})
@@ -539,17 +553,28 @@ export async function runControllerStep({
         }
       }
 
+      let reusedAcrossNonFarmRev = false
       if (Number(inLockWorld.rev) !== Number(rawWorld.rev)) {
-        asyncPlanner.cache.invalidate(account)
-        return {
-          status: 'stale-plan-invalidated',
-          planSource,
-          account,
-          expectedRev: rawWorld.rev,
-          actualRev: inLockWorld.rev,
-          diagnostics: { solveElapsedMs: Math.round(solveElapsedMs) },
-          nextWakeSec: Number(inLockWorld.now || 0) + 1,
+        const bucket0 = plan.trunkBuckets?.[0]
+        const isWaitPlan =
+          (bucket0?.domesticActions?.length || 0) === 0 &&
+          (bucket0?.visitActions?.length || 0) === 0
+        const compatibleAcrossNonFarmRev = isFarmDomainPassiveCompatible(adapter, rawWorld, inLockWorld, {
+          isWaitPlan,
+        })
+        if (!compatibleAcrossNonFarmRev) {
+          asyncPlanner.cache.invalidate(account)
+          return {
+            status: 'stale-plan-invalidated',
+            planSource,
+            account,
+            expectedRev: rawWorld.rev,
+            actualRev: inLockWorld.rev,
+            diagnostics: { solveElapsedMs: Math.round(solveElapsedMs) },
+            nextWakeSec: Number(inLockWorld.now || 0) + 1,
+          }
         }
+        reusedAcrossNonFarmRev = true
       }
 
       const effectiveInLockWorld = applyUnknownReservations(inLockWorld, inLockReconcile)
@@ -567,6 +592,7 @@ export async function runControllerStep({
         compiled: compiledInLock,
         planSource,
         solveElapsedMs,
+        reusedAcrossNonFarmRev,
         observedNeighbors: neighborTargets,
         observedUpcomingNeighbors: upcomingNeighborTargets,
         observedPartnerWorld: partnerWorld,

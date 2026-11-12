@@ -10,8 +10,10 @@ import {
 import {
   buildObservationEnvelope,
   buildVisitTargetBelief,
+  computeStaticFarmStateDigest,
   quoteFutureItemUnderScenario,
   recomputeVisitBeliefForVisitor,
+  resolveRaidOutcomeDistribution,
 } from '../model/observations.mjs'
 import {
   applyExogenousArrivals,
@@ -1531,11 +1533,13 @@ function optimizeAndSimulateSequence(adapter, {
   skipObjectiveEval = false,
   isPastDeadlineFn = null,
   scheduledUpcomingRaids = [],
+  raidOutcomeOverrides = null,
 }) {
   const { R, graph } = adapter
   const L = seqBuckets.length
   const t0 = Number(initialWorldForObjective?.now ?? startWorld.now)
-  const effectivePrngFactory = typeof prngFactory === 'function'
+  const hasExplicitPrng = typeof prngFactory === 'function'
+  const effectivePrngFactory = hasExplicitPrng
     ? prngFactory
     : () => adapter.makeSampleStreamPrng(0, t0)
   const probePrng = effectivePrngFactory()
@@ -1543,6 +1547,59 @@ function optimizeAndSimulateSequence(adapter, {
   const baseExecPrng = effectivePrngFactory()
   const auxSeedPrng = effectivePrngFactory()
   const baseExecSeed = Math.floor(auxSeedPrng() * 0xffffffff) >>> 0
+  const makeIsolatedRaidStream = () => {
+    let state = ((baseExecSeed ^ 0x51a7beef) >>> 0) || 0x13579bdf
+    return () => {
+      state = (state + 0x6d2b79f5) >>> 0
+      let z = state
+      z = Math.imul(z ^ (z >>> 15), z | 1)
+      z ^= z + Math.imul(z ^ (z >>> 7), z | 61)
+      return ((z ^ (z >>> 14)) >>> 0) / 4294967296
+    }
+  }
+  const probeRaidPrng = hasExplicitPrng ? makeIsolatedRaidStream() : null
+  const execRaidPrng = hasExplicitPrng ? makeIsolatedRaidStream() : null
+  const resolveDiscreteRaidBranch = (dist, raidKey, raidPrngFn) => {
+    const outcomes = dist?.outcomes || []
+    const overrideKind = raidOutcomeOverrides instanceof Map
+      ? raidOutcomeOverrides.get(raidKey)
+      : raidOutcomeOverrides?.[raidKey]
+    if (overrideKind) {
+      const matched = outcomes.find((o) => o.kind === overrideKind) || outcomes[0]
+      if (matched) {
+        return {
+          kind: matched.kind,
+          isRealizedBranch: true,
+          arrivals: Object.entries(matched.lootBag || {}).map(([id, n]) => ({ id, q: 0, n })),
+          fineCoins: matched.fineCoins,
+        }
+      }
+    }
+    if (raidPrngFn && outcomes.length > 0) {
+      const uVal = raidPrngFn()
+      let acc = 0
+      let picked = outcomes[outcomes.length - 1]
+      for (const o of outcomes) {
+        acc += o.prob
+        if (uVal <= acc + 1e-12) {
+          picked = o
+          break
+        }
+      }
+      return {
+        kind: picked.kind,
+        isRealizedBranch: true,
+        arrivals: Object.entries(picked.lootBag || {}).map(([id, n]) => ({ id, q: 0, n })),
+        fineCoins: picked.fineCoins,
+      }
+    }
+    return {
+      kind: outcomes.length === 1 ? outcomes[0].kind : 'conservative-trunk',
+      isRealizedBranch: outcomes.length === 1,
+      arrivals: Object.entries(dist?.guaranteedLootBag || {}).map(([id, n]) => ({ id, q: 0, n })),
+      fineCoins: Number(dist?.worstCaseFineCoins || 0),
+    }
+  }
   const execPrngMap = new Map()
   const getExecPrngForKind = (kindStr) => {
     const key = String(kindStr || 'det')
@@ -2125,9 +2182,15 @@ function optimizeAndSimulateSequence(adapter, {
           }
         }
         probeWorld.state.en = Math.max(0, curProbeEn - expTr.energyCost)
-        if (expTr.intLoot.length > 0) {
-          probeWorld = applyExogenousArrivals(probeWorld, expTr.intLoot)
-          raidIntLootByU[u].push(...expTr.intLoot)
+        const raidKey = `${sr.targetId}@${Number(sr.unlockAtSec ?? b.atSec)}`
+        const probeBranch = resolveDiscreteRaidBranch(expTr.distribution, raidKey, probeRaidPrng)
+        if (probeBranch.arrivals.length > 0) {
+          probeWorld = applyExogenousArrivals(probeWorld, probeBranch.arrivals)
+          raidIntLootByU[u].push(...probeBranch.arrivals)
+        }
+        const probeFine = Math.min(Math.max(0, Number(probeWorld.coins || 0)), probeBranch.fineCoins)
+        if (probeFine > 0) {
+          probeWorld.coins = Math.max(0, Number(probeWorld.coins || 0) - probeFine)
         }
       }
     }
@@ -4060,7 +4123,7 @@ function optimizeAndSimulateSequence(adapter, {
       return Math.max(dirVal, marginalItemValueFn(id, q, b.atSec))
     }
 
-    // 0. Execute any committed upcoming neighbor raids unlocking at `b.atSec` BEFORE bucket-`u` domestic work!
+    // 0. Execute any committed neighbor raids unlocking at `b.atSec` BEFORE bucket-`u` domestic work!
     if (scheduledRaidsByU[u].length > 0) {
       for (let rIdxU = 0; rIdxU < scheduledRaidsByU[u].length; rIdxU++) {
         const scheduledRaid = scheduledRaidsByU[u][rIdxU]
@@ -4068,7 +4131,9 @@ function optimizeAndSimulateSequence(adapter, {
           ...scheduledRaidsByU[u].slice(rIdxU + 1),
           ...futureRaidsAfterU[u],
         ]
-        const buffCombos = buildThiefBuffCombinations(adapter, execWorld, constraints, allowedSet)
+        const buffCombos = Array.isArray(scheduledRaid.forcedBuffCombo)
+          ? [scheduledRaid.forcedBuffCombo]
+          : buildThiefBuffCombinations(adapter, execWorld, constraints, allowedSet)
         let chosenRaidOpt = null
 
         for (const buffCombo of buffCombos) {
@@ -4138,6 +4203,7 @@ function optimizeAndSimulateSequence(adapter, {
             chosenRaidOpt = {
               score,
               buffCombo,
+              buffCostCoins,
               prepActs: prep.prepActs,
               trans,
             }
@@ -4148,7 +4214,9 @@ function optimizeAndSimulateSequence(adapter, {
           return makeInfeasibleRaidReturn()
         }
 
+        const prePrepEn = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)))
         const prepAndBuffActs = [...chosenRaidOpt.buffCombo, ...chosenRaidOpt.prepActs]
+        let prepCashSpent = 0
         if (prepAndBuffActs.length > 0) {
           const bCoins = Number(execWorld.coins || 0)
           const svPrep = simulateValidBatch(adapter, execWorld, prepAndBuffActs, {
@@ -4157,42 +4225,72 @@ function optimizeAndSimulateSequence(adapter, {
           })
           execWorld = svPrep.afterWorld
           const aCoins = Number(execWorld.coins || 0)
+          prepCashSpent = Math.max(0, bCoins - aCoins)
           if (aCoins !== bCoins) {
             cashEvents.push({ atSec: b.atSec, netCashDelta: aCoins - bCoins })
           }
         }
         execWorld = adapter.advanceTimeOnly(execWorld, b.atSec, { futurePrices: dynamicPrices })
-        if (Math.floor(Number(execWorld.state?.en || 0)) < chosenRaidOpt.trans.energyCost) {
+        const postPrepEn = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)))
+        if (postPrepEn < chosenRaidOpt.trans.energyCost) {
           return makeInfeasibleRaidReturn()
         }
-        execWorld.state.en = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)) - chosenRaidOpt.trans.energyCost)
-        if (chosenRaidOpt.trans.intLoot.length > 0) {
-          execWorld = applyExogenousArrivals(execWorld, chosenRaidOpt.trans.intLoot)
+        const prepEnGrant = Math.max(0, postPrepEn - prePrepEn)
+        const minEnBeforePrep = Math.max(0, chosenRaidOpt.trans.energyCost - prepEnGrant)
+        const minCoinsBeforePrep = prepCashSpent > 0
+          ? Number(constraints.cashReserveFloor || 0) + prepCashSpent
+          : 0
+        const requiredEdiblesMap = new Map()
+        let coffeeCount = 0
+        for (const pa of chosenRaidOpt.prepActs) {
+          if (pa.a === 'coffee') coffeeCount++
+          else if (pa.a === 'eat') {
+            const eKey = `${pa.id}:${pa.q ?? 0}`
+            requiredEdiblesMap.set(eKey, (requiredEdiblesMap.get(eKey) || 0) + 1)
+          }
         }
-        const fineCoins = Math.round(chosenRaidOpt.trans.expFine)
-        if (fineCoins > 0) {
-          execWorld.coins = Math.max(0, Number(execWorld.coins || 0) - fineCoins)
+        const requiredEdibles = [...requiredEdiblesMap.entries()].map(([k, n]) => {
+          const [id, qRaw] = k.split(':')
+          return { id, q: Number(qRaw || 0), count: n }
+        })
+
+        execWorld.state.en = Math.max(0, postPrepEn - chosenRaidOpt.trans.energyCost)
+        const raidKey = `${scheduledRaid.targetId}@${Number(scheduledRaid.unlockAtSec ?? b.atSec)}`
+        const realized = resolveDiscreteRaidBranch(chosenRaidOpt.trans.distribution, raidKey, execRaidPrng)
+        if (realized.arrivals.length > 0) {
+          execWorld = applyExogenousArrivals(execWorld, realized.arrivals)
         }
-        if (chosenRaidOpt.trans.expFine !== 0) {
-          cashEvents.push({ atSec: b.atSec, netCashDelta: -chosenRaidOpt.trans.expFine })
-        }
-        let fracPresentVal = 0
-        for (const fl of chosenRaidOpt.trans.fracLoot) {
-          fracPresentVal += fl.fracQty * marginalItemValueFn(fl.id, 0, b.atSec)
-        }
-        const fracCashAtBucket = bucketDisc > 1e-12 ? fracPresentVal / bucketDisc : fracPresentVal
-        if (fracCashAtBucket > 1e-9) {
-          cashEvents.push({ atSec: b.atSec, netCashDelta: fracCashAtBucket })
+        const actualFineCoins = Math.min(Math.max(0, Number(execWorld.coins || 0)), realized.fineCoins)
+        if (actualFineCoins > 0) {
+          execWorld.coins = Math.max(0, Number(execWorld.coins || 0) - actualFineCoins)
+          cashEvents.push({ atSec: b.atSec, netCashDelta: -actualFineCoins })
         }
         raidTransitionsByBucket[u].push({
           targetId: scheduledRaid.targetId,
+          targetName: chosenRaidOpt.trans.belief?.targetName || scheduledRaid.targetName || String(scheduledRaid.targetId),
+          unlockAtSec: Number(scheduledRaid.unlockAtSec ?? b.atSec),
+          isImmediate: Boolean(scheduledRaid.isImmediate),
+          exactUnlockKnown: Boolean(scheduledRaid.exactUnlockKnown),
           atSec: b.atSec,
+          totalSpots: Number(chosenRaidOpt.trans.belief?.totalSpots || scheduledRaid.totalSpots || 0),
+          buffActs: chosenRaidOpt.buffCombo,
+          staminaPrepActs: chosenRaidOpt.prepActs,
           prepAndBuffActs,
+          preconditions: {
+            minEnBeforePrep,
+            minCoinsBeforePrep,
+            coffeeCount,
+            requiredEdibles,
+          },
           energyCost: chosenRaidOpt.trans.energyCost,
-          intLoot: chosenRaidOpt.trans.intLoot,
-          fineCoins,
-          expFine: chosenRaidOpt.trans.expFine,
-          fracCashAtBucket,
+          tacticalDecision: chosenRaidOpt.trans.belief?.tacticalDecision || scheduledRaid.tacticalDecision || null,
+          optimalLoadout: chosenRaidOpt.trans.belief?.optimalLoadout || scheduledRaid.optimalLoadout || null,
+          numGearChanges: Number(chosenRaidOpt.trans.belief?.numGearChanges ?? scheduledRaid.numGearChanges ?? 0),
+          belief: chosenRaidOpt.trans.belief,
+          distribution: chosenRaidOpt.trans.distribution,
+          outcomeKind: realized.kind,
+          intLoot: realized.arrivals,
+          fineCoins: actualFineCoins,
         })
       }
     }
@@ -6563,6 +6661,7 @@ function optimizeAndSimulateSequence(adapter, {
 
   const marginalContext = {
     sourceWorldRev: startWorld?.rev ?? null,
+    sourceFarmDigest: computeStaticFarmStateDigest(startWorld),
     sourceIsleIndex: R.isleIndex(startWorld.now),
     sourceWorldDay: R.worldDay(startWorld.now),
     sourceCoins: Math.floor(Number(startWorld.coins || 0)),
@@ -6823,53 +6922,41 @@ function advanceScalarStamina(curEn, curEnT, enMax, regenStep, targetSec) {
 }
 
 function computeExpectedRaidTransition(adapter, raidBelief, visitorWorldAtRaid, marginalItemValueFn = null) {
-  const vb = recomputeVisitBeliefForVisitor(adapter, raidBelief, visitorWorldAtRaid, visitorWorldAtRaid.now)
-  const pDet = vb.hasGuard ? Math.max(0, Math.min(1, Number(vb.detectionProb || 0))) : 0
-  const pUndet = Math.max(0, 1 - pDet)
-  const wLo = Number(vb.winInterval?.[0] ?? 1)
-  const wHi = Number(vb.winInterval?.[1] ?? 1)
-  const wMid = 0.5 * (wLo + wHi)
-  const lHi = Math.min(1 - wLo, Number(vb.lossInterval?.[1] ?? 0))
-  const lMid = Math.min(1 - wMid, 0.5 * (Number(vb.lossInterval?.[0] ?? 0) + Number(vb.lossInterval?.[1] ?? 0)))
-  const useConservative = vb.estimationSource === 'unobserved-wide-prior'
-  const wUse = useConservative ? wLo : wMid
-  const lUse = useConservative ? lHi : lMid
-
-  const intLoot = []
-  const fracLoot = []
-  const intLootBag = {}
-  const expectedLootBag = {}
-  let grossLootValue = 0
-  const allIds = new Set([
-    ...Object.keys(vb.lootBag || {}),
-    ...Object.keys(vb.guardWinLootBag || {}),
-  ])
-  for (const id of allIds) {
-    const qUndet = Number(vb.lootBag?.[id] || 0)
-    const qWin = Number(vb.guardWinLootBag?.[id] ?? qUndet)
-    const expQty = pUndet * qUndet + pDet * wUse * qWin
-    if (!(expQty > 1e-9)) continue
-    expectedLootBag[id] = expQty
-    const intQty = Math.floor(expQty + 1e-9)
-    const fracQty = Math.max(0, expQty - intQty)
-    if (intQty > 0) {
-      intLoot.push({ id, q: 0, n: intQty })
-      intLootBag[id] = intQty
+  let effectiveBelief = raidBelief
+  if (raidBelief?._rawNeighborTarget && visitorWorldAtRaid) {
+    const rebuilt = buildVisitTargetBelief(adapter, visitorWorldAtRaid, raidBelief._rawNeighborTarget, visitorWorldAtRaid.now)
+    effectiveBelief = {
+      ...rebuilt,
+      targetId: rebuilt.targetId ?? raidBelief.targetId,
+      targetName: rebuilt.targetName || raidBelief.targetName,
+      unlockAtSec: raidBelief.unlockAtSec,
+      isImmediate: raidBelief.isImmediate,
+      exactUnlockKnown: raidBelief.exactUnlockKnown,
+      forcedBuffCombo: raidBelief.forcedBuffCombo,
     }
-    if (fracQty > 1e-9) fracLoot.push({ id, fracQty })
-    if (marginalItemValueFn) {
+  }
+  const dist = resolveRaidOutcomeDistribution(
+    adapter,
+    effectiveBelief,
+    raidBelief?._rawNeighborTarget ? null : visitorWorldAtRaid,
+    visitorWorldAtRaid?.now
+  )
+  const guaranteedArrivals = Object.entries(dist.guaranteedLootBag || {}).map(([id, n]) => ({ id, q: 0, n }))
+  let grossLootValue = 0
+  if (marginalItemValueFn) {
+    for (const [id, expQty] of Object.entries(dist.expectedLootBag || {})) {
       grossLootValue += expQty * marginalItemValueFn(id, 0, visitorWorldAtRaid.now)
     }
   }
-  const expFine = pDet * lUse * Number(vb.estimatedFineOnLoss || 0)
   return {
-    belief: vb,
-    energyCost: Math.max(0, Math.floor(Number(vb.energyCost || 0))),
-    lootBag: expectedLootBag,
-    intLootBag,
-    intLoot,
-    fracLoot,
-    expFine,
+    belief: dist.belief,
+    distribution: dist,
+    energyCost: dist.energyCost,
+    lootBag: dist.expectedLootBag,
+    guaranteedLootBag: dist.guaranteedLootBag,
+    guaranteedArrivals,
+    expFine: dist.expectedFineCoins,
+    worstCaseFineCoins: dist.worstCaseFineCoins,
     grossLootValue,
   }
 }
@@ -7004,12 +7091,12 @@ function replayRecordedRaidTransitions(adapter, world, transitions, { atSec, pri
     if (tr.intLoot?.length > 0) {
       curW = applyExogenousArrivals(curW, tr.intLoot)
     }
-    if (tr.fineCoins > 0) {
-      curW.coins = Math.max(0, Number(curW.coins || 0) - tr.fineCoins)
-    }
-    if (cashEvents) {
-      if (tr.expFine !== 0) cashEvents.push({ atSec, netCashDelta: -tr.expFine })
-      if (tr.fracCashAtBucket > 1e-9) cashEvents.push({ atSec, netCashDelta: tr.fracCashAtBucket })
+    const actualFine = Math.min(Math.max(0, Number(curW.coins || 0)), Number(tr.fineCoins || 0))
+    if (actualFine > 0) {
+      curW.coins = Math.max(0, Number(curW.coins || 0) - actualFine)
+      if (cashEvents) {
+        cashEvents.push({ atSec, netCashDelta: -actualFine })
+      }
     }
   }
   return curW
@@ -7210,6 +7297,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       initialSoldByIsleOverride = null,
       prngFactory = null,
       scheduledUpcomingRaids = [],
+      raidOutcomeOverrides = null,
     } = {}
   ) => {
     const activeBuckets = customBuckets || buckets
@@ -7257,6 +7345,8 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
           allBuckets: activeBuckets,
           trunkBucketsUsed: [],
           trunkActionsByBucket: [],
+          raidTransitionsByBucket: [],
+          raidTransitionsFlat: [],
           bucketPlannedPostEnFloor: new Int32Array(0),
           scheduledUpcomingRaids,
           scenarioBranches: {
@@ -7285,6 +7375,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         hasExplicitPriceOverride,
         isPastDeadlineFn: isPastDeadline,
         scheduledUpcomingRaids,
+        raidOutcomeOverrides,
       })
       if (res.raidScheduleInfeasible) {
         return {
@@ -7295,11 +7386,14 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
           allBuckets: activeBuckets,
           trunkBucketsUsed: activeBuckets,
           trunkActionsByBucket: res.bucketActions,
+          raidTransitionsByBucket: [],
+          raidTransitionsFlat: [],
           bucketPlannedPostEnFloor: res.bucketPlannedPostEnFloor,
           scheduledUpcomingRaids,
           scenarioBranches: {},
         }
       }
+      const raidTrByB = res.raidTransitionsByBucket || []
       return {
         raidScheduleInfeasible: false,
         expectedValue: res.objectiveEval.totalObjectiveValue,
@@ -7308,6 +7402,8 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         allBuckets: activeBuckets,
         trunkBucketsUsed: activeBuckets,
         trunkActionsByBucket: res.bucketActions,
+        raidTransitionsByBucket: raidTrByB,
+        raidTransitionsFlat: raidTrByB.flat(),
         bucketPlannedPostEnFloor: res.bucketPlannedPostEnFloor,
         scheduledUpcomingRaids,
         discretizationMeta: res.discretizationMeta,
@@ -7388,6 +7484,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       skipObjectiveEval: true,
       isPastDeadlineFn: isPastDeadline,
       scheduledUpcomingRaids,
+      raidOutcomeOverrides,
     })
     if (lookaheadRun.raidScheduleInfeasible) {
       return {
@@ -7398,6 +7495,8 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         allBuckets: activeBuckets,
         trunkBucketsUsed: activeTrunkMeta,
         trunkActionsByBucket: [],
+        raidTransitionsByBucket: [],
+        raidTransitionsFlat: [],
         bucketPlannedPostEnFloor: new Int32Array(activeTrunkMeta.length),
         scheduledUpcomingRaids,
         scenarioBranches: {},
@@ -7407,6 +7506,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     // Replay ONLY the shared trunk actions `0..K-1` identically to obtain the exact common `worldAtBranchStart`!
     const K = activeTrunkMeta.length
     const trunkActions = lookaheadRun.bucketActions.slice(0, K)
+    const trunkRaidTransitions = (lookaheadRun.raidTransitionsByBucket || []).slice(0, K)
     let trunkWorld = adapter.cloneWorld(startW)
     const trunkCashEvents = [...autoInitCashEvents]
     const trunkSoldByIsle = new Map()
@@ -7448,6 +7548,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     const branchUpcomingRaids = (scheduledUpcomingRaids || []).filter((r) => Number(r.unlockAtSec) >= branchStartSec)
     let expectedVal = 0
     const scenarioBranches = {}
+    let firstBranchRaidTransitionsFlat = []
     const mergedDisc = {
       cashDiscretized: Boolean(lookaheadRun.discretizationMeta?.cashDiscretized),
       maxCashUnit: Number(lookaheadRun.discretizationMeta?.maxCashUnit || 1),
@@ -7455,7 +7556,8 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       maxDpCells: Number(lookaheadRun.discretizationMeta?.maxDpCells || 0),
       sites: [...(lookaheadRun.discretizationMeta?.sites || [])],
     }
-    for (const sc of scenarios) {
+    for (let scIdx = 0; scIdx < scenarios.length; scIdx++) {
+      const sc = scenarios[scIdx]
       const branchRes = optimizeAndSimulateSequence(adapter, {
         startWorld: trunkWorld,
         initialWorldForObjective: initialObjectiveW,
@@ -7476,6 +7578,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         skipObjectiveEval: true,
         isPastDeadlineFn: isPastDeadline,
         scheduledUpcomingRaids: branchUpcomingRaids,
+        raidOutcomeOverrides,
       })
       if (branchRes.raidScheduleInfeasible) {
         return {
@@ -7486,10 +7589,15 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
           allBuckets: activeBuckets,
           trunkBucketsUsed: activeTrunkMeta,
           trunkActionsByBucket: trunkActions,
+          raidTransitionsByBucket: trunkRaidTransitions,
+          raidTransitionsFlat: trunkRaidTransitions.flat(),
           bucketPlannedPostEnFloor: lookaheadRun.bucketPlannedPostEnFloor.slice(0, K),
           scheduledUpcomingRaids,
           scenarioBranches: {},
         }
+      }
+      if (scIdx === 0 && branchRes.raidTransitionsByBucket) {
+        firstBranchRaidTransitionsFlat = branchRes.raidTransitionsByBucket.flat()
       }
       if (branchRes.discretizationMeta) {
         mergedDisc.maxDpCells = Math.max(mergedDisc.maxDpCells, branchRes.discretizationMeta.maxDpCells || 0)
@@ -7534,6 +7642,8 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       allBuckets: activeBuckets,
       trunkBucketsUsed: activeTrunkMeta,
       trunkActionsByBucket: trunkActions,
+      raidTransitionsByBucket: trunkRaidTransitions,
+      raidTransitionsFlat: [...trunkRaidTransitions.flat(), ...firstBranchRaidTransitionsFlat],
       bucketPlannedPostEnFloor: lookaheadRun.bucketPlannedPostEnFloor.slice(0, K),
       scheduledUpcomingRaids,
       discretizationMeta: mergedDisc,
@@ -7553,7 +7663,8 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     prefixSoldMap,
     prngFactory = null,
     contPolicyMode = 'optimal',
-    scheduledUpcomingRaids = []
+    scheduledUpcomingRaids = [],
+    raidOutcomeOverrides = null
   ) => {
     const tFollow = Math.min(tHorizonEnd, world0.now + minGapSec)
     const wCont = tFollow > afterPrefixWorld.now
@@ -7564,9 +7675,9 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       .map((r) => (Number(r.unlockAtSec) < wCont.now ? { ...r, unlockAtSec: wCont.now } : r))
     const baseMaxB = options.maxBuckets || 16
     const contMaxBuckets = (prngFactory != null ? Math.min(8, baseMaxB) : baseMaxB) + remRaids.length
-    const contBuckets = tFollow < tHorizonEnd
+    const contBuckets = (tFollow < tHorizonEnd || objectiveCfg.horizonSec > 0)
       ? buildEventBuckets(adapter, wCont, {
-          horizonSec: tHorizonEnd - tFollow,
+          horizonSec: Math.max(0, tHorizonEnd - wCont.now),
           deterministicArrivals: remArrivalsAfterT0,
           upcomingRaidSecs: remRaids.map((r) => Number(r.unlockAtSec)),
           maxBuckets: contMaxBuckets,
@@ -7587,20 +7698,221 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       initialSoldByIsleOverride: prefixSoldMap,
       prngFactory,
       scheduledUpcomingRaids: remRaids,
+      raidOutcomeOverrides,
     })
     if (contRes.raidScheduleInfeasible && remRaids.length > 0) {
-      return evalContinuationFromPostPrefix(afterPrefixWorld, prefixCashEvents, prefixSoldMap, prngFactory, contPolicyMode, [])
+      return evalContinuationFromPostPrefix(
+        afterPrefixWorld,
+        prefixCashEvents,
+        prefixSoldMap,
+        prngFactory,
+        contPolicyMode,
+        [],
+        raidOutcomeOverrides
+      )
     }
+    contRes._evalStartWorld = wCont
+    contRes._evalInitCash = prefixCashEvents
+    contRes._evalInitSold = prefixSoldMap
     return contRes
   }
 
-  // True Policy Expectation Evaluator (`Round-2 P1-1`):
-  // Scores EVERY domestic candidate BEFORE ranking so candidate comparison (`candidateModes`, `upstreamVariants`)
+  const candidateHasDomesticStoch = (c) => {
+    for (const bActs of c?.trunkActionsByBucket || []) {
+      for (const a of bActs || []) if (adapter.isStochasticAction(a)) return true
+    }
+    for (const br of Object.values(c?.scenarioBranches || {})) {
+      for (const bActs of br.bucketActions || []) {
+        for (const a of bActs || []) if (adapter.isStochasticAction(a)) return true
+      }
+    }
+    return false
+  }
+
+  // Non-anticipative exact discrete outcome tree for stochastic neighbor raids (`{ undetected, guard-win, guard-tie, guard-loss }`):
+  // - Replays all pre-raid domestic buckets `0 .. uStoch - 1` AND pre-visit `prepAndBuffActs` ONCE identically (zero hindsight!).
+  // - Branches ONLY on the discrete raid receipt at `bRaid.atSec`, allowing post-receipt buckets `uStoch .. B-1` to adapt to
+  //   integer realized loot and discrete `-actualFine` (zero fractional cash, zero pre-receipt infeasible commitments!).
+  const evalExactUpcomingRaidTree = (baseCand, startW = world0, initCash = null, initSold = null, depth = 0) => {
+    const allRaidFlat = baseCand?.raidTransitionsFlat || []
+    const stochFlat = allRaidFlat.filter((tr) => tr?.distribution?.isStochastic)
+    if (stochFlat.length === 0) {
+      return { ok: !candidateHasDomesticStoch(baseCand), value: baseCand.expectedValue, branchCount: 1 }
+    }
+    if (depth > 3 || candidateHasDomesticStoch(baseCand)) {
+      return { ok: false, value: baseCand.expectedValue, branchCount: 0 }
+    }
+    let totalCombos = 1
+    for (const tr of stochFlat) {
+      const nOut = (tr.distribution?.outcomes || []).filter((o) => o.prob > 1e-9).length || 1
+      totalCombos *= nOut
+    }
+    if (totalCombos > 16) {
+      return { ok: false, value: baseCand.expectedValue, branchCount: 0 }
+    }
+
+    const uStoch = (baseCand.raidTransitionsByBucket || []).findIndex((trs) =>
+      (trs || []).some((tr) => tr?.distribution?.isStochastic)
+    )
+    const curSoldBase = initSold || baseSoldByIsle
+    const curCashBase = initCash ?? (() => {
+      const diff = Number(startW.coins || 0) - Number(world0.coins || 0)
+      return diff !== 0 ? [{ atSec: world0.now, netCashDelta: diff }] : []
+    })()
+
+    if (uStoch < 0) {
+      // Stochastic raid occurs in post-isle-reveal scenario branches (`activeBranchMeta`): enumerate `raidOutcomeOverrides`
+      let states = [{ prob: 1, overrides: new Map() }]
+      for (const tr of stochFlat) {
+        const rKey = `${tr.targetId}@${Number(tr.unlockAtSec ?? tr.atSec)}`
+        const outs = (tr.distribution?.outcomes || []).filter((o) => o.prob > 1e-9)
+        const nextStates = []
+        for (const st of states) {
+          for (const out of outs) {
+            const nextMap = new Map(st.overrides)
+            nextMap.set(rKey, out)
+            nextStates.push({ prob: st.prob * out.prob, overrides: nextMap })
+          }
+        }
+        states = nextStates
+      }
+      let mean = 0
+      for (const st of states) {
+        if (isPastDeadline()) return { ok: false, value: baseCand.expectedValue, branchCount: 0 }
+        const sub = evaluateTrunkPolicy(baseCand.policyMeta?.trunkPolicyMode || 'optimal', startW, world0, {
+          customBuckets: baseCand.allBuckets,
+          enableFirstBucketPlant: baseCand.policyMeta?.enableFirstBucketPlant ?? true,
+          enableFirstBucketStockBuy: baseCand.policyMeta?.enableFirstBucketStockBuy ?? true,
+          capexActionsAtStart: startW === world0 ? preselectedCapexActions : [],
+          initialCashEventsOverride: curCashBase,
+          initialSoldByIsleOverride: curSoldBase,
+          scheduledUpcomingRaids: baseCand.scheduledUpcomingRaids || [],
+          raidOutcomeOverrides: st.overrides,
+        })
+        if (sub.raidScheduleInfeasible || candidateHasDomesticStoch(sub)) {
+          return { ok: false, value: baseCand.expectedValue, branchCount: 0 }
+        }
+        mean += st.prob * sub.expectedValue
+      }
+      return { ok: true, value: mean, branchCount: states.length }
+    }
+
+    // Replay `0 .. uStoch - 1` identically before the stochastic raid unlocks
+    let preW = adapter.cloneWorld(startW)
+    const preCash = [...curCashBase]
+    const preSold = new Map()
+    for (const [k, v] of curSoldBase.entries()) preSold.set(k, { ...v })
+
+    for (let u = 0; u < uStoch; u++) {
+      const b = baseCand.trunkBucketsUsed[u]
+      const pB = makePricesFn(scenarios[0])(b, preSold)
+      preW = adapter.advanceTimeOnly(preW, b.atSec, { futurePrices: pB })
+      preW = applyExogenousArrivals(preW, b.exogenousArrivalsAtStart)
+      if (baseCand.raidTransitionsByBucket?.[u]?.length > 0) {
+        preW = replayRecordedRaidTransitions(adapter, preW, baseCand.raidTransitionsByBucket[u], {
+          atSec: b.atSec,
+          prices: pB,
+          cashEvents: preCash,
+        })
+      }
+      const acts = baseCand.trunkActionsByBucket?.[u] || []
+      if (acts.length > 0) {
+        const bCoins = Number(preW.coins || 0)
+        const sv = simulateValidBatch(adapter, preW, acts, { t: b.atSec, prices: pB })
+        preW = sv.afterWorld
+        const aCoins = Number(preW.coins || 0)
+        if (aCoins !== bCoins) preCash.push({ atSec: b.atSec, netCashDelta: aCoins - bCoins })
+        if (sv.sim) {
+          sv.validActions.forEach((act, idx) => {
+            if (act.a === 'sell' && sv.sim.result.out[idx]?.ok) {
+              const sm = preSold.get(b.isleIndex) || {}
+              sm[act.id] = (sm[act.id] || 0) + Number(act.n || 0)
+              preSold.set(b.isleIndex, sm)
+            }
+          })
+        }
+      }
+    }
+
+    const bRaid = baseCand.trunkBucketsUsed[uStoch]
+    const pRaid = makePricesFn(scenarios[0])(bRaid, preSold)
+    preW = adapter.advanceTimeOnly(preW, bRaid.atSec, { futurePrices: pRaid })
+    preW = applyExogenousArrivals(preW, bRaid.exogenousArrivalsAtStart)
+
+    let states = [{ prob: 1, w: preW, cash: preCash }]
+    const trsAtU = baseCand.raidTransitionsByBucket?.[uStoch] || []
+    for (const tr of trsAtU) {
+      const nextStates = []
+      const outs = (tr.distribution?.outcomes || [{ kind: 'undetected', prob: 1, lootBag: {}, fineCoins: 0 }])
+        .filter((o) => o.prob > 1e-9)
+      for (const st of states) {
+        let wAfterPrep = adapter.cloneWorld(st.w)
+        const cashAfterPrep = [...st.cash]
+        if (tr.prepAndBuffActs?.length > 0) {
+          const bC = Number(wAfterPrep.coins || 0)
+          const svP = simulateValidBatch(adapter, wAfterPrep, tr.prepAndBuffActs, { t: bRaid.atSec, prices: pRaid })
+          wAfterPrep = svP.afterWorld
+          const aC = Number(wAfterPrep.coins || 0)
+          if (aC !== bC) cashAfterPrep.push({ atSec: bRaid.atSec, netCashDelta: aC - bC })
+        }
+        wAfterPrep = adapter.advanceTimeOnly(wAfterPrep, bRaid.atSec, { futurePrices: pRaid })
+        wAfterPrep.state.en = Math.max(0, Math.floor(Number(wAfterPrep.state?.en || 0)) - Number(tr.energyCost || 0))
+
+        for (const out of outs) {
+          let wBr = adapter.cloneWorld(wAfterPrep)
+          const cashBr = [...cashAfterPrep]
+          const arrivals = Object.entries(out.lootBag || {}).map(([id, n]) => ({ id, q: 0, n }))
+          if (arrivals.length > 0) wBr = applyExogenousArrivals(wBr, arrivals)
+          const actualFine = Math.min(Math.max(0, Number(wBr.coins || 0)), Math.max(0, Math.round(Number(out.fineCoins || 0))))
+          if (actualFine > 0) {
+            wBr.coins = Math.max(0, Number(wBr.coins || 0) - actualFine)
+            cashBr.push({ atSec: bRaid.atSec, netCashDelta: -actualFine })
+          }
+          nextStates.push({ prob: st.prob * out.prob, w: wBr, cash: cashBr })
+        }
+      }
+      states = nextStates
+    }
+
+    const remBuckets = (baseCand.allBuckets || []).slice(uStoch).map((b, idx) =>
+      idx === 0 ? { ...b, index: 0, exogenousArrivalsAtStart: [] } : { ...b, index: idx }
+    )
+    const remRaids = (baseCand.scheduledUpcomingRaids || []).filter((r) => Number(r.unlockAtSec) > bRaid.atSec)
+
+    let meanVal = 0
+    let totalBranches = 0
+    for (const br of states) {
+      if (isPastDeadline()) return { ok: false, value: baseCand.expectedValue, branchCount: 0 }
+      const subCand = evaluateTrunkPolicy(baseCand.policyMeta?.trunkPolicyMode || 'optimal', br.w, world0, {
+        customBuckets: remBuckets,
+        enableFirstBucketPlant: uStoch === 0 ? (baseCand.policyMeta?.enableFirstBucketPlant ?? true) : true,
+        enableFirstBucketStockBuy: uStoch === 0 ? (baseCand.policyMeta?.enableFirstBucketStockBuy ?? true) : true,
+        capexActionsAtStart: uStoch === 0 && startW === world0 ? preselectedCapexActions : [],
+        initialCashEventsOverride: br.cash,
+        initialSoldByIsleOverride: preSold,
+        scheduledUpcomingRaids: remRaids,
+      })
+      if (subCand.raidScheduleInfeasible || candidateHasDomesticStoch(subCand)) {
+        return { ok: false, value: baseCand.expectedValue, branchCount: 0 }
+      }
+      const rec = evalExactUpcomingRaidTree(subCand, br.w, br.cash, preSold, depth + 1)
+      if (!rec.ok) {
+        return { ok: false, value: baseCand.expectedValue, branchCount: 0 }
+      }
+      meanVal += br.prob * rec.value
+      totalBranches += rec.branchCount
+    }
+    return { ok: true, value: meanVal, branchCount: totalBranches }
+  }
+
+  // True Policy Expectation Evaluator (`Round-2 P1-1` + `v1.4.3 Discrete Raid Outcome Alignment`):
+  // Scores EVERY candidate BEFORE ranking so candidate comparison (`candidateModes`, `upstreamVariants`, `raidSubsets`)
   // and final quality reporting BOTH use true stochastic policy expectation (exact discrete outcome enumeration
-  // for single `harvest`/`fish`/`mine`, or paired Common-Random-Number M-stream Monte Carlo with `rand:`)!
+  // for single `harvest`/`fish`/`mine` and/or discrete guarded raid outcomes, or paired CRN M-stream Monte Carlo)!
   const scoreDomesticCandidate = (cand) => {
     const candRaids = cand.scheduledUpcomingRaids || []
-    const raidSig = candRaids.map((r) => `${r.targetId}@${r.unlockAtSec}:${r.energyCost}`).join('|')
+    const immSig = cand.immediateRaidMeta?.sig || ''
+    const raidSig = `${immSig}::${candRaids.map((r) => `${r.targetId}@${r.unlockAtSec}:${r.energyCost}`).join('|')}`
     let trunkStochCount = 0
     for (const bActs of cand.trunkActionsByBucket || []) {
       for (const a of bActs || []) if (adapter.isStochasticAction(a)) trunkStochCount++
@@ -7612,7 +7924,11 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       }
     }
     const hasDomStoch = (trunkStochCount + branchStochCount) > 0
-    if (!hasDomStoch) {
+    const hasImmStochRaid = Boolean(cand.immediateRaidMeta?.hasStochasticImmRaid)
+    const hasUpcomingStochRaid = Boolean((cand.raidTransitionsFlat || []).some((tr) => tr?.distribution?.isStochastic))
+    const hasAnyStochRaid = hasImmStochRaid || hasUpcomingStochRaid
+
+    if (!hasDomStoch && !hasAnyStochRaid) {
       cand.policyExpectedValue = cand.expectedValue
       cand.standardError = 0
       cand.confidenceInterval95 = null
@@ -7623,8 +7939,46 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       return cand
     }
 
-    const b0 = cand.trunkBucketsUsed?.[0]
-    const dom0 = cand.trunkActionsByBucket?.[0] || []
+    if (!hasDomStoch && hasAnyStochRaid) {
+      if (isPastDeadline()) {
+        cand.policyExpectedValue = cand.expectedValue
+        cand.standardError = 0
+        cand.confidenceInterval95 = null
+        cand.policySampleCount = 1
+        cand.valueInterpretation = 'deadline-truncated-single-stream'
+        return cand
+      }
+      if (cand.immediateRaidMeta?.evalExactExpectationFn) {
+        const immExact = cand.immediateRaidMeta.evalExactExpectationFn()
+        if (immExact.ok) {
+          cand.policyExpectedValue = immExact.value
+          cand.standardError = 0
+          cand.confidenceInterval95 = [immExact.value, immExact.value]
+          cand.policySampleCount = immExact.branchCount
+          cand.valueInterpretation = 'exact-discrete-policy-expectation'
+          return cand
+        }
+      } else {
+        const upExact = evalExactUpcomingRaidTree(
+          cand,
+          cand._evalStartWorld || world0,
+          cand._evalInitCash || null,
+          cand._evalInitSold || null,
+          0
+        )
+        if (upExact.ok) {
+          cand.policyExpectedValue = upExact.value
+          cand.standardError = 0
+          cand.confidenceInterval95 = [upExact.value, upExact.value]
+          cand.policySampleCount = upExact.branchCount
+          cand.valueInterpretation = 'exact-discrete-policy-expectation'
+          return cand
+        }
+      }
+    }
+
+    const b0 = cand.immediateRaidMeta ? null : cand.trunkBucketsUsed?.[0]
+    const dom0 = cand.immediateRaidMeta ? [] : (cand.trunkActionsByBucket?.[0] || [])
     const firstStochIdx = dom0.findIndex((a) => adapter.isStochasticAction(a))
     const rawContMode = cand.policyMeta?.trunkPolicyMode === 'hold-in-first-bucket' ? 'hold-in-first-bucket' : 'optimal'
     // When `firstStochIdx >= 0`, execution commits `compiledPrefix` at `t0` and re-enters the unified planner
@@ -7639,7 +7993,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       causalPref = computeCausalStochasticPrefix(adapter, w0Tmp, dom0, adapter.R.WORLD?.maxActions || 40).prefix
     }
     const compiledPrefix = firstStochIdx >= 0 ? causalPref : dom0
-    const cacheKey = b0
+    const cacheKey = b0 && !(cand.raidTransitionsByBucket?.[0]?.length > 0)
       ? JSON.stringify(
           firstStochIdx >= 0
             ? { k: 'pref', pref: compiledPrefix, r: raidSig }
@@ -7662,7 +8016,13 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     }
 
     let exactEvaluated = false
-    if (firstStochIdx >= 0 && trunkStochCount === 1 && branchStochCount === 0 && b0) {
+    if (
+      firstStochIdx >= 0 &&
+      trunkStochCount === 1 &&
+      branchStochCount === 0 &&
+      b0 &&
+      !(cand.raidTransitionsByBucket?.[0]?.length > 0)
+    ) {
       const detBefore = dom0.slice(0, firstStochIdx)
       const stochAct = dom0[firstStochIdx]
       if (stochAct.a === 'harvest' || stochAct.a === 'fish' || stochAct.a === 'mine') {
@@ -7696,6 +8056,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         if (exactBranches && exactBranches.length > 0) {
           let exactMean = 0
           let anyFurtherStoch = false
+          let totalLeafCount = 0
           for (const br of exactBranches) {
             if (isPastDeadline()) {
               anyFurtherStoch = true
@@ -7705,20 +8066,30 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
             const dC = Number(br.afterWorld.coins || 0) - Number(wAt0.coins || 0)
             if (dC !== 0) brCash.push({ atSec: b0.atSec, netCashDelta: dC })
             const cont = evalContinuationFromPostPrefix(br.afterWorld, brCash, preSold, null, contMode, candRaids)
-            const contStoch = (cont.trunkActionsByBucket || []).some((ba) => (ba || []).some((a) => adapter.isStochasticAction(a)))
-              || Object.values(cont.scenarioBranches || {}).some((sb) => (sb.bucketActions || []).some((ba) => (ba || []).some((a) => adapter.isStochasticAction(a))))
-            if (contStoch) {
+            if (candidateHasDomesticStoch(cont)) {
               anyFurtherStoch = true
               break
             }
-            exactMean += br.prob * cont.expectedValue
+            const contRaidTree = evalExactUpcomingRaidTree(
+              cont,
+              cont._evalStartWorld || br.afterWorld,
+              cont._evalInitCash || brCash,
+              cont._evalInitSold || preSold,
+              0
+            )
+            if (!contRaidTree.ok) {
+              anyFurtherStoch = true
+              break
+            }
+            exactMean += br.prob * contRaidTree.value
+            totalLeafCount += contRaidTree.branchCount
           }
           if (!anyFurtherStoch) {
             const stats = {
               policyExpectedValue: exactMean,
               standardError: 0,
               confidenceInterval95: [exactMean, exactMean],
-              policySampleCount: exactBranches.length,
+              policySampleCount: totalLeafCount || exactBranches.length,
               valueInterpretation: 'exact-discrete-policy-expectation',
             }
             scoredPrefixCache.set(cacheKey, stats)
@@ -7738,7 +8109,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
 
       // Pre-compute deterministic prefix state once when `firstStochIdx === -1 && b0`!
       let detPostPrefix = null
-      if (firstStochIdx === -1 && b0) {
+      if (firstStochIdx === -1 && b0 && !(cand.raidTransitionsByBucket?.[0]?.length > 0)) {
         const p0 = makePricesFn(scenarios[0])(b0, baseSoldByIsle)
         let wAt0 = adapter.advanceTimeOnly(world0, b0.atSec, { futurePrices: p0 })
         wAt0 = applyExogenousArrivals(wAt0, b0.exogenousArrivalsAtStart)
@@ -7765,13 +8136,15 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       const fixedStochPrefix = firstStochIdx >= 0 ? compiledPrefix : null
       for (let m = 0; m < M; m++) {
         if (m > 0 && isPastDeadline()) break
-        if (m === 0 && !fixedStochPrefix) {
-          // Stream 0 already ran identically in `evaluateTrunkPolicy(..., prngFactory: null)`!
+        if (m === 0 && !fixedStochPrefix && !hasAnyStochRaid && !cand.immediateRaidMeta) {
+          // Stream 0 already ran identically in `evaluateTrunkPolicy(..., prngFactory: null)` when no stochastic raid used conservative trunk!
           sampleVals.push(cand.expectedValue)
           continue
         }
         const prngFactory = () => adapter.makeSampleStreamPrng(m, world0.now)
-        if (fixedStochPrefix && b0) {
+        if (cand.immediateRaidMeta?.evalRolloutFn) {
+          sampleVals.push(cand.immediateRaidMeta.evalRolloutFn(prngFactory))
+        } else if (fixedStochPrefix && b0 && !(cand.raidTransitionsByBucket?.[0]?.length > 0)) {
           const p0 = makePricesFn(scenarios[0])(b0, baseSoldByIsle)
           let wAt0 = adapter.advanceTimeOnly(world0, b0.atSec, { futurePrices: p0 })
           wAt0 = applyExogenousArrivals(wAt0, b0.exogenousArrivalsAtStart)
@@ -7976,76 +8349,34 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     scoreDomesticCandidate(bestDomestic)
   }
 
-  // Unified Steal Raid Valuation:
-  // - Combinational `R.THIEF_ITEMS` + stamina prep
-  // - Sequential Conditional Multi-Raid Packing (prevents double-counting shared workshop/tier capacities across targets!)
-  // - Consistent Post-Prep Continuation Timeline (when `raidPrepActs` occupies `t0`, domestic work is evaluated at `t0 + minGap`!)
-  // - Joint Upcoming Raid Timeline Comparison (`∅` vs candidate subsets `C` on full-trajectory objective, zero food double-counting!)
+  // Unified Steal Raid Horizon & Executable Schedule (`v1.4.3`):
+  // - Ready (`t = t0`) and Upcoming (`t > t0`) neighbor raids enter ONE unified candidate pool `R_all`.
+  // - Candidate subsets `C ⊆ R_all` (`∅`, ready-only, upcoming-only, and ready + upcoming) are compared
+  //   on the EXACT SAME full-trajectory objective (`policyExpectedValue`) with shared stamina, rations,
+  //   thief-buff durations, cash, and workshop capacities — eliminating `selectedVisits.length === 0` gating!
+  // - Outputs explicit `plan.raidSchedule` (`evaluatedTargetIds`, `committedRaids`, `plannedPrepActs`,
+  //   `tacticalDecision`, `optimalLoadout`, `preconditions`) for `SnipeScheduler`.
+  const evaluatedTargetIdSet = new Set()
+  let raidEvalTruncatedByDeadline = false
+
+  const regenEveryPlan0 = adapter.R.WORLD?.regen || 180
+  const refWorldAt0 = adapter.advanceTimeOnly(world0, world0.now, { futurePrices: world0.prices || {} })
+  const plannedAtEnT0 = Math.max(world0.now - regenEveryPlan0, Math.floor(Number(refWorldAt0.state?.enT ?? world0.now)))
+
   const selectedVisits = []
   let raidPrepActs = []
   let raidAdjustedDomestic = bestDomestic
+  let committedRaids = []
   let committedUpcomingRaids = []
 
   if (
     allowedSet.has('visit') &&
     constraints.maxStealsPerIsleDay !== 0 &&
-    Array.isArray(envelope.beliefs?.visitBeliefs) &&
-    envelope.beliefs.visitBeliefs.length > 0
+    ((envelope.beliefs?.visitBeliefs?.length || 0) > 0 || (envelope.beliefs?.upcomingVisitBeliefs?.length || 0) > 0)
   ) {
-    const remStealBudget = constraints.maxStealsPerIsleDay == null
-      ? Infinity
-      : Math.max(0, constraints.maxStealsPerIsleDay - Number(envelope.reservedBudgets?.stealUsedOrReservedThisIsleDay || 0))
-    const minSpots = Number(options.minStealSpots ?? constraints.minStealSpots ?? 0)
-    const eligibleRawBeliefs = envelope.beliefs.visitBeliefs.filter(
-      (b) => b && b.targetId != null && b.totalSpots > 0 && b.totalSpots >= minSpots
-    )
-
-    if (remStealBudget > 0 && eligibleRawBeliefs.length > 0) {
-      const packRes = packRaidsOnMarginalContext(adapter, {
-        worldAtNow: world0,
-        marginalCtx: bestDomestic.marginalContext,
-        eligibleRawBeliefs,
-        rawNeighborTargetsById: options.rawNeighborTargetsById || null,
-        constraints,
-        allowedSet,
-        utilityTokens,
-        remStealBudget,
-        isPastDeadlineFn: isPastDeadline,
-      })
-
-      if (packRes && packRes.visits.length > 0) {
-        selectedVisits.push(...packRes.visits)
-        raidPrepActs = packRes.prepActs
-        if (raidPrepActs.length > 0) {
-          const tContRaid = Math.min(tHorizonEnd, world0.now + minGapSec)
-          const evalBaseWorld = adapter.advanceTimeOnly(packRes.afterPrepWorld, tContRaid, { futurePrices: world0.prices || {} })
-          const raidContBuckets = tContRaid < tHorizonEnd
-            ? buildEventBuckets(adapter, evalBaseWorld, {
-                horizonSec: tHorizonEnd - tContRaid,
-                deterministicArrivals: remArrivalsAfterT0,
-                maxBuckets: options.maxBuckets || 16,
-                coalesceWindowSec: options.coalesceWindowSec ?? 5,
-              }).buckets
-            : []
-          raidAdjustedDomestic = evaluateTrunkPolicy('optimal', evalBaseWorld, world0, {
-            customBuckets: raidContBuckets,
-            capexActionsAtStart: preselectedCapexActions,
-          })
-        } else {
-          raidAdjustedDomestic = bestDomestic
-        }
-      }
-    }
-  }
-
-  if (
-    selectedVisits.length === 0 &&
-    allowedSet.has('visit') &&
-    constraints.maxStealsPerIsleDay !== 0 &&
-    Array.isArray(envelope.beliefs?.upcomingVisitBeliefs) &&
-    envelope.beliefs.upcomingVisitBeliefs.length > 0 &&
-    !isPastDeadline()
-  ) {
+    if (isPastDeadline()) {
+      raidEvalTruncatedByDeadline = true
+    } else {
     const isle0 = adapter.R.isleIndex(world0.now)
     const maxPerIsleSteal = constraints.maxStealsPerIsleDay == null
       ? Infinity
@@ -8054,25 +8385,46 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       ? Infinity
       : Math.max(0, maxPerIsleSteal - Number(envelope.reservedBudgets?.stealUsedOrReservedThisIsleDay || 0))
     const minSpots = Number(options.minStealSpots ?? constraints.minStealSpots ?? 0)
-    const rawUpcoming = envelope.beliefs.upcomingVisitBeliefs.filter(
-      (b) =>
-        b &&
-        b.targetId != null &&
-        Number.isFinite(Number(b.unlockAtSec)) &&
-        Math.floor(Number(b.unlockAtSec)) > world0.now &&
-        Math.floor(Number(b.unlockAtSec)) <= tHorizonEnd &&
-        Number(b.totalSpots || 0) > 0 &&
-        Number(b.totalSpots || 0) >= minSpots
-    )
 
-    // Pre-filter gross-positive upcoming raids (zero stamina/food cost subtracted: food & stamina compete on full trajectory!)
-    const grossPositive = []
+    const rawReady = remIsle0StealBudget > 0
+      ? (envelope.beliefs?.visitBeliefs || [])
+          .filter((b) => b && b.targetId != null && Number(b.totalSpots || 0) > 0 && Number(b.totalSpots || 0) >= minSpots)
+          .map((b) => ({
+            ...b,
+            unlockAtSec: world0.now,
+            isImmediate: true,
+            exactUnlockKnown: true,
+            _rawNeighborTarget: options.rawNeighborTargetsById?.get(b.targetId) || null,
+          }))
+      : []
+
+    const rawUpcoming = (envelope.beliefs?.upcomingVisitBeliefs || [])
+      .filter(
+        (b) =>
+          b &&
+          b.targetId != null &&
+          Number.isFinite(Number(b.unlockAtSec)) &&
+          Math.floor(Number(b.unlockAtSec)) > world0.now &&
+          Math.floor(Number(b.unlockAtSec)) <= tHorizonEnd &&
+          Number(b.totalSpots || 0) > 0 &&
+          Number(b.totalSpots || 0) >= minSpots
+      )
+      .map((b) => ({
+        ...b,
+        unlockAtSec: Math.floor(Number(b.unlockAtSec)),
+        isImmediate: false,
+        exactUnlockKnown: Boolean(b.exactUnlockKnown),
+      }))
+
+    // Pre-filter gross-positive raid candidates (zero stamina/food cost subtracted; discrete integer outcomes only!)
     const baseEnForGross = bestDomestic.marginalContext?.baseWorldEn0 ?? Number(world0.state?.en || 0)
-    for (const ub of rawUpcoming) {
-      const unlockSec = Math.floor(Number(ub.unlockAtSec))
+    const evalCandidateGross = (candBelief) => {
+      const unlockSec = Math.floor(Number(candBelief.unlockAtSec))
       const iIdx = adapter.R.isleIndex(unlockSec)
-      if ((iIdx === isle0 ? remIsle0StealBudget : maxPerIsleSteal) <= 0) continue
-      const wAtUnlock = adapter.advanceTimeOnly(world0, unlockSec, { futurePrices: world0.prices || {} })
+      if ((iIdx === isle0 ? remIsle0StealBudget : maxPerIsleSteal) <= 0) return -Infinity
+      const wAtUnlock = unlockSec > world0.now
+        ? adapter.advanceTimeOnly(world0, unlockSec, { futurePrices: world0.prices || {} })
+        : refWorldAt0
       const buffCombos = buildThiefBuffCombinations(adapter, wAtUnlock, constraints, allowedSet)
       let bestGrossDelta = -Infinity
       for (const buffCombo of buffCombos) {
@@ -8080,50 +8432,79 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         let buffCost = 0
         if (buffCombo.length > 0) {
           buffCost = buffCombo.reduce((sAcc, a) => sAcc + Number(adapter.R.THIEF_ITEMS?.[a.id]?.price || 0), 0)
+          if (Number(wAtUnlock.coins || 0) - Number(constraints.cashReserveFloor || 0) < buffCost) continue
           const simB = adapter.simulateBatch(wAtUnlock, buffCombo, { t: unlockSec, prices: world0.prices || {} })
           if (!simB.allOk) continue
           wCand = simB.afterWorld
         }
-        const tr = computeExpectedRaidTransition(adapter, ub, wCand, null)
+        const tr = computeExpectedRaidTransition(adapter, candBelief, wCand, null)
         if (!(tr.energyCost > 0) || !(tr.belief?.totalSpots > 0)) continue
-        const fracGrossEst = tr.fracLoot.reduce(
-          (acc, fl) => acc + fl.fracQty * Math.max(Number(world0.prices?.[fl.id] || 0), Number(adapter.R.BASE_PRICE?.[fl.id] || 0)),
-          0
-        )
-        const intGrossEst = Object.entries(tr.intLootBag).reduce(
-          (acc, [id, q0]) => acc + q0 * Math.max(Number(world0.prices?.[id] || 0), Number(adapter.R.BASE_PRICE?.[id] || 0)),
-          0
-        )
-        const grossDelta = bestDomestic.marginalContext
-          ? evaluateMarginalRaidDelta(adapter, bestDomestic.marginalContext, {
-              invDeltaById: addBagToInvDelta({}, tr.intLootBag),
+        let grossDelta = 0
+        if (bestDomestic.marginalContext) {
+          for (const out of tr.distribution?.outcomes || []) {
+            if (!(out.prob > 1e-9)) continue
+            grossDelta += out.prob * evaluateMarginalRaidDelta(adapter, bestDomestic.marginalContext, {
+              invDeltaById: addBagToInvDelta({}, out.lootBag),
               postRaidEn: baseEnForGross,
-              cashSpent: tr.expFine + buffCost,
-            }) + fracGrossEst
-          : intGrossEst + fracGrossEst - tr.expFine - buffCost
+              cashSpent: Number(out.fineCoins || 0) + buffCost,
+            })
+          }
+        } else {
+          for (const out of tr.distribution?.outcomes || []) {
+            if (!(out.prob > 1e-9)) continue
+            const rawLootVal = Object.entries(out.lootBag || {}).reduce(
+              (acc, [id, q0]) => acc + q0 * Math.max(Number(world0.prices?.[id] || 0), Number(adapter.R.BASE_PRICE?.[id] || 0)),
+              0
+            )
+            grossDelta += out.prob * (rawLootVal - Number(out.fineCoins || 0) - buffCost)
+          }
+        }
         if (grossDelta > bestGrossDelta) bestGrossDelta = grossDelta
       }
-      if (bestGrossDelta > 1e-6) {
-        grossPositive.push({
-          belief: { ...ub, unlockAtSec: unlockSec },
-          grossDelta: bestGrossDelta,
-        })
-      }
+      return bestGrossDelta
     }
 
-    if (grossPositive.length > 0) {
-      grossPositive.sort((a, b) =>
-        (b.grossDelta - a.grossDelta) ||
+    const grossReady = []
+    for (const rb of rawReady) {
+      const g = evalCandidateGross(rb)
+      if (g > 1e-6) grossReady.push({ belief: rb, grossDelta: g })
+    }
+    const grossUpcoming = []
+    for (const ub of rawUpcoming) {
+      const g = evalCandidateGross(ub)
+      if (g > 1e-6) grossUpcoming.push({ belief: ub, grossDelta: g })
+    }
+
+    const sortByGrossDesc = (a, b) =>
+      (b.grossDelta - a.grossDelta) ||
+      (a.belief.unlockAtSec - b.belief.unlockAtSec) ||
+      (Number(a.belief.targetId) - Number(b.belief.targetId))
+    grossReady.sort(sortByGrossDesc)
+    grossUpcoming.sort(sortByGrossDesc)
+
+    // Balanced pool up to K = 4 preserving top ready AND top upcoming options so they compete directly!
+    const pickedPool = []
+    const pushUniqueCand = (item) => {
+      if (!item || pickedPool.length >= 4) return
+      const key = `${item.belief.targetId}@${item.belief.unlockAtSec}:${item.belief.isImmediate ? 1 : 0}`
+      if (pickedPool.some((x) => `${x.belief.targetId}@${x.belief.unlockAtSec}:${x.belief.isImmediate ? 1 : 0}` === key)) return
+      pickedPool.push(item)
+    }
+    for (let i = 0; i < Math.min(2, grossReady.length); i++) pushUniqueCand(grossReady[i])
+    for (let i = 0; i < Math.min(2, grossUpcoming.length); i++) pushUniqueCand(grossUpcoming[i])
+    for (const rem of [...grossReady.slice(2), ...grossUpcoming.slice(2)].sort(sortByGrossDesc)) {
+      if (pickedPool.length >= 4) break
+      pushUniqueCand(rem)
+    }
+
+    if (pickedPool.length > 0) {
+      pickedPool.sort((a, b) =>
         (a.belief.unlockAtSec - b.belief.unlockAtSec) ||
+        ((b.belief.isImmediate ? 1 : 0) - (a.belief.isImmediate ? 1 : 0)) ||
+        (b.grossDelta - a.grossDelta) ||
         (Number(a.belief.targetId) - Number(b.belief.targetId))
       )
-      const topUpcoming = grossPositive
-        .slice(0, 3)
-        .sort((a, b) =>
-          (a.belief.unlockAtSec - b.belief.unlockAtSec) ||
-          (Number(a.belief.targetId) - Number(b.belief.targetId))
-        )
-      const K = topUpcoming.length
+      const K = pickedPool.length
       const candidateSubsets = []
       for (let mask = 1; mask < (1 << K); mask++) {
         const sub = []
@@ -8133,7 +8514,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         const perIsleUsed = new Map()
         for (let bit = 0; bit < K; bit++) {
           if (!(mask & (1 << bit))) continue
-          const item = topUpcoming[bit]
+          const item = pickedPool[bit]
           const r = item.belief
           const natDay = adapter.R.worldDay(r.unlockAtSec)
           const ownerDayKey = `${r.targetId}:${natDay}`
@@ -8150,7 +8531,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
             break
           }
           perIsleUsed.set(rIsle, nextIsleUsed)
-          sub.push(r)
+          sub.push({ ...r, _grossDelta: item.grossDelta })
           grossSum += item.grossDelta
         }
         if (validSub && sub.length > 0) {
@@ -8159,67 +8540,423 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       }
       candidateSubsets.sort((a, b) => b.grossSum - a.grossSum || a.sub.length - b.sub.length)
 
-      let winningUpcomingCand = bestDomestic
+      let winningRaidCand = bestDomestic
       const baseModeForSub = bestDomestic.policyMeta?.trunkPolicyMode || 'optimal'
       const modesToTry = baseModeForSub !== 'optimal' ? ['optimal', baseModeForSub] : ['optimal']
+      const t0BuffCombos = buildThiefBuffCombinations(adapter, refWorldAt0, constraints, allowedSet)
 
       for (const { sub } of candidateSubsets) {
-        if (isPastDeadline()) break
-        const candBuckets = buildEventBuckets(adapter, world0, {
-          horizonSec: objectiveCfg.horizonSec,
-          deterministicArrivals: options.deterministicArrivals || [],
-          upcomingRaidSecs: sub.map((r) => Number(r.unlockAtSec)),
-          maxBuckets: (options.maxBuckets || 16) + sub.length,
-          coalesceWindowSec: options.coalesceWindowSec ?? 5,
-          preservePrefixThroughSec: options.preservePrefixThroughSec ?? null,
-          prefixMaxBuckets: options.prefixMaxBuckets != null ? options.prefixMaxBuckets + sub.length : null,
-        }).buckets
+        if (isPastDeadline()) {
+          raidEvalTruncatedByDeadline = true
+          break
+        }
+        const immSub = sub
+          .filter((r) => r.isImmediate)
+          .sort((a, b) => (b._grossDelta - a._grossDelta) || (Number(a.targetId) - Number(b.targetId)))
+        const futSub = sub
+          .filter((r) => !r.isImmediate)
+          .sort((a, b) => (a.unlockAtSec - b.unlockAtSec) || (Number(a.targetId) - Number(b.targetId)))
 
-        for (const mTry of modesToTry) {
-          if (isPastDeadline()) break
-          const rawCand = evaluateTrunkPolicy(mTry, world0, world0, {
-            customBuckets: candBuckets,
-            enableFirstBucketPlant: bestDomestic.policyMeta?.enableFirstBucketPlant ?? true,
-            enableFirstBucketStockBuy: bestDomestic.policyMeta?.enableFirstBucketStockBuy ?? true,
-            scheduledUpcomingRaids: sub,
-          })
-          if (rawCand.raidScheduleInfeasible) continue
-          if (hasImmediatePrefixStochastic(winningUpcomingCand) || hasImmediatePrefixStochastic(rawCand)) {
-            if (winningUpcomingCand.valueInterpretation == null) scoreDomesticCandidate(winningUpcomingCand)
-            scoreDomesticCandidate(rawCand)
+        if (immSub.length === 0) {
+          // Upcoming-only subset `futSub` (`t > t0`):
+          const candBuckets = buildEventBuckets(adapter, world0, {
+            horizonSec: objectiveCfg.horizonSec,
+            deterministicArrivals: options.deterministicArrivals || [],
+            upcomingRaidSecs: futSub.map((r) => Number(r.unlockAtSec)),
+            maxBuckets: (options.maxBuckets || 16) + futSub.length,
+            coalesceWindowSec: options.coalesceWindowSec ?? 5,
+            preservePrefixThroughSec: options.preservePrefixThroughSec ?? null,
+            prefixMaxBuckets: options.prefixMaxBuckets != null ? options.prefixMaxBuckets + futSub.length : null,
+          }).buckets
+
+          for (const mTry of modesToTry) {
+            if (isPastDeadline()) break
+            const rawCand = evaluateTrunkPolicy(mTry, world0, world0, {
+              customBuckets: candBuckets,
+              enableFirstBucketPlant: bestDomestic.policyMeta?.enableFirstBucketPlant ?? true,
+              enableFirstBucketStockBuy: bestDomestic.policyMeta?.enableFirstBucketStockBuy ?? true,
+              scheduledUpcomingRaids: futSub,
+            })
+            if (rawCand.raidScheduleInfeasible) continue
+            const hasStochRaidHere = Boolean((rawCand.raidTransitionsFlat || []).some((tr) => tr?.distribution?.isStochastic))
+            if (
+              hasStochRaidHere ||
+              hasImmediatePrefixStochastic(winningRaidCand) ||
+              hasImmediatePrefixStochastic(rawCand) ||
+              winningRaidCand.immediateRaidMeta
+            ) {
+              if (winningRaidCand.valueInterpretation == null) scoreDomesticCandidate(winningRaidCand)
+              scoreDomesticCandidate(rawCand)
+            }
+            if (rawCand.policyExpectedValue > winningRaidCand.policyExpectedValue + 1e-6) {
+              winningRaidCand = rawCand
+            }
           }
-          if (rawCand.policyExpectedValue > winningUpcomingCand.policyExpectedValue + 1e-6) {
-            winningUpcomingCand = rawCand
+        } else {
+          // Subset includes immediate `t0` raid(s) `immSub` (plus `0` or more upcoming raids `futSub`):
+          for (const buffCombo of t0BuffCombos) {
+            if (isPastDeadline()) break
+            let wAfterBuff0 = refWorldAt0
+            if (buffCombo.length > 0) {
+              const buffCost0 = buffCombo.reduce((sAcc, a) => sAcc + Number(adapter.R.THIEF_ITEMS?.[a.id]?.price || 0), 0)
+              if (Number(refWorldAt0.coins || 0) - Number(constraints.cashReserveFloor || 0) < buffCost0) continue
+              const stepB = adapter.simulateBatch(refWorldAt0, buffCombo, { t: world0.now, prices: world0.prices || {} })
+              if (!stepB.allOk) continue
+              wAfterBuff0 = stepB.afterWorld
+            }
+
+            const immTransList = []
+            let immValid = true
+            let totalImmEn = 0
+            for (const immR of immSub) {
+              const tr = computeExpectedRaidTransition(adapter, immR, wAfterBuff0, null)
+              if (!(tr.energyCost > 0) || !(tr.belief?.totalSpots > 0)) {
+                immValid = false
+                break
+              }
+              totalImmEn += tr.energyCost
+              immTransList.push({ raid: immR, trans: tr })
+            }
+            if (!immValid) continue
+
+            const prepRes0 = findCheapestRaidStaminaPrep(
+              adapter,
+              wAfterBuff0,
+              totalImmEn,
+              allowedSet,
+              utilityTokens,
+              constraints
+            )
+            if (!prepRes0.feasible) continue
+
+            const fullPrepActs0 = [...buffCombo, ...prepRes0.prepActs]
+            const prePrepEn0 = Math.max(0, Math.floor(Number(refWorldAt0.state?.en || 0)))
+            let wAfterPrep0 = refWorldAt0
+            let prepCashSpent0 = 0
+            const prepCashEvents0 = []
+            if (fullPrepActs0.length > 0) {
+              const bC = Number(refWorldAt0.coins || 0)
+              const simP = adapter.simulateBatch(refWorldAt0, fullPrepActs0, { t: world0.now, prices: world0.prices || {} })
+              if (!simP.allOk) continue
+              wAfterPrep0 = simP.afterWorld
+              const aC = Number(wAfterPrep0.coins || 0)
+              prepCashSpent0 = Math.max(0, bC - aC)
+              if (aC !== bC) prepCashEvents0.push({ atSec: world0.now, netCashDelta: aC - bC })
+            }
+            const postPrepEn0 = Math.max(0, Math.floor(Number(wAfterPrep0.state?.en || 0)))
+            if (postPrepEn0 < totalImmEn) continue
+
+            const prepEnGrant0 = Math.max(0, postPrepEn0 - prePrepEn0)
+            const reqEdMap0 = new Map()
+            let coffeeCnt0 = 0
+            for (const pa of prepRes0.prepActs) {
+              if (pa.a === 'coffee') coffeeCnt0++
+              else if (pa.a === 'eat') {
+                const ek = `${pa.id}:${pa.q ?? 0}`
+                reqEdMap0.set(ek, (reqEdMap0.get(ek) || 0) + 1)
+              }
+            }
+            const reqEdibles0 = [...reqEdMap0.entries()].map(([k, count]) => {
+              const [id, qRaw] = k.split(':')
+              return { id, q: Number(qRaw || 0), count }
+            })
+
+            const tContRaid = Math.min(tHorizonEnd, world0.now + minGapSec)
+            const remFutSub = futSub
+              .filter((r) => Number(r.unlockAtSec) <= tHorizonEnd)
+              .map((r) => (Number(r.unlockAtSec) < tContRaid ? { ...r, unlockAtSec: tContRaid } : r))
+
+            const buildContBucketsAt = (wStart) =>
+              (tContRaid < tHorizonEnd || objectiveCfg.horizonSec > 0)
+                ? buildEventBuckets(adapter, wStart, {
+                    horizonSec: Math.max(0, tHorizonEnd - wStart.now),
+                    deterministicArrivals: remArrivalsAfterT0,
+                    upcomingRaidSecs: remFutSub.map((r) => Number(r.unlockAtSec)),
+                    maxBuckets: (options.maxBuckets || 16) + remFutSub.length,
+                    coalesceWindowSec: options.coalesceWindowSec ?? 5,
+                    preservePrefixThroughSec: options.preservePrefixThroughSec ?? null,
+                    prefixMaxBuckets: options.prefixMaxBuckets != null ? options.prefixMaxBuckets + remFutSub.length : null,
+                  }).buckets
+                : []
+
+            // Build conservative post-`immSub` trunk world (`guaranteedArrivals` + `worstCaseFineCoins`)
+            let wTrunkImm = adapter.cloneWorld(wAfterPrep0)
+            const trunkCash0 = [...prepCashEvents0]
+            const immTransitions = []
+            for (let idxImm = 0; idxImm < immTransList.length; idxImm++) {
+              const { raid: immR, trans: tr } = immTransList[idxImm]
+              wTrunkImm.state.en = Math.max(0, Math.floor(Number(wTrunkImm.state?.en || 0)) - tr.energyCost)
+              if (tr.guaranteedArrivals.length > 0) {
+                wTrunkImm = applyExogenousArrivals(wTrunkImm, tr.guaranteedArrivals)
+              }
+              const worstFine = Math.min(Math.max(0, Number(wTrunkImm.coins || 0)), tr.worstCaseFineCoins)
+              if (worstFine > 0) {
+                wTrunkImm.coins = Math.max(0, Number(wTrunkImm.coins || 0) - worstFine)
+                trunkCash0.push({ atSec: world0.now, netCashDelta: -worstFine })
+              }
+              immTransitions.push({
+                targetId: immR.targetId,
+                targetName: tr.belief?.targetName || immR.targetName || String(immR.targetId),
+                unlockAtSec: world0.now,
+                isImmediate: true,
+                exactUnlockKnown: true,
+                atSec: world0.now,
+                totalSpots: Number(tr.belief?.totalSpots || immR.totalSpots || 0),
+                buffActs: idxImm === 0 ? buffCombo : [],
+                staminaPrepActs: idxImm === 0 ? prepRes0.prepActs : [],
+                prepAndBuffActs: idxImm === 0 ? fullPrepActs0 : [],
+                preconditions: idxImm === 0
+                  ? {
+                      minEnBeforePrep: Math.max(0, totalImmEn - prepEnGrant0),
+                      minCoinsBeforePrep: prepCashSpent0 > 0 ? Number(constraints.cashReserveFloor || 0) + prepCashSpent0 : 0,
+                      coffeeCount: coffeeCnt0,
+                      requiredEdibles: reqEdibles0,
+                    }
+                  : { minEnBeforePrep: tr.energyCost, minCoinsBeforePrep: 0, coffeeCount: 0, requiredEdibles: [] },
+                energyCost: tr.energyCost,
+                tacticalDecision: tr.belief?.tacticalDecision || immR.tacticalDecision || null,
+                optimalLoadout: tr.belief?.optimalLoadout || immR.optimalLoadout || null,
+                numGearChanges: Number(tr.belief?.numGearChanges ?? immR.numGearChanges ?? 0),
+                belief: tr.belief,
+                distribution: tr.distribution,
+              })
+            }
+
+            const evalBaseWorld = tContRaid > wTrunkImm.now
+              ? adapter.advanceTimeOnly(wTrunkImm, tContRaid, { futurePrices: world0.prices || {} })
+              : wTrunkImm
+            const raidContBuckets = buildContBucketsAt(evalBaseWorld)
+            const rawCand = evaluateTrunkPolicy('optimal', evalBaseWorld, world0, {
+              customBuckets: raidContBuckets,
+              capexActionsAtStart: preselectedCapexActions,
+              initialCashEventsOverride: trunkCash0,
+              initialSoldByIsleOverride: baseSoldByIsle,
+              scheduledUpcomingRaids: remFutSub,
+            })
+            if (rawCand.raidScheduleInfeasible) continue
+
+            const hasStochasticImmRaid = immTransList.some((x) => Boolean(x.trans.distribution?.isStochastic))
+            rawCand.immediateRaidMeta = {
+              sig: `${fullPrepActs0.map((a) => `${a.a}:${a.id || ''}:${a.q ?? ''}`).join(',')}=>${immTransList.map((x) => x.raid.targetId).join(',')}`,
+              hasPrepAtT0: fullPrepActs0.length > 0,
+              fullPrepActs0,
+              immTransitions,
+              hasStochasticImmRaid,
+              evalExactExpectationFn: () => {
+                let states = [{ prob: 1, w: adapter.cloneWorld(wAfterPrep0), cash: [...prepCashEvents0] }]
+                for (const { trans: tr } of immTransList) {
+                  const outs = (tr.distribution?.outcomes || [{ kind: 'undetected', prob: 1, lootBag: {}, fineCoins: 0 }])
+                    .filter((o) => o.prob > 1e-9)
+                  const nextStates = []
+                  for (const st of states) {
+                    let wStep = adapter.cloneWorld(st.w)
+                    wStep.state.en = Math.max(0, Math.floor(Number(wStep.state?.en || 0)) - tr.energyCost)
+                    for (const out of outs) {
+                      let wBr = adapter.cloneWorld(wStep)
+                      const cashBr = [...st.cash]
+                      const arrivals = Object.entries(out.lootBag || {}).map(([id, n]) => ({ id, q: 0, n }))
+                      if (arrivals.length > 0) wBr = applyExogenousArrivals(wBr, arrivals)
+                      const actualFine = Math.min(Math.max(0, Number(wBr.coins || 0)), Math.max(0, Math.round(Number(out.fineCoins || 0))))
+                      if (actualFine > 0) {
+                        wBr.coins = Math.max(0, Number(wBr.coins || 0) - actualFine)
+                        cashBr.push({ atSec: world0.now, netCashDelta: -actualFine })
+                      }
+                      nextStates.push({ prob: st.prob * out.prob, w: wBr, cash: cashBr })
+                    }
+                  }
+                  states = nextStates
+                }
+                if (states.length > 16) return { ok: false, value: rawCand.expectedValue, branchCount: 0 }
+                let meanVal = 0
+                let totalLeaves = 0
+                for (const br of states) {
+                  if (isPastDeadline()) return { ok: false, value: rawCand.expectedValue, branchCount: 0 }
+                  const wBrCont = tContRaid > br.w.now
+                    ? adapter.advanceTimeOnly(br.w, tContRaid, { futurePrices: world0.prices || {} })
+                    : br.w
+                  const brCand = evaluateTrunkPolicy('optimal', wBrCont, world0, {
+                    customBuckets: raidContBuckets,
+                    capexActionsAtStart: preselectedCapexActions,
+                    initialCashEventsOverride: br.cash,
+                    initialSoldByIsleOverride: baseSoldByIsle,
+                    scheduledUpcomingRaids: remFutSub,
+                  })
+                  if (brCand.raidScheduleInfeasible || candidateHasDomesticStoch(brCand)) {
+                    return { ok: false, value: rawCand.expectedValue, branchCount: 0 }
+                  }
+                  const rec = evalExactUpcomingRaidTree(brCand, wBrCont, br.cash, baseSoldByIsle, 0)
+                  if (!rec.ok) return { ok: false, value: rawCand.expectedValue, branchCount: 0 }
+                  meanVal += br.prob * rec.value
+                  totalLeaves += rec.branchCount
+                }
+                return { ok: true, value: meanVal, branchCount: totalLeaves }
+              },
+              evalRolloutFn: (prngFactory) => {
+                const raidRand = typeof prngFactory === 'function' ? prngFactory() : adapter.makeSampleStreamPrng(991, world0.now)
+                let wRoll = adapter.cloneWorld(wAfterPrep0)
+                const cashRoll = [...prepCashEvents0]
+                for (const { trans: tr } of immTransList) {
+                  wRoll.state.en = Math.max(0, Math.floor(Number(wRoll.state?.en || 0)) - tr.energyCost)
+                  const outs = tr.distribution?.outcomes || []
+                  const uDraw = raidRand()
+                  let chosen = outs[outs.length - 1] || { lootBag: {}, fineCoins: 0 }
+                  let acc = 0
+                  for (const o of outs) {
+                    acc += o.prob
+                    if (uDraw <= acc + 1e-12) {
+                      chosen = o
+                      break
+                    }
+                  }
+                  const arrivals = Object.entries(chosen.lootBag || {}).map(([id, n]) => ({ id, q: 0, n }))
+                  if (arrivals.length > 0) wRoll = applyExogenousArrivals(wRoll, arrivals)
+                  const actualFine = Math.min(Math.max(0, Number(wRoll.coins || 0)), Math.max(0, Math.round(Number(chosen.fineCoins || 0))))
+                  if (actualFine > 0) {
+                    wRoll.coins = Math.max(0, Number(wRoll.coins || 0) - actualFine)
+                    cashRoll.push({ atSec: world0.now, netCashDelta: -actualFine })
+                  }
+                }
+                const wRollCont = tContRaid > wRoll.now
+                  ? adapter.advanceTimeOnly(wRoll, tContRaid, { futurePrices: world0.prices || {} })
+                  : wRoll
+                let rollRes = evaluateTrunkPolicy('optimal', wRollCont, world0, {
+                  customBuckets: raidContBuckets,
+                  capexActionsAtStart: preselectedCapexActions,
+                  initialCashEventsOverride: cashRoll,
+                  initialSoldByIsleOverride: baseSoldByIsle,
+                  prngFactory,
+                  scheduledUpcomingRaids: remFutSub,
+                })
+                if (rollRes.raidScheduleInfeasible && remFutSub.length > 0) {
+                  rollRes = evaluateTrunkPolicy('optimal', wRollCont, world0, {
+                    capexActionsAtStart: preselectedCapexActions,
+                    initialCashEventsOverride: cashRoll,
+                    initialSoldByIsleOverride: baseSoldByIsle,
+                    prngFactory,
+                  })
+                }
+                return rollRes.expectedValue
+              },
+            }
+
+            if (winningRaidCand.valueInterpretation == null) scoreDomesticCandidate(winningRaidCand)
+            scoreDomesticCandidate(rawCand)
+            if (rawCand.policyExpectedValue > winningRaidCand.policyExpectedValue + 1e-6) {
+              winningRaidCand = rawCand
+            }
           }
         }
       }
 
-      if (winningUpcomingCand !== bestDomestic) {
-        if (!options.skipPostSelectionScoring && winningUpcomingCand.valueInterpretation == null) {
-          scoreDomesticCandidate(winningUpcomingCand)
+      if (winningRaidCand !== bestDomestic) {
+        if (!options.skipPostSelectionScoring && winningRaidCand.valueInterpretation == null) {
+          scoreDomesticCandidate(winningRaidCand)
         }
-        if (winningUpcomingCand.policyExpectedValue > bestDomestic.policyExpectedValue + 1e-6) {
-          raidAdjustedDomestic = winningUpcomingCand
-          committedUpcomingRaids = (winningUpcomingCand.scheduledUpcomingRaids || []).map((r) => ({
-            targetId: r.targetId,
-            unlockAtSec: Number(r.unlockAtSec),
-            exactUnlockKnown: Boolean(r.exactUnlockKnown),
-            energyCost: Number(r.energyCost || 0),
-            totalSpots: Number(r.totalSpots || 0),
+        if (bestDomestic.valueInterpretation == null) {
+          scoreDomesticCandidate(bestDomestic)
+        }
+        const netDeltaOverBestDom = winningRaidCand.policyExpectedValue - bestDomestic.policyExpectedValue
+        if (netDeltaOverBestDom > 1e-6) {
+          raidAdjustedDomestic = winningRaidCand
+
+          const immMeta = winningRaidCand.immediateRaidMeta || null
+          if (immMeta && immMeta.immTransitions.length > 0) {
+            raidPrepActs = immMeta.fullPrepActs0 || []
+            const firstImm = immMeta.immTransitions[0]
+            const vb0 = firstImm.belief || {}
+            selectedVisits.push({
+              targetId: firstImm.targetId,
+              targetName: firstImm.targetName,
+              totalSpots: firstImm.totalSpots,
+              lootBag: vb0.lootBag || {},
+              guardWinLootBag: vb0.guardWinLootBag || vb0.lootBag || {},
+              energyCost: firstImm.energyCost,
+              detectionProb: vb0.hasGuard ? Number(vb0.detectionProb || 0) : 0,
+              hasGuard: Boolean(vb0.hasGuard),
+              expectedDeltaObjectiveMid: netDeltaOverBestDom,
+              expectedDeltaObjectiveInterval: [netDeltaOverBestDom, netDeltaOverBestDom],
+              estimationSource: vb0.estimationSource || (vb0.hasGuard ? 'unobserved-wide-prior' : 'no-guard-deterministic'),
+              decisionScore: netDeltaOverBestDom,
+              tacticalDecision: firstImm.tacticalDecision || null,
+              optimalLoadout: firstImm.optimalLoadout || null,
+              numGearChanges: firstImm.numGearChanges || 0,
+              belief: vb0,
+            })
+          }
+
+          const allRecordedRaids = [
+            ...(immMeta?.immTransitions || []),
+            ...(winningRaidCand.raidTransitionsFlat || []),
+          ]
+          committedRaids = allRecordedRaids.map((tr) => ({
+            targetId: tr.targetId,
+            targetName: tr.targetName || String(tr.targetId),
+            unlockAtSec: Number(tr.unlockAtSec ?? tr.atSec ?? world0.now),
+            isImmediate: Boolean(tr.isImmediate),
+            exactUnlockKnown: Boolean(tr.exactUnlockKnown),
+            totalSpots: Number(tr.totalSpots || 0),
+            energyCost: Number(tr.energyCost || 0),
+            plannedBuffActs: tr.buffActs || [],
+            plannedStaminaPrepActs: tr.staminaPrepActs || [],
+            plannedPrepActs: tr.prepAndBuffActs || [],
+            tacticalDecision: tr.tacticalDecision || null,
+            optimalLoadout: tr.optimalLoadout || null,
+            numGearChanges: Number(tr.numGearChanges || 0),
+            expectedDeltaObjectiveMid: netDeltaOverBestDom,
+            preconditions: tr.preconditions || {
+              minEnBeforePrep: Number(tr.energyCost || 0),
+              minCoinsBeforePrep: 0,
+              coffeeCount: 0,
+              requiredEdibles: [],
+            },
           }))
+          committedUpcomingRaids = committedRaids
+            .filter((r) => !r.isImmediate && r.unlockAtSec > world0.now)
+            .map((r) => ({
+              targetId: r.targetId,
+              targetName: r.targetName,
+              unlockAtSec: r.unlockAtSec,
+              exactUnlockKnown: r.exactUnlockKnown,
+              energyCost: r.energyCost,
+              totalSpots: r.totalSpots,
+              plannedBuffActs: r.plannedBuffActs,
+              plannedStaminaPrepActs: r.plannedStaminaPrepActs,
+              plannedPrepActs: r.plannedPrepActs,
+              tacticalDecision: r.tacticalDecision,
+              optimalLoadout: r.optimalLoadout,
+              preconditions: r.preconditions,
+            }))
+        }
+      }
+      if (!raidEvalTruncatedByDeadline) {
+        for (const b of envelope.beliefs?.visitBeliefs || []) {
+          if (b?.targetId != null) evaluatedTargetIdSet.add(Number(b.targetId))
+        }
+        for (const b of envelope.beliefs?.upcomingVisitBeliefs || []) {
+          if (b?.targetId != null) evaluatedTargetIdSet.add(Number(b.targetId))
         }
       }
     }
+    if (!raidEvalTruncatedByDeadline && evaluatedTargetIdSet.size === 0) {
+      for (const b of envelope.beliefs?.visitBeliefs || []) {
+        if (b?.targetId != null) evaluatedTargetIdSet.add(Number(b.targetId))
+      }
+      for (const b of envelope.beliefs?.upcomingVisitBeliefs || []) {
+        if (b?.targetId != null) evaluatedTargetIdSet.add(Number(b.targetId))
+      }
+    }
+    }
   }
+  for (const cr of committedRaids) {
+    if (cr?.targetId != null) evaluatedTargetIdSet.add(Number(cr.targetId))
+  }
+  const evaluatedTargetIds = [...evaluatedTargetIdSet].filter(Number.isFinite).sort((a, b) => a - b)
 
   // Assemble `trunkBuckets` output:
-  // When `selectedVisits.length > 0 && raidPrepActs.length > 0`, `trunkBuckets[0]` at `t0` contains ONLY `raidPrepActs`,
-  // followed by the deferred continuation buckets `raidAdjustedDomestic.trunkBucketsUsed` at `t0 + minGap`!
-  const regenEveryPlan0 = adapter.R.WORLD?.regen || 180
-  const refWorldAt0 = adapter.advanceTimeOnly(world0, world0.now, { futurePrices: world0.prices || {} })
-  const plannedAtEnT0 = Math.max(world0.now - regenEveryPlan0, Math.floor(Number(refWorldAt0.state?.enT ?? world0.now)))
+  // When `selectedVisits.length > 0`, `trunkBuckets[0]` at `t0` holds `raidPrepActs` (`[]` when stamina/buffs are already ready,
+  // emitting `visitFirst = true`, or `fullPrepActs0` emitting `visitFirst = false`), followed by post-raid continuation at `t0 + minGap`!
   let trunkBuckets
-  if (selectedVisits.length > 0 && raidPrepActs.length > 0) {
+  if (selectedVisits.length > 0) {
     const firstMeta = trunkBucketsMeta[0]
     const contUsed = raidAdjustedDomestic.trunkBucketsUsed || []
     const contActs = raidAdjustedDomestic.trunkActionsByBucket || []
@@ -8229,7 +8966,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
         nextAtSec: contUsed.length > 0 ? contUsed[0].atSec : firstMeta.nextAtSec,
         domesticActions: raidPrepActs,
         visitActions: selectedVisits,
-        visitFirst: false,
+        visitFirst: raidPrepActs.length === 0,
         plannedPostBucketEnFloor: 0,
         plannedAtEnT: plannedAtEnT0,
       },
@@ -8247,14 +8984,14 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     trunkBuckets = usedMeta.map((b, idx) => ({
       ...b,
       domesticActions: raidAdjustedDomestic.trunkActionsByBucket[idx] || [],
-      visitActions: idx === 0 ? selectedVisits : [],
-      visitFirst: idx === 0 && selectedVisits.length > 0,
+      visitActions: [],
+      visitFirst: false,
       plannedPostBucketEnFloor: Number(raidAdjustedDomestic.bucketPlannedPostEnFloor?.[idx] || 0),
       ...(idx === 0 ? { plannedAtEnT: plannedAtEnT0 } : {}),
     }))
   }
 
-  // Check if any stochastic action appears in the active plan (across trunk OR scenario recourse branches!)
+  // Check if any stochastic action appears in the active plan (across trunk, scenario recourse branches, or guarded raids!)
   const branchHasStochastic = Object.values(raidAdjustedDomestic.scenarioBranches || {}).some((br) =>
     (br.bucketActions || []).some((bActs) => (bActs || []).some((a) => adapter.isStochasticAction(a)))
   )
@@ -8263,18 +9000,12 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
   ) || branchHasStochastic
   const hasStochasticInPlan = hasDomesticStochastic || selectedVisits.length > 0
 
-  const netRaidDeltaOverBase0 = selectedVisits.length > 0
-    ? (raidAdjustedDomestic.expectedValue + (selectedVisits[0]?.expectedDeltaObjectiveMid || 0)) - bestDomestic.expectedValue
-    : 0
-  const feasibleIncumbentValue = selectedVisits.length > 0
-    ? bestDomestic.policyExpectedValue + netRaidDeltaOverBase0
-    : raidAdjustedDomestic.policyExpectedValue
-  const standardError = selectedVisits.length > 0 ? 0 : (raidAdjustedDomestic.standardError || 0)
-  const confidenceInterval95 = selectedVisits.length > 0 ? null : (raidAdjustedDomestic.confidenceInterval95 || null)
-  const policySampleCount = selectedVisits.length > 0 ? null : (raidAdjustedDomestic.policySampleCount || null)
-  const valueInterpretation = selectedVisits.length > 0
-    ? 'conditional-scenario-expectation'
-    : (raidAdjustedDomestic.valueInterpretation || (scenarios.length === 1 ? 'deterministic-exact' : 'conditional-scenario-expectation'))
+  const feasibleIncumbentValue = raidAdjustedDomestic.policyExpectedValue
+  const standardError = raidAdjustedDomestic.standardError || 0
+  const confidenceInterval95 = raidAdjustedDomestic.confidenceInterval95 || null
+  const policySampleCount = raidAdjustedDomestic.policySampleCount || null
+  const valueInterpretation = raidAdjustedDomestic.valueInterpretation
+    || (scenarios.length === 1 ? 'deterministic-exact' : 'conditional-scenario-expectation')
 
   // Only claim valid upper bound when no unmodeled farm/stochastic actions were active in `activeActionTypes`!
   const boundRes = scenarios.length === 1
@@ -8314,7 +9045,9 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
   }
 
   // Determine exact event-driven & `minActionableEn`-driven `nextWakeSec` (zero `+5s` delay on deterministic events)
-  const activePlanBuckets = raidAdjustedDomestic.allBuckets || buckets
+  const activePlanBuckets = selectedVisits.length > 0
+    ? [trunkBuckets[0], ...(raidAdjustedDomestic.allBuckets || [])]
+    : (raidAdjustedDomestic.allBuckets || buckets)
   const fallbackWakeFloorSec = world0.now + Math.max(5, minGapSec)
   const bucket0Empty = (trunkBuckets[0]?.domesticActions?.length || 0) === 0 && (trunkBuckets[0]?.visitActions?.length || 0) === 0
   let nextWakeIdx = 1
@@ -8393,7 +9126,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       minActionableEn = Math.min(minActionableEn, activeFloorWake + (adapter.R.WORLD?.cost?.mine ?? 3))
     }
     if (allowedSet.has('fish') && Number(iqWake.fish || 0) < (adapter.R.WORLD?.daily?.fish || 80)) {
-      minActionableEn = Math.min(minActionableEn, activeFloorWake + (adapter.R.WORLD?.cost?.fish ?? 4))
+      minActionableEn = Math.min(minActionableEn, activeFloorWake + (adapter.R.WORLD?.daily?.fish ? (adapter.R.WORLD?.cost?.fish ?? 4) : 4))
     }
     if (curEnWake < minActionableEn && minActionableEn <= enMaxWake) {
       const regenEvery = adapter.R.WORLD?.regen || 180
@@ -8415,8 +9148,19 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
   const cpuDiff = startCpu && typeof process?.cpuUsage === 'function' ? process.cpuUsage(startCpu) : null
   const cpuMs = cpuDiff ? (cpuDiff.user + cpuDiff.system) / 1000 : elapsedMs
 
+  const planId = crypto.randomUUID()
+  const sourceFarmDigest = computeStaticFarmStateDigest(world0)
+  const raidSchedule = {
+    planId,
+    createdAtSec: world0.now,
+    sourceFarmDigest,
+    evaluatedTargetIds,
+    committedRaids,
+    truncatedByDeadline: raidEvalTruncatedByDeadline,
+  }
+
   const planOut = {
-    planId: crypto.randomUUID(),
+    planId,
     account: envelope.account,
     rulesHash: adapter.rulesHash,
     objectiveHash: objectiveCfg.objectiveHash,
@@ -8426,6 +9170,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     horizonSec: objectiveCfg.horizonSec,
     terminalMethod: objectiveCfg.terminalSupplyMode,
     trunkBuckets,
+    raidSchedule,
     committedUpcomingRaids,
     scenarioBranches: raidAdjustedDomestic.scenarioBranches,
     marginalContext: raidAdjustedDomestic.marginalContext || bestDomestic.marginalContext || null,
@@ -8472,21 +9217,17 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
   }
   if (options.skipPostSelectionScoring) {
     planOut._finalizePostSelectionQuality = () => {
-      const targetCand = selectedVisits.length > 0 ? bestDomestic : raidAdjustedDomestic
+      const targetCand = raidAdjustedDomestic
       if (!targetCand || targetCand.valueInterpretation != null) return
       const tFin0 = performance.now()
       scoreDomesticCandidate(targetCand)
       const q = planOut.quality
-      const nextIncumbent = selectedVisits.length > 0
-        ? bestDomestic.policyExpectedValue + netRaidDeltaOverBase0
-        : targetCand.policyExpectedValue
+      const nextIncumbent = targetCand.policyExpectedValue
       q.feasibleIncumbentValue = nextIncumbent
-      if (selectedVisits.length === 0) {
-        q.standardError = targetCand.standardError || 0
-        q.confidenceInterval95 = targetCand.confidenceInterval95 || null
-        q.policySampleCount = targetCand.policySampleCount || null
-        q.valueInterpretation = targetCand.valueInterpretation || q.valueInterpretation
-      }
+      q.standardError = targetCand.standardError || 0
+      q.confidenceInterval95 = targetCand.confidenceInterval95 || null
+      q.policySampleCount = targetCand.policySampleCount || null
+      q.valueInterpretation = targetCand.valueInterpretation || q.valueInterpretation
       if (boundRes.validUpperBound != null) {
         if (boundRes.validUpperBound + 1e-6 < nextIncumbent) {
           q.solverStatus = 'bound-violation-error'
@@ -9387,10 +10128,13 @@ export function createUnifiedRaidEvaluator(adapter, world, {
     'goal', 'visit', 'wait',
   ])
 
+  const curStaticFarmDigest = computeStaticFarmStateDigest(world0)
   let marginalCtx = precomputedMarginalContext
   if (
     marginalCtx &&
-    ((marginalCtx.sourceWorldRev != null && world0.rev != null && marginalCtx.sourceWorldRev !== world0.rev) ||
+    ((marginalCtx.sourceFarmDigest != null
+      ? marginalCtx.sourceFarmDigest !== curStaticFarmDigest
+      : (marginalCtx.sourceWorldRev != null && world0.rev != null && marginalCtx.sourceWorldRev !== world0.rev)) ||
       (marginalCtx.sourceIsleIndex != null && marginalCtx.sourceIsleIndex !== adapter.R.isleIndex(world0.now)) ||
       (marginalCtx.sourceWorldDay != null && marginalCtx.sourceWorldDay !== adapter.R.worldDay(world0.now)))
   ) {

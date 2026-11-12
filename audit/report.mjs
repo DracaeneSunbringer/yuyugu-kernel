@@ -1,4 +1,4 @@
-import { detectRollingDeferral, evaluateTrajectoryObjective } from '../model/objective.mjs'
+import { buildObjectiveConfig, detectRollingDeferral, evaluateTrajectoryObjective } from '../model/objective.mjs'
 import { auditTransactionReplay } from './replay.mjs'
 import { auditDecisionAgainstReference } from './reference-solver.mjs'
 
@@ -29,6 +29,7 @@ export async function buildAuditDecisionReport({
   scenarios = null,
   explicitPricesByStep = null,
   deterministicArrivals = [],
+  visitBeliefs = null,
   upcomingVisitBeliefs = null,
   reservedStealUsedThisIsleDay = null,
   objectiveCfg = null,
@@ -79,6 +80,9 @@ export async function buildAuditDecisionReport({
       if (!scenarios && Array.isArray(archivedEnvelope?.beliefs?.scenarios) && archivedEnvelope.beliefs.scenarios.length > 0) {
         scenarios = archivedEnvelope.beliefs.scenarios
       }
+      if (!visitBeliefs && Array.isArray(archivedEnvelope?.beliefs?.visitBeliefs)) {
+        visitBeliefs = archivedEnvelope.beliefs.visitBeliefs
+      }
       if (!upcomingVisitBeliefs && Array.isArray(archivedEnvelope?.beliefs?.upcomingVisitBeliefs)) {
         upcomingVisitBeliefs = archivedEnvelope.beliefs.upcomingVisitBeliefs
       }
@@ -106,6 +110,7 @@ export async function buildAuditDecisionReport({
   actualFirstActions ||= []
   scenarios ||= [{ id: 'baseline', weight: 1.0, externalSupplyFactor: 0.96 }]
   constraints ||= {}
+  objectiveCfg ||= buildObjectiveConfig()
 
   // Reconstruct chronological `commitmentHistory` from `journal` if not explicitly passed!
   if (!commitmentHistory) {
@@ -141,6 +146,7 @@ export async function buildAuditDecisionReport({
     scenarios,
     explicitPricesByStep,
     deterministicArrivals,
+    visitBeliefs: visitBeliefs || [],
     upcomingVisitBeliefs: upcomingVisitBeliefs || [],
     reservedStealUsedThisIsleDay: Number(reservedStealUsedThisIsleDay || 0),
     objectiveCfg,
@@ -182,6 +188,7 @@ export async function buildAuditDecisionReport({
       scenarios: [{ ...exPostRealizedScenario, weight: 1.0 }],
       explicitPricesByStep: exPostRealizedScenario.explicitPricesByStep || explicitPricesByStep,
       deterministicArrivals,
+      visitBeliefs: visitBeliefs || [],
       upcomingVisitBeliefs: upcomingVisitBeliefs || [],
       reservedStealUsedThisIsleDay: Number(reservedStealUsedThisIsleDay || 0),
       objectiveCfg,

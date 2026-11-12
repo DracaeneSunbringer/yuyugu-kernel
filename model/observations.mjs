@@ -157,6 +157,215 @@ export function computeConstraintsHash(constraints) {
   return crypto.createHash('sha256').update(JSON.stringify(constraints), 'utf8').digest('hex')
 }
 
+const NON_STATIC_FARM_STATE_KEYS = new Set(['xs', 'en', 'enT', 'enDay'])
+
+function canonicalizeForDigest(val) {
+  if (val === null || typeof val !== 'object') return val
+  if (Array.isArray(val)) return val.map(canonicalizeForDigest)
+  const sortedKeys = Object.keys(val).sort()
+  const out = {}
+  for (const k of sortedKeys) {
+    if (val[k] !== undefined) {
+      out[k] = canonicalizeForDigest(val[k])
+    }
+  }
+  return out
+}
+
+/**
+ * Canonical SHA-256 digest of all farm-domain static state fields on `world`,
+ * explicitly isolating out B16 cultivation state (`state.xs`) and passive regen clocks (`en`, `enT`, `enDay`),
+ * as well as transport-level `world.rev` / `world.now`.
+ */
+export function computeStaticFarmStateDigest(world) {
+  if (!world || typeof world !== 'object') return 'null'
+  const rawState = world.state && typeof world.state === 'object' ? world.state : {}
+  const farmState = {}
+  for (const k of Object.keys(rawState).sort()) {
+    if (NON_STATIC_FARM_STATE_KEYS.has(k)) continue
+    if (rawState[k] !== undefined) {
+      farmState[k] = canonicalizeForDigest(rawState[k])
+    }
+  }
+  const payload = {
+    clockStart: Number(world.clockStart || 0),
+    coins: Number(world.coins || 0),
+    prices: canonicalizeForDigest(world.prices || {}),
+    rumors: canonicalizeForDigest(world.rumors || null),
+    state: farmState,
+  }
+  return crypto.createHash('sha256').update(JSON.stringify(payload), 'utf8').digest('hex').slice(0, 24)
+}
+
+/**
+ * Full farm-domain identity digest including refreshed stamina `(en, enT, enDay)` while excluding `state.xs` and `world.rev`.
+ */
+export function computeFarmDomainDigest(world, adapter = null) {
+  if (!world || typeof world !== 'object') return 'null'
+  const wRef = (adapter && typeof adapter.advanceTimeOnly === 'function' && Number.isFinite(world.now))
+    ? adapter.advanceTimeOnly(world, world.now)
+    : world
+  const staticDigest = computeStaticFarmStateDigest(wRef)
+  const en = Number(wRef.state?.en || 0)
+  const enT = Number(wRef.state?.enT || 0)
+  const enDay = String(wRef.state?.enDay || '')
+  return `${staticDigest}:${en}:${enT}:${enDay}`
+}
+
+/**
+ * Verifies that `liveWorld` is passively compatible with `baseWorld` on the farm domain
+ * (i.e. only time passed and/or isolated `state.xs` changed, with zero unmodeled farm mutations).
+ */
+export function isFarmDomainPassiveCompatible(adapter, baseWorld, liveWorld, {
+  isWaitPlan = false,
+  staticDigestBase = null,
+} = {}) {
+  if (!adapter || !baseWorld || !liveWorld) return false
+  const baseNow = Math.floor(Number(baseWorld.now || 0))
+  const liveNow = Math.floor(Number(liveWorld.now || 0))
+  if (liveNow < baseNow) return false
+  if (adapter.R.isleIndex(liveNow) !== adapter.R.isleIndex(baseNow)) return false
+  if (adapter.R.worldDay(liveNow) !== adapter.R.worldDay(baseNow)) return false
+
+  if (baseWorld.rev != null && liveWorld.rev != null) {
+    const bRev = Number(baseWorld.rev)
+    const lRev = Number(liveWorld.rev)
+    if (lRev < bRev) return false
+    if (lRev > bRev) {
+      const baseXs = JSON.stringify(canonicalizeForDigest(baseWorld.state?.xs ?? null))
+      const liveXs = JSON.stringify(canonicalizeForDigest(liveWorld.state?.xs ?? null))
+      if (baseXs === liveXs) return false
+    }
+  }
+
+  const baseStatic = staticDigestBase || computeStaticFarmStateDigest(baseWorld)
+  const liveStatic = computeStaticFarmStateDigest(liveWorld)
+  if (baseStatic !== liveStatic) return false
+
+  const baseAtBase = adapter.advanceTimeOnly(baseWorld, baseNow)
+  const baseAdvancedToLive = adapter.advanceTimeOnly(baseWorld, liveNow)
+  const liveRefreshed = adapter.advanceTimeOnly(liveWorld, liveNow)
+
+  if (Number(baseAdvancedToLive.state?.en || 0) !== Number(liveRefreshed.state?.en || 0)) {
+    return false
+  }
+  if (Number(baseAdvancedToLive.state?.enT || 0) !== Number(liveRefreshed.state?.enT || 0)) {
+    return false
+  }
+  if (isWaitPlan && Number(liveRefreshed.state?.en || 0) > Number(baseAtBase.state?.en || 0)) {
+    return false
+  }
+  return true
+}
+
+/**
+ * Resolves a neighbor raid belief into its exact discrete physical outcome branches:
+ * `{ undetected, guard-win, guard-tie, guard-loss }`.
+ *
+ * Every branch carries strictly integer `lootBag` and discrete integer `fineCoins`
+ * (zero fractional items, zero unsold-item-to-cash conversion).
+ */
+export function resolveRaidOutcomeDistribution(adapter, raidBelief, visitorWorld = null, nowSec = visitorWorld?.now, {
+  mode = 'auto',
+} = {}) {
+  const vb = (visitorWorld && raidBelief)
+    ? recomputeVisitBeliefForVisitor(adapter, raidBelief, visitorWorld, nowSec ?? visitorWorld.now)
+    : raidBelief
+  if (!vb) {
+    return {
+      belief: null,
+      energyCost: 0,
+      outcomes: [],
+      expectedLootBag: {},
+      guaranteedLootBag: {},
+      expectedFineCoins: 0,
+      worstCaseFineCoins: 0,
+      isStochastic: false,
+    }
+  }
+
+  const energyCost = Math.max(0, Math.floor(Number(vb.energyCost || 0)))
+  const pDet = vb.hasGuard ? Math.max(0, Math.min(1, Number(vb.detectionProb || 0))) : 0
+  const pUndet = Math.max(0, 1 - pDet)
+
+  const wLo = Math.max(0, Math.min(1, Number(vb.winInterval?.[0] ?? (vb.hasGuard ? 0.25 : 1))))
+  const wHi = Math.max(wLo, Math.min(1, Number(vb.winInterval?.[1] ?? (vb.hasGuard ? 0.85 : 1))))
+  const wMid = 0.5 * (wLo + wHi)
+
+  const lLoRaw = Math.max(0, Math.min(1, Number(vb.lossInterval?.[0] ?? (vb.hasGuard ? Math.max(0, 1 - wHi) : 0))))
+  const lHiRaw = Math.max(lLoRaw, Math.min(1, Number(vb.lossInterval?.[1] ?? (vb.hasGuard ? Math.max(0, 1 - wLo) : 0))))
+  const lLo = Math.min(Math.max(0, 1 - wHi), lLoRaw)
+  const lHi = Math.min(Math.max(0, 1 - wLo), lHiRaw)
+  const lMid = Math.min(Math.max(0, 1 - wMid), 0.5 * (lLoRaw + lHiRaw))
+
+  const useConservative = mode === 'conservative'
+    || (mode === 'auto' && vb.estimationSource === 'unobserved-wide-prior')
+  const useOptimistic = mode === 'optimistic'
+
+  const wCond = !vb.hasGuard ? 1 : (useConservative ? wLo : (useOptimistic ? wHi : wMid))
+  const lCond = !vb.hasGuard ? 0 : (useConservative ? lHi : (useOptimistic ? lLo : lMid))
+  const dCond = !vb.hasGuard ? 0 : Math.max(0, 1 - wCond - lCond)
+
+  const cleanIntBag = (bag) => {
+    const out = {}
+    for (const [id, rawQty] of Object.entries(bag || {})) {
+      const n = Math.max(0, Math.round(Number(rawQty || 0)))
+      if (n > 0) out[id] = n
+    }
+    return out
+  }
+
+  const undetBag = cleanIntBag(vb.lootBag)
+  const winBag = cleanIntBag(vb.guardWinLootBag || vb.lootBag)
+  const estFine = Math.max(0, Math.round(Number(vb.estimatedFineOnLoss || 0)))
+
+  const rawOutcomes = [
+    { kind: 'undetected', prob: pUndet, lootBag: undetBag, fineCoins: 0 },
+    { kind: 'guard-win', prob: pDet * wCond, lootBag: winBag, fineCoins: 0 },
+    { kind: 'guard-tie', prob: pDet * dCond, lootBag: {}, fineCoins: 0 },
+    { kind: 'guard-loss', prob: pDet * lCond, lootBag: {}, fineCoins: estFine },
+  ].filter((o) => o.prob > 1e-12)
+
+  const pSum = rawOutcomes.reduce((s, o) => s + o.prob, 0) || 1
+  const outcomes = rawOutcomes.map((o) => ({ ...o, prob: o.prob / pSum }))
+
+  const allIds = new Set([
+    ...Object.keys(undetBag),
+    ...Object.keys(winBag),
+  ])
+  const expectedLootBag = {}
+  const guaranteedLootBag = {}
+  for (const id of allIds) {
+    let expQty = 0
+    let minQty = outcomes.length > 0 ? Infinity : 0
+    for (const o of outcomes) {
+      const q = Number(o.lootBag[id] || 0)
+      expQty += o.prob * q
+      if (q < minQty) minQty = q
+    }
+    if (expQty > 1e-12) expectedLootBag[id] = expQty
+    if (minQty > 0 && Number.isFinite(minQty)) guaranteedLootBag[id] = minQty
+  }
+
+  let expectedFineCoins = 0
+  let worstCaseFineCoins = 0
+  for (const o of outcomes) {
+    expectedFineCoins += o.prob * o.fineCoins
+    if (o.fineCoins > worstCaseFineCoins) worstCaseFineCoins = o.fineCoins
+  }
+
+  return {
+    belief: vb,
+    energyCost,
+    outcomes,
+    expectedLootBag,
+    guaranteedLootBag,
+    expectedFineCoins,
+    worstCaseFineCoins,
+    isStochastic: outcomes.length > 1,
+  }
+}
+
 export function buildVisitTargetBelief(adapter, visitorWorld, targetBundle, nowSec = visitorWorld?.now) {
   const { R, graph } = adapter
   const owner = targetBundle?.owner || {}

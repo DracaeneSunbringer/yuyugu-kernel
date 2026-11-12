@@ -1,6 +1,11 @@
 import crypto from 'node:crypto'
 import { Worker } from 'node:worker_threads'
 import { buildObjectiveConfig } from '../model/objective.mjs'
+import {
+  computeFarmDomainDigest,
+  computeStaticFarmStateDigest,
+  isFarmDomainPassiveCompatible,
+} from '../model/observations.mjs'
 import { compileExecutablePrefix, computeEarliestDomesticTransitionSec } from '../planner/compile-prefix.mjs'
 
 function canonicalizeBeliefItem(b) {
@@ -110,6 +115,8 @@ export class PlanCache {
     const entry = {
       account,
       rev: Number(worldBefore.rev ?? -1),
+      worldBefore,
+      staticFarmDigest: computeStaticFarmStateDigest(worldBefore),
       atSec: Math.floor(Number(worldBefore.now || 0)),
       isleIndex: adapter.R.isleIndex(worldBefore.now),
       naturalDay: adapter.R.worldDay(worldBefore.now),
@@ -126,7 +133,21 @@ export class PlanCache {
       horizonStability,
       createdAtMs,
     }
-    this.byAccount.set(account, entry)
+    const prevList = Array.isArray(this.byAccount.get(account)) ? this.byAccount.get(account) : []
+    const nextList = prevList.filter((prev) => {
+      if (!prev) return false
+      if (prev.atSec === entry.atSec) return false
+      if (
+        Number(entry.rev) > Number(prev.rev) &&
+        entry.staticFarmDigest !== prev.staticFarmDigest
+      ) {
+        return false
+      }
+      return true
+    })
+    nextList.push(entry)
+    nextList.sort((a, b) => b.atSec - a.atSec)
+    this.byAccount.set(account, nextList.slice(0, 3))
     return entry
   }
 
@@ -138,43 +159,73 @@ export class PlanCache {
     objectiveHash,
     neighborSig = 'none',
     maxClockDriftSec = Infinity,
+    evictExpired = true,
   }) {
-    const entry = this.byAccount.get(account)
-    if (!entry || !world) return null
-    if (Number(world.rev ?? -2) !== entry.rev) {
-      if (Number(world.rev ?? -2) > entry.rev) {
-        this.byAccount.delete(account)
-      }
-      return null
-    }
-    const nowW = Math.floor(Number(world.now || 0))
-    const driftSec = nowW - entry.atSec
-    if (driftSec < 0 || driftSec > maxClockDriftSec) return null
-    if (nowW >= entry.invalidateAtSec) {
+    const rawEntries = this.byAccount.get(account)
+    if (!rawEntries || !world) return null
+    const entries = Array.isArray(rawEntries) ? rawEntries : [rawEntries]
+    if (entries.length === 0) {
       this.byAccount.delete(account)
       return null
     }
-    if (adapter.R.isleIndex(world.now) !== entry.isleIndex) return null
-    if (adapter.R.worldDay(world.now) !== entry.naturalDay) return null
-    if (constraintsHash && entry.constraintsHash !== constraintsHash) return null
-    if (objectiveHash && entry.objectiveHash !== objectiveHash) return null
-    if (entry.neighborSig !== neighborSig) return null
-    if (Number(world.coins || 0) !== entry.coins) return null
-    const refreshedEn = adapter.advanceTimeOnly
-      ? Number(adapter.advanceTimeOnly(world, world.now).state?.en || 0)
-      : Number(world.state?.en || 0)
-    if (refreshedEn < entry.en) return null
-    if (entry.isWaitPlan && refreshedEn > entry.en) return null
-    if (JSON.stringify(world.state?.iq || {}) !== entry.iqJson) return null
+    const nowW = Math.floor(Number(world.now || 0))
+    const liveRev = Number(world.rev ?? -2)
+    let liveStaticDigest = null
+    const getLiveStaticDigest = () => {
+      if (liveStaticDigest === null) liveStaticDigest = computeStaticFarmStateDigest(world)
+      return liveStaticDigest
+    }
 
-    const compiled = compileExecutablePrefix(adapter, world, entry.plan, { maxClockDriftSec })
-    if (compiled.status === 'plan-invalid') {
-      return null
+    const kept = []
+    let hit = null
+    for (const entry of entries) {
+      if (!entry) continue
+      if (nowW >= entry.invalidateAtSec) continue
+
+      const driftSec = nowW - entry.atSec
+      if (driftSec < 0) {
+        // Future pre-warmed entry (e.g. `farmWakeSec` pre-warm while an intermediate `xian` wake occurs):
+        // keep it unless an actual static farm mutation already invalidated its base farm state.
+        if (liveRev > entry.rev && getLiveStaticDigest() !== entry.staticFarmDigest) {
+          continue
+        }
+        kept.push(entry)
+        continue
+      }
+
+      if (
+        !isFarmDomainPassiveCompatible(adapter, entry.worldBefore, world, {
+          isWaitPlan: entry.isWaitPlan,
+          staticDigestBase: entry.staticFarmDigest,
+        })
+      ) {
+        if (liveRev <= entry.rev) {
+          kept.push(entry)
+        }
+        continue
+      }
+
+      kept.push(entry)
+      if (hit) continue
+      if (driftSec > maxClockDriftSec) continue
+      if (constraintsHash && entry.constraintsHash !== constraintsHash) continue
+      if (objectiveHash && entry.objectiveHash !== objectiveHash) continue
+      if (entry.neighborSig !== neighborSig) continue
+
+      const compiled = compileExecutablePrefix(adapter, world, entry.plan, { maxClockDriftSec })
+      if (compiled.status === 'plan-invalid') continue
+      hit = {
+        ...entry,
+        compiled,
+      }
     }
-    return {
-      ...entry,
-      compiled,
+
+    if (evictExpired) {
+      if (kept.length === 0) this.byAccount.delete(account)
+      else this.byAccount.set(account, kept)
     }
+
+    return hit
   }
 
   invalidate(account) {
@@ -197,6 +248,7 @@ export class AsyncPlanManager {
     this.rulesPath = rulesPath
     this.cache = cache
     this.worker = null
+    this.closed = false
     this.nextJobId = 1
     this.activeJob = null
     this.stats = {
@@ -344,8 +396,9 @@ export class AsyncPlanManager {
     }
   }
 
-  _buildMatchKey({ account, world, constraintsHash, objectiveHash, neighborSig, runStability }) {
-    return `${account}:${world?.rev}:${Math.floor(Number(world?.now || 0))}:${constraintsHash}:${objectiveHash}:${neighborSig}:${runStability ? 1 : 0}`
+  _buildMatchKey({ adapter, account, world, constraintsHash, objectiveHash, neighborSig, runStability }) {
+    const farmKey = computeFarmDomainDigest(world, adapter)
+    return `${account}:${farmKey}:${Math.floor(Number(world?.now || 0))}:${constraintsHash}:${objectiveHash}:${neighborSig}:${runStability ? 1 : 0}`
   }
 
   _startWorkerJob({
@@ -371,6 +424,7 @@ export class AsyncPlanManager {
 
     const jobId = this.nextJobId++
     const matchKey = this._buildMatchKey({
+      adapter,
       account,
       world: envelope.observed.world,
       constraintsHash: envelope.constraintsHash,
@@ -442,6 +496,8 @@ export class AsyncPlanManager {
       account,
       matchKey,
       rev: Number(jobWorld?.rev ?? -1),
+      worldBefore: jobWorld,
+      staticFarmDigest: computeStaticFarmStateDigest(jobWorld),
       atSec: jobAtSec,
       isleIndex: adapter ? adapter.R.isleIndex(jobWorld?.now || 0) : null,
       naturalDay: adapter ? adapter.R.worldDay(jobWorld?.now || 0) : null,
@@ -528,6 +584,7 @@ export class AsyncPlanManager {
     }
 
     const matchKey = this._buildMatchKey({
+      adapter,
       account,
       world,
       constraintsHash: envelope.constraintsHash,
@@ -538,20 +595,23 @@ export class AsyncPlanManager {
 
     const isCompatibleInFlight = (candJob) => {
       if (!candJob) return false
-      if (candJob.matchKey === matchKey) return true
+      if (candJob.matchKey === matchKey && Number(world?.rev ?? -2) === candJob.rev) return true
       const nowW = Math.floor(Number(world?.now || 0))
       const drift = nowW - Number(candJob.atSec || 0)
       if (candJob.account !== account) return false
-      if (Number(world?.rev ?? -2) !== candJob.rev) return false
       if (drift < 0 || drift > maxClockDriftSec) return false
       if (nowW >= candJob.invalidateAtSec) return false
-      if (adapter && (adapter.R.isleIndex(world.now) !== candJob.isleIndex || adapter.R.worldDay(world.now) !== candJob.naturalDay)) return false
       if (candJob.constraintsHash !== envelope.constraintsHash) return false
       if (candJob.objectiveHash !== objCfg.objectiveHash) return false
       if (candJob.neighborSig !== neighborSig) return false
-      if (Number(world?.coins || 0) !== candJob.coins) return false
-      if (Number(world?.state?.en || 0) < candJob.en) return false
-      if (JSON.stringify(world?.state?.iq || {}) !== candJob.iqJson) return false
+      if (
+        !isFarmDomainPassiveCompatible(adapter, candJob.worldBefore, world, {
+          isWaitPlan: false,
+          staticDigestBase: candJob.staticFarmDigest,
+        })
+      ) {
+        return false
+      }
       return true
     }
 
@@ -704,8 +764,9 @@ export class AsyncPlanManager {
     solverOptions = {},
     runStability = false,
     deadlineAtMs = Infinity,
+    nowMsFn = Date.now,
   }) {
-    if (this.activeJob) return null
+    if (this.closed || this.activeJob) return null
     const objCfg = objectiveCfg?.objectiveHash
       ? objectiveCfg
       : buildObjectiveConfig(objectiveCfg || {})
@@ -717,6 +778,7 @@ export class AsyncPlanManager {
       constraintsHash: envelope.constraintsHash,
       objectiveHash: objCfg.objectiveHash,
       neighborSig,
+      evictExpired: false,
     })
     if (already) return Promise.resolve({ status: 'cache-hit', plan: already.plan })
 
@@ -731,12 +793,14 @@ export class AsyncPlanManager {
       solverOptions,
       runStability,
       deadlineAtMs,
+      nowMsFn,
       isBackground: true,
     })
     return job.promise
   }
 
   async close() {
+    this.closed = true
     this.activeJob = null
     const w = this.worker
     this.worker = null

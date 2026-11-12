@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import {
+  computeStaticFarmStateDigest,
   normalizeUserConstraints,
 } from '../model/observations.mjs'
 import {
@@ -64,13 +65,60 @@ export class SnipeScheduler {
     // Keep most recent raw `visit` snapshots in memory so `runControllerStep` & `executeStagedSnipe` get exact `isle` + `posterior`
     this._liveVisitBundles = new Map()
     this._evaluatorCache = { key: null, evaluator: null }
+    this.activeRaidSchedule = null
+  }
+
+  syncCommittedRaidSchedule(plan, world = null) {
+    if (!this.isStealEnabled()) {
+      this.activeRaidSchedule = null
+      return null
+    }
+    const rs = plan?.raidSchedule
+    if (!rs || typeof rs !== 'object') {
+      return this.activeRaidSchedule
+    }
+    const evaluatedTargetSet = new Set((rs.evaluatedTargetIds || []).map(Number).filter(Number.isFinite))
+    const committedByTargetId = new Map()
+    for (const cr of rs.committedRaids || []) {
+      const tid = Number(cr?.targetId)
+      if (Number.isFinite(tid)) {
+        committedByTargetId.set(tid, cr)
+        const key = String(tid)
+        if (this.data?.targets?.[key] && !cr.isImmediate) {
+          this.data.targets[key].plannedPrepActs = cr.plannedPrepActs || []
+          if (cr.numGearChanges != null) {
+            this.data.targets[key].numGearChanges = Number(cr.numGearChanges || 0)
+          }
+        }
+      }
+    }
+    this.activeRaidSchedule = {
+      planId: rs.planId || plan?.planId || null,
+      createdAtSec: Number(rs.createdAtSec ?? plan?.serverNow ?? world?.now ?? 0),
+      sourceFarmDigest: rs.sourceFarmDigest || (world ? computeStaticFarmStateDigest(world) : null),
+      evaluatedTargetSet,
+      committedByTargetId,
+      committedRaids: [...(rs.committedRaids || [])],
+      needsRefresh: false,
+      refreshReason: null,
+    }
+    return this.activeRaidSchedule
+  }
+
+  needsScheduleRefresh() {
+    return Boolean(this.activeRaidSchedule?.needsRefresh)
+  }
+
+  getScheduleRefreshReason() {
+    return this.activeRaidSchedule?.refreshReason || null
   }
 
   _makeEvaluatorCacheKey(adapter, visitorWorld, constraints) {
     const now = Number(visitorWorld?.now || 0)
+    const staticDigest = computeStaticFarmStateDigest(visitorWorld)
     return [
       adapter?.rulesHash || '',
-      visitorWorld?.rev ?? 0,
+      staticDigest,
       adapter?.R?.isleIndex ? adapter.R.isleIndex(now) : 0,
       adapter?.R?.worldDay ? adapter.R.worldDay(now) : '',
       Math.floor(Number(visitorWorld?.state?.en || 0)),
@@ -87,16 +135,17 @@ export class SnipeScheduler {
   primeUnifiedBaseline(adapter, visitorWorld, marginalContext, userConstraints = {}) {
     if (!this.isStealEnabled() || !adapter || !visitorWorld || !marginalContext) return null
     const now = Number(visitorWorld?.now || 0)
-    const revMismatch = marginalContext.sourceWorldRev != null
-      && visitorWorld?.rev != null
-      && marginalContext.sourceWorldRev !== visitorWorld.rev
+    const staticDigest = computeStaticFarmStateDigest(visitorWorld)
+    const farmMismatch = marginalContext.sourceFarmDigest != null
+      ? marginalContext.sourceFarmDigest !== staticDigest
+      : (marginalContext.sourceWorldRev != null && visitorWorld?.rev != null && marginalContext.sourceWorldRev !== visitorWorld.rev)
     const isleMismatch = marginalContext.sourceIsleIndex != null
       && adapter?.R?.isleIndex
       && marginalContext.sourceIsleIndex !== adapter.R.isleIndex(now)
     const dayMismatch = marginalContext.sourceWorldDay != null
       && adapter?.R?.worldDay
       && marginalContext.sourceWorldDay !== adapter.R.worldDay(now)
-    if (revMismatch || isleMismatch || dayMismatch) {
+    if (farmMismatch || isleMismatch || dayMismatch) {
       this.invalidateUnifiedBaseline()
       return null
     }
@@ -517,6 +566,29 @@ export class SnipeScheduler {
       gearData: effGearCtx.gearData || null,
       observedPanels: effGearCtx.observedPanels || null,
     })
+
+    if (this.activeRaidSchedule) {
+      const comm = this.activeRaidSchedule.committedByTargetId.get(idNum)
+      if (comm && !comm.isImmediate) {
+        const lostEligibility = !entry.upcomingEligible && !entry.readyEligible
+        const unlockShifted = entry.expectedUnlockAt != null
+          && Math.abs(Number(entry.expectedUnlockAt) - Number(comm.unlockAtSec)) > 2
+        const spotsDropped = Number(entry.upcomingSpots || entry.stealableCount || 0) < Number(comm.totalSpots || 0)
+        if (lostEligibility || unlockShifted || spotsDropped) {
+          this.activeRaidSchedule.needsRefresh = true
+          this.activeRaidSchedule.refreshReason = `committed-target-drifted:${idNum}`
+        }
+      } else if (!this.activeRaidSchedule.evaluatedTargetSet.has(idNum)) {
+        if (
+          (entry.readyEligible && Number(entry.projectedScore || 0) > 0) ||
+          (entry.upcomingEligible && Number(entry.projectedScore || 0) > 0)
+        ) {
+          this.activeRaidSchedule.needsRefresh = true
+          this.activeRaidSchedule.refreshReason = `new-positive-ev-target:${idNum}`
+        }
+      }
+    }
+
     this.save(nowSec)
     return entry
   }
@@ -580,6 +652,11 @@ export class SnipeScheduler {
       entry.updatedAt = nowSec
       this.data.targets[key] = entry
       this._liveVisitBundles.delete(idNum)
+      if (this.activeRaidSchedule?.committedByTargetId?.has(idNum) && entry.expectedUnlockAt == null) {
+        this.activeRaidSchedule.committedByTargetId.delete(idNum)
+        this.activeRaidSchedule.needsRefresh = true
+        this.activeRaidSchedule.refreshReason = `committed-target-rejected:${idNum}`
+      }
       this.save(nowSec)
       return entry
     }
@@ -619,6 +696,9 @@ export class SnipeScheduler {
       }
       entry.nextProbeAt = nowSec + 300
       this._liveVisitBundles.delete(idNum)
+      if (this.activeRaidSchedule?.committedByTargetId?.has(idNum)) {
+        this.activeRaidSchedule.committedByTargetId.delete(idNum)
+      }
     } else {
       // Draw: spots remain on island, brief 4s cooldown before re-evaluating
       entry.cooldownUntil = nowSec + 4
@@ -679,22 +759,67 @@ export class SnipeScheduler {
   }
 
   /**
-   * Returns earliest unblocked `exactUnlockKnown` target and `leadSec = expectedUnlockAt - nowSec`.
+   * Returns earliest unblocked `exactUnlockKnown` target and `leadSec = expectedUnlockAt - nowSec`,
+   * enforcing `this.activeRaidSchedule` when synced from `solveUnifiedPlan`:
+   *   - Targets committed in `plan.raidSchedule` execute with their committed prep/loadout metadata.
+   *   - Targets already evaluated and rejected by `plan.raidSchedule` are strictly skipped.
+   *   - Newly discovered targets outside `evaluatedTargetIds`:
+   *       * if `leadSec > ceil(T_prep + 2)`, mark `needsRefresh = true` so `live-daemon` wakes `runControllerStep` first;
+   *       * if `leadSec <= ceil(T_prep + 2)` (imminent unplanned discovery), allow immediate fast-path staging with audit reason.
    */
   nextExactUnlockInfo(nowSec) {
     if (!this.isStealEnabled()) return null
     let best = null
+    const sched = this.activeRaidSchedule
     for (const entry of Object.values(this.data.targets || {})) {
       if (!entry || this.isTargetBlocked(entry, nowSec)) continue
       if (!entry.upcomingEligible || !entry.exactUnlockKnown || entry.expectedUnlockAt == null) continue
       const leadSec = Number(entry.expectedUnlockAt) - nowSec
       if (leadSec < -20) continue
-      if (!best || entry.expectedUnlockAt < best.unlockAt || (entry.expectedUnlockAt === best.unlockAt && (entry.projectedScore || 0) > (best.entry.projectedScore || 0))) {
+
+      const idNum = Number(entry.id)
+      let committedRaid = null
+      let unplannedImminentDiscovery = false
+      let effectiveEntry = entry
+
+      if (sched) {
+        const comm = sched.committedByTargetId.get(idNum) || null
+        if (comm) {
+          if (comm.isImmediate && !(Number(entry.expectedUnlockAt) > nowSec)) continue
+          committedRaid = comm
+          effectiveEntry = {
+            ...entry,
+            plannedPrepActs: comm.plannedPrepActs || entry.plannedPrepActs || [],
+            numGearChanges: comm.numGearChanges ?? entry.numGearChanges,
+          }
+        } else if (sched.evaluatedTargetSet.has(idNum)) {
+          continue
+        } else {
+          const immWindow = Math.ceil(this.computePhysicalPrepLeadSec(entry) + 2)
+          if (leadSec > immWindow) {
+            sched.needsRefresh = true
+            if (!sched.refreshReason) {
+              sched.refreshReason = `new-positive-ev-target:${idNum}`
+            }
+            continue
+          }
+          unplannedImminentDiscovery = true
+        }
+      }
+
+      if (
+        !best ||
+        entry.expectedUnlockAt < best.unlockAt ||
+        (entry.expectedUnlockAt === best.unlockAt && (entry.projectedScore || 0) > (best.entry.projectedScore || 0))
+      ) {
         best = {
-          targetId: entry.id,
-          entry,
+          targetId: idNum,
+          entry: effectiveEntry,
+          rawEntry: entry,
           unlockAt: Number(entry.expectedUnlockAt),
           leadSec,
+          committedRaid,
+          unplannedImminentDiscovery,
         }
       }
     }
@@ -703,8 +828,13 @@ export class SnipeScheduler {
 
   hasReadyTargetNow(nowSec) {
     if (!this.isStealEnabled()) return false
+    const sched = this.activeRaidSchedule
     for (const entry of Object.values(this.data.targets || {})) {
       if (!entry || this.isTargetBlocked(entry, nowSec)) continue
+      const idNum = Number(entry.id)
+      if (sched && sched.evaluatedTargetSet.has(idNum) && !sched.committedByTargetId.has(idNum)) {
+        continue
+      }
       if (entry.readyEligible && Number(entry.stealableCount || 0) >= this.minStealSpots && Number(entry.projectedScore || 0) > 0) {
         return true
       }
@@ -776,7 +906,7 @@ export class SnipeScheduler {
     const candidates = []
     for (const e of Object.values(this.data.targets || {})) {
       if (!e || this.isTargetBlocked(e, nowSec)) continue
-      if (e.readyEligible) continue
+      if (e.readyEligible && !(Number(e.upcomingSpots || 0) > Number(e.stealableCount || 0))) continue
       if (!e.upcomingEligible || e.expectedUnlockAt == null) continue
       const unlockAtSec = Math.floor(Number(e.expectedUnlockAt))
       const lead = unlockAtSec - nowSec
@@ -882,12 +1012,23 @@ export class SnipeScheduler {
     }
 
     const { targetId, entry, unlockAt } = nextInfo
+    const rawEntry = this.data.targets[String(targetId)] || nextInfo.rawEntry || entry
+    const committedRaid = nextInfo.committedRaid
+      || this.activeRaidSchedule?.committedByTargetId?.get(Number(targetId))
+      || null
+    const schedulePlanId = this.activeRaidSchedule?.planId || null
+    let usedCommittedSchedule = false
+    let scheduleReselectReason = nextInfo.unplannedImminentDiscovery
+      ? 'imminent-unplanned-discovery-reselect'
+      : (this.activeRaidSchedule && !committedRaid ? 'unscheduled-fallback' : null)
+    let prepFallbackReason = null
     const constraints = normalizeUserConstraints(userConstraints, this.accountKey)
 
     // 1) Guard-log freshness check if target had a prior un-synced loss
-    if (entry.needsGuardLogSync && this.profileStorePath) {
+    if (rawEntry.needsGuardLogSync && this.profileStorePath) {
       await syncGuardLogProfiles(httpClient, this.accountKey, { storePath: this.profileStorePath })
-      entry.needsGuardLogSync = false
+      rawEntry.needsGuardLogSync = false
+      this.data.targets[String(targetId)] = rawEntry
       const cached = this._liveVisitBundles.get(targetId)
       if (cached) {
         const wCheck = await fetchWorldFn()
@@ -936,102 +1077,165 @@ export class SnipeScheduler {
         return { status: 'steal-budget-exhausted', targetId }
       }
 
-      // 2) Exact Unified Re-Evaluation on `liveWorld` (`< 5ms`) for thief buffs, stamina prep & cached combat loadout!
+      // 2) Committed Raid Contract Fast-Path (`< 1ms` live precondition check, 0 duplicate evaluation!)
+      //    with fail-closed Unified Re-Evaluation fallback if preconditions drifted or target was unplanned.
       const cachedRec = this._liveVisitBundles.get(targetId)
-      const evaluator = this.getUnifiedEvaluator(adapter, liveWorld, { userConstraints: constraints })
       let fullPrepBatch = []
-      let neededEn = Math.max(1, Number(entry.projectedEnergyCost || 6))
-      let precomputedDecision = cachedRec?.tacticalDecision || null
+      let neededEn = Math.max(1, Number(committedRaid?.energyCost || rawEntry.projectedEnergyCost || 6))
+      let precomputedDecision = committedRaid?.tacticalDecision || cachedRec?.tacticalDecision || null
 
-      let activeCachedRec = cachedRec
-      if (!(activeCachedRec?.waveBundle || activeCachedRec?.bundle) && typeof httpClient?.getJson === 'function' && (unlockAt - httpClient.estimatedServerNowSec()) >= 2) {
-        try {
-          const freshSnap = await httpClient.getJson(`/api/pet/world/visit/${targetId}`)
-          if (freshSnap && freshSnap.owner) {
-            this.recordVisitSnapshot(adapter, liveWorld, targetId, freshSnap, {
-              allowThiefBuffPurchase: constraints.allowThiefBuffPurchase !== false,
-              cashReserveFloor: Number(constraints.cashReserveFloor || 0),
-            })
-            activeCachedRec = this._liveVisitBundles.get(targetId) || null
-          }
-        } catch {
-          // Non-fatal fallback to persisted entry fields if mock/test endpoint lacks GET /visit/:id
-        }
-      }
+      if (committedRaid && !committedRaid.isImmediate) {
+        const unlockMatches = Math.abs(Number(unlockAt) - Number(committedRaid.unlockAtSec ?? unlockAt)) <= 2
+        const spotsStillOk = Number(rawEntry.upcomingSpots || rawEntry.stealableCount || committedRaid.totalSpots || 0) >= this.minStealSpots
+        if (unlockMatches && spotsStillOk) {
+          let precondOk = true
+          let simW = adapter.advanceTimeOnly(liveWorld, liveWorld.now)
+          const verifiedCommittedPrep = []
 
-      if (activeCachedRec?.waveBundle || activeCachedRec?.bundle) {
-        const baseWave = activeCachedRec.waveBundle || activeCachedRec.bundle
-        const effGearCtx = activeCachedRec.gearData
-          ? { gearData: activeCachedRec.gearData, observedPanels: activeCachedRec.observedPanels }
-          : this._readCachedGearContext()
-        const livePosterior = (baseWave.owner?.guard && effGearCtx.gearData && this.profileStorePath)
-          ? computeGuardPosteriorForTarget(effGearCtx.gearData, targetId, {
-              knownOpponentLevel: baseWave.owner.level || entry.level || null,
-              observedPanels: effGearCtx.observedPanels,
-              storePath: this.profileStorePath,
-            })
-          : (baseWave.posterior || null)
-        const liveEval = evaluator.evaluateTargetWave(
-          { ...baseWave, posterior: livePosterior },
-          unlockAt,
-          { visitorWorldOverride: liveWorld, remStealBudget: remSteals }
-        )
-        if (!liveEval.profitable || !(liveEval.decisionScore > 0)) {
-          entry.upcomingEligible = false
-          entry.readyEligible = false
-          this.save(liveWorld.now)
-          return { status: 'aborted-non-positive-unified-ev', targetId, decisionScore: liveEval.decisionScore }
-        }
-        fullPrepBatch = liveEval.prepActs || []
-        neededEn = liveEval.neededEn || neededEn
-        precomputedDecision = liveEval.tacticalDecision || livePosterior?.decision || precomputedDecision
-      } else {
-        let curSimW = adapter.advanceTimeOnly(liveWorld, liveWorld.now)
-        const rebuiltPrep = []
-        for (const act of entry.plannedPrepActs || []) {
-          const buffDef = act?.a === 'buy' ? adapter.R.THIEF_ITEMS?.[act.id] : null
-          if (!buffDef || constraints.allowThiefBuffPurchase === false) continue
-          const curEff = adapter.R.b12Effect?.(curSimW.state, buffDef.slot, curSimW.now)
-          if (curEff?.legacy || (curEff && curEff.id !== act.id)) continue
-          if (curEff && curEff.id === act.id && curEff.until > curSimW.now + 60) continue
-          const step = adapter.simulateBatch(curSimW, [act], { t: curSimW.now, prices: curSimW.prices })
-          if (step.allOk) {
-            rebuiltPrep.push(act)
-            curSimW = step.afterWorld
-          }
-        }
-        if (Number(curSimW.state?.en || 0) < neededEn) {
-          const prepRes = findCheapestRaidStaminaPrep(
-            adapter,
-            curSimW,
-            neededEn,
-            new Set(['eat', 'coffee', 'stockBuy']),
-            discoverRuleUtilityTokens(adapter),
-            constraints
-          )
-          if (prepRes.feasible) {
-            rebuiltPrep.push(...prepRes.prepActs)
-          }
-        }
-        fullPrepBatch = rebuiltPrep
-      }
-
-      if (fullPrepBatch.length > 0) {
-        const verifiedPrep = []
-        let simW = adapter.advanceTimeOnly(liveWorld, liveWorld.now)
-        for (const act of fullPrepBatch) {
-          if ((act.a === 'eat' || act.a === 'coffee') && Number(simW.state?.en || 0) >= neededEn) continue
-          const step = adapter.simulateBatch(simW, [act], { t: simW.now, prices: simW.prices })
-          if (step.allOk) {
-            verifiedPrep.push(act)
+          for (const act of committedRaid.plannedBuffActs || []) {
+            const buffDef = act?.a === 'buy' ? adapter.R.THIEF_ITEMS?.[act.id] : null
+            if (!buffDef || constraints.allowThiefBuffPurchase === false) continue
+            const curEff = adapter.R.b12Effect?.(simW.state, buffDef.slot, simW.now)
+            if (curEff && curEff.id === act.id && curEff.until > simW.now + 60) continue
+            if (curEff?.legacy || (curEff && curEff.id !== act.id)) {
+              precondOk = false
+              break
+            }
+            const step = adapter.simulateBatch(simW, [act], { t: simW.now, prices: simW.prices })
+            if (!step.allOk) {
+              precondOk = false
+              break
+            }
+            verifiedCommittedPrep.push(act)
             simW = step.afterWorld
           }
+
+          if (precondOk && Math.floor(Number(simW.state?.en || 0)) < neededEn) {
+            for (const act of committedRaid.plannedStaminaPrepActs || []) {
+              if ((act.a === 'eat' || act.a === 'coffee') && Math.floor(Number(simW.state?.en || 0)) >= neededEn) continue
+              const step = adapter.simulateBatch(simW, [act], { t: simW.now, prices: simW.prices })
+              if (!step.allOk) {
+                precondOk = false
+                break
+              }
+              verifiedCommittedPrep.push(act)
+              simW = step.afterWorld
+            }
+          }
+
+          const minCashFloor = Number(
+            committedRaid.preconditions?.minCashFloor ?? constraints.cashReserveFloor ?? 0
+          )
+          if (
+            precondOk &&
+            Math.floor(Number(simW.state?.en || 0)) >= neededEn &&
+            Number(simW.coins || 0) >= minCashFloor
+          ) {
+            usedCommittedSchedule = true
+            fullPrepBatch = verifiedCommittedPrep
+            precomputedDecision = committedRaid.tacticalDecision || cachedRec?.tacticalDecision || null
+          } else {
+            prepFallbackReason = 'committed-precondition-drift'
+          }
+        } else {
+          prepFallbackReason = !unlockMatches ? 'committed-unlock-drifted' : 'committed-spots-dropped'
         }
-        fullPrepBatch = verifiedPrep
+      }
+
+      if (!usedCommittedSchedule) {
+        const evaluator = this.getUnifiedEvaluator(adapter, liveWorld, { userConstraints: constraints })
+        let activeCachedRec = cachedRec
+        if (!(activeCachedRec?.waveBundle || activeCachedRec?.bundle) && typeof httpClient?.getJson === 'function' && (unlockAt - httpClient.estimatedServerNowSec()) >= 2) {
+          try {
+            const freshSnap = await httpClient.getJson(`/api/pet/world/visit/${targetId}`)
+            if (freshSnap && freshSnap.owner) {
+              this.recordVisitSnapshot(adapter, liveWorld, targetId, freshSnap, {
+                allowThiefBuffPurchase: constraints.allowThiefBuffPurchase !== false,
+                cashReserveFloor: Number(constraints.cashReserveFloor || 0),
+              })
+              activeCachedRec = this._liveVisitBundles.get(targetId) || null
+            }
+          } catch {
+            // Non-fatal fallback to persisted entry fields if mock/test endpoint lacks GET /visit/:id
+          }
+        }
+
+        if (activeCachedRec?.waveBundle || activeCachedRec?.bundle) {
+          const baseWave = activeCachedRec.waveBundle || activeCachedRec.bundle
+          const effGearCtx = activeCachedRec.gearData
+            ? { gearData: activeCachedRec.gearData, observedPanels: activeCachedRec.observedPanels }
+            : this._readCachedGearContext()
+          const livePosterior = (baseWave.owner?.guard && effGearCtx.gearData && this.profileStorePath)
+            ? computeGuardPosteriorForTarget(effGearCtx.gearData, targetId, {
+                knownOpponentLevel: baseWave.owner.level || rawEntry.level || null,
+                observedPanels: effGearCtx.observedPanels,
+                storePath: this.profileStorePath,
+              })
+            : (baseWave.posterior || null)
+          const liveEval = evaluator.evaluateTargetWave(
+            { ...baseWave, posterior: livePosterior },
+            unlockAt,
+            { visitorWorldOverride: liveWorld, remStealBudget: remSteals }
+          )
+          if (!liveEval.profitable || !(liveEval.decisionScore > 0)) {
+            rawEntry.upcomingEligible = false
+            rawEntry.readyEligible = false
+            this.data.targets[String(targetId)] = rawEntry
+            this.save(liveWorld.now)
+            return { status: 'aborted-non-positive-unified-ev', targetId, decisionScore: liveEval.decisionScore }
+          }
+          fullPrepBatch = liveEval.prepActs || []
+          neededEn = liveEval.neededEn || neededEn
+          precomputedDecision = liveEval.tacticalDecision || livePosterior?.decision || precomputedDecision
+        } else {
+          let curSimW = adapter.advanceTimeOnly(liveWorld, liveWorld.now)
+          const rebuiltPrep = []
+          for (const act of entry.plannedPrepActs || []) {
+            const buffDef = act?.a === 'buy' ? adapter.R.THIEF_ITEMS?.[act.id] : null
+            if (!buffDef || constraints.allowThiefBuffPurchase === false) continue
+            const curEff = adapter.R.b12Effect?.(curSimW.state, buffDef.slot, curSimW.now)
+            if (curEff?.legacy || (curEff && curEff.id !== act.id)) continue
+            if (curEff && curEff.id === act.id && curEff.until > curSimW.now + 60) continue
+            const step = adapter.simulateBatch(curSimW, [act], { t: curSimW.now, prices: curSimW.prices })
+            if (step.allOk) {
+              rebuiltPrep.push(act)
+              curSimW = step.afterWorld
+            }
+          }
+          if (Number(curSimW.state?.en || 0) < neededEn) {
+            const prepRes = findCheapestRaidStaminaPrep(
+              adapter,
+              curSimW,
+              neededEn,
+              new Set(['eat', 'coffee', 'stockBuy']),
+              discoverRuleUtilityTokens(adapter),
+              constraints
+            )
+            if (prepRes.feasible) {
+              rebuiltPrep.push(...prepRes.prepActs)
+            }
+          }
+          fullPrepBatch = rebuiltPrep
+        }
+
+        if (fullPrepBatch.length > 0) {
+          const verifiedPrep = []
+          let simW = adapter.advanceTimeOnly(liveWorld, liveWorld.now)
+          for (const act of fullPrepBatch) {
+            if ((act.a === 'eat' || act.a === 'coffee') && Number(simW.state?.en || 0) >= neededEn) continue
+            const step = adapter.simulateBatch(simW, [act], { t: simW.now, prices: simW.prices })
+            if (step.allOk) {
+              verifiedPrep.push(act)
+              simW = step.afterWorld
+            }
+          }
+          fullPrepBatch = verifiedPrep
+        }
       }
 
       if (fullPrepBatch.length === 0 && Number(liveWorld.state?.en || 0) < neededEn) {
-        entry.cooldownUntil = Math.max(Number(entry.cooldownUntil || 0), unlockAt + 15)
+        rawEntry.cooldownUntil = Math.max(Number(rawEntry.cooldownUntil || 0), unlockAt + 15)
+        this.data.targets[String(targetId)] = rawEntry
         this.save(liveWorld.now)
         return { status: 'insufficient-stamina-for-snipe', targetId, neededEn, currentEn: liveWorld.state?.en }
       }
@@ -1043,9 +1247,17 @@ export class SnipeScheduler {
           lockRootDir,
           alreadyLocked: true,
           account: this.accountKey,
+          decisionId: schedulePlanId,
           kind: 'act',
           worldBefore: liveWorld,
-          requestPayload: { actions: fullPrepBatch, reason: 'staged-snipe-prep', targetId },
+          requestPayload: {
+            actions: fullPrepBatch,
+            reason: 'staged-snipe-prep',
+            targetId,
+            schedulePlanId,
+            usedCommittedSchedule,
+            prepFallbackReason,
+          },
           sendFn: async ({ operation }) => {
             const r = await httpClient.postJson('/api/pet/world/act', {
               rev: liveWorld.rev,
@@ -1069,7 +1281,7 @@ export class SnipeScheduler {
 
       // Wait down to physical gear-swap lead (`gearSwaps * 1.3 + 2 * rtt + 0.5`) before acquiring gear lock!
       const rttSec = Math.max(0.4, Math.min(2.0, Number(httpClient?.lastRttMs || 600) / 1000))
-      const gearSwaps = precomputedDecision?.switchedSlots?.length ?? Number(entry.numGearChanges || (entry.guard ? 2 : 0))
+      const gearSwaps = precomputedDecision?.switchedSlots?.length ?? Number(entry.numGearChanges || (rawEntry.guard ? 2 : 0))
       const gearLeadSec = (gearSwaps > 0 ? (gearSwaps * 1.3 + 2 * rttSec) : rttSec) + 0.5
       const preGearWaitMs = (unlockAt - gearLeadSec) * 1000 - httpClient.estimatedServerNowMs()
       if (preGearWaitMs > 0) {
@@ -1084,7 +1296,7 @@ export class SnipeScheduler {
         lockRoot: gearLockDir,
         opponentId: targetId,
         mode: 'guard',
-        knownOpponentLevel: entry.level || null,
+        knownOpponentLevel: rawEntry.level || null,
         storePath: this.profileStorePath,
         precomputedDecision,
         getGearFn: () => httpClient.getJson('/api/pet/battle/gear'),
@@ -1096,15 +1308,20 @@ export class SnipeScheduler {
             lockRootDir,
             alreadyLocked: true,
             account: this.accountKey,
+            decisionId: schedulePlanId,
             kind: 'visit',
             budgetKind: 'steal',
             budgetLimitPerIsleDay: constraints.maxStealsPerIsleDay,
             worldBefore: liveWorld,
             requestPayload: {
               targetId,
-              expectedSpots: Math.max(this.minStealSpots, entry.upcomingSpots || 1),
+              expectedSpots: Math.max(this.minStealSpots, rawEntry.upcomingSpots || committedRaid?.totalSpots || 1),
               expectedEnergyCost: neededEn,
               stagedExactUnlockAt: unlockAt,
+              schedulePlanId,
+              usedCommittedSchedule,
+              scheduleReselectReason,
+              prepFallbackReason,
             },
             waitBeforeSendFn: async () => {
               await httpClient.sleepUntilServerSec(unlockAt, postUnlockOffsetMs)
@@ -1136,6 +1353,10 @@ export class SnipeScheduler {
         status: tacRes.result?.status || (tacRes.preEquipError ? 'pre-equip-aborted' : 'completed'),
         targetId,
         unlockAt,
+        schedulePlanId,
+        usedCommittedSchedule,
+        scheduleReselectReason,
+        prepFallbackReason,
         prepActionsSent: fullPrepBatch.length,
         switchedLoadout: tacRes.decision?.switched || false,
         switchedSlots: tacRes.decision?.switchedSlots || [],
