@@ -52,6 +52,18 @@ export async function buildAuditDecisionReport({
         exPostHindsightGap: null,
       }
     }
+    if (tx.kind === 'xian-act') {
+      const defect = ['model-drift', 'illegal-action-in-batch'].includes(replayResult.status)
+      return {
+        verdict: defect ? 'mechanical-or-conservation-defect' : 'ex-ante-consistent',
+        identifiable: true,
+        replay: replayResult,
+        identifiableDecisionRegretLowerBound: 0,
+        estimatedReferenceDelta: 0,
+        planFulfillmentDrift: null,
+        exPostHindsightGap: null,
+      }
+    }
     if (!worldBefore && tx.stateBeforeRef) {
       worldBefore = journal.readBlob(tx.stateBeforeRef)
     }

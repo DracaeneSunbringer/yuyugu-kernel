@@ -158,6 +158,70 @@ export async function auditTransactionReplay(journal, tx, { fallbackAdapter = nu
     }
   }
 
+  if (tx.kind === 'xian-act') {
+    const xianActions = Array.isArray(request.actions) ? request.actions : []
+    const nonXian = xianActions
+      .map((act, index) => (!String(act?.a || '').startsWith('xian') ? { index, action: act, msg: 'non-xian-action' } : null))
+      .filter(Boolean)
+    if (nonXian.length > 0) {
+      return {
+        operation: tx.operation,
+        kind: 'xian-act',
+        status: 'illegal-action-in-batch',
+        identifiable: true,
+        rejectedSimIndices: nonXian,
+        serverDrifts: [],
+      }
+    }
+    if (tx.status !== 'confirmed') {
+      return {
+        operation: tx.operation,
+        kind: 'xian-act',
+        status: 'clean-rejected-xian',
+        identifiable: true,
+        serverDrifts: [],
+      }
+    }
+    const srvBody = response?.body || response
+    if (!stateAfter && !srvBody) {
+      return {
+        operation: tx.operation,
+        kind: 'xian-act',
+        status: 'not-identifiable',
+        identifiable: false,
+        reason: 'confirmed-xian-tx-missing-both-response-and-state-after',
+      }
+    }
+    const xianDrifts = []
+    if (stateAfter) {
+      const evalXianSec = Number(stateAfter.now ?? stateBefore.now ?? 0)
+      const refreshedBefore = adapter.advanceTimeOnly(stateBefore, evalXianSec)
+      if (Number(stateAfter.state?.en) !== Number(refreshedBefore.state?.en)) {
+        xianDrifts.push({ field: 'xian.en', expected: refreshedBefore.state?.en, server: stateAfter.state?.en })
+      }
+      const outRows = Array.isArray(srvBody?.out) ? srvBody.out : []
+      const totalSpend = Number.isFinite(srvBody?.spend)
+        ? Number(srvBody.spend)
+        : outRows.reduce((s, r) => s + (r?.ok ? Number(r.spend || 0) : 0), 0)
+      const expectedCoins = Number(stateBefore.coins || 0) - totalSpend
+      if (Number(stateAfter.coins) !== expectedCoins) {
+        xianDrifts.push({ field: 'xian.coins', expected: expectedCoins, server: stateAfter.coins })
+      }
+      const expInv = JSON.stringify(adapter.availableInvSnapshot(refreshedBefore.state))
+      const srvInv = JSON.stringify(adapter.availableInvSnapshot(stateAfter.state))
+      if (expInv !== srvInv) {
+        xianDrifts.push({ field: 'xian.availableInv', expected: JSON.parse(expInv), server: JSON.parse(srvInv) })
+      }
+    }
+    return {
+      operation: tx.operation,
+      kind: 'xian-act',
+      status: xianDrifts.length > 0 ? 'model-drift' : 'consistent-external-xian',
+      identifiable: true,
+      serverDrifts: xianDrifts,
+    }
+  }
+
   const actions = Array.isArray(request.actions) ? request.actions : []
   const evalSec = Number(stateAfter?.now ?? stateBefore.now ?? 0)
   const hasStochastic = actions.some((a) => adapter.isStochasticAction(a))

@@ -15,6 +15,11 @@ import {
 } from '../execution/pet-and-battle.mjs'
 import { SnipeScheduler } from '../execution/snipe-scheduler.mjs'
 import { UpdateNotifier } from '../execution/update-notifier.mjs'
+import {
+  computeNextXianWakeSec,
+  normalizeXianOptions,
+  runXianCultivationSlice,
+} from '../execution/xian-cultivation.mjs'
 import { runControllerStep } from './controller.mjs'
 
 /**
@@ -47,8 +52,10 @@ export async function runLiveAccountTick({
   asyncPlanner = null,
   rulesPath = null,
   maxTickSolveMs = 45000,
+  xianOptions = {},
   dryRun = false,
 }) {
+  const normalizedXian = normalizeXianOptions(xianOptions)
   const effectiveRulesPath = rulesPath || runtimeState?.rulesPath || null
   const activePlanner = asyncPlanner
     || (runtimeState?.asyncPlanner ?? null)
@@ -264,6 +271,7 @@ export async function runLiveAccountTick({
     battlePrep: null,
     arenaBout: null,
     huancai: null,
+    xian: null,
     discovery: null,
   }
 
@@ -338,7 +346,35 @@ export async function runLiveAccountTick({
       runtimeState.lastHuancaiCheckAtSec = httpClient.estimatedServerNowSec()
     }
 
-    // C.5: Incremental Neighbor Discovery Slice FIFTH (`main` only, `<= 2` pages, `<= 4` probes)
+    // C.5: Optional b16 Xian Cultivation Slice (`--enable-xian`, default OFF; zero island stamina, strict D-coin/material firewall)
+    if (normalizedXian.enabled && !snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())) {
+      const xianOut = await runXianCultivationSlice({
+        account,
+        adapter,
+        httpClient,
+        journal,
+        lockRootDir,
+        observedWorld: lastInLockWorld || controllerOut.world || null,
+        shouldAbortFn: () => Boolean(snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())),
+        xianOptions: {
+          ...normalizedXian,
+          cashReserveFloor: Math.max(
+            normalizedXian.cashReserveFloor,
+            Number(effectiveConstraints.cashReserveFloor ?? 10)
+          ),
+        },
+        dryRun,
+      })
+      backgroundReport.xian = xianOut
+      if (xianOut?.status === 'confirmed') {
+        snipeScheduler?.invalidateUnifiedBaseline?.()
+        if (xianOut.worldAfter) {
+          lastInLockWorld = xianOut.worldAfter
+        }
+      }
+    }
+
+    // C.6: Incremental Neighbor Discovery Slice (`main` only, `<= 2` pages, `<= 4` probes)
     if (lastInLockWorld && snipeScheduler?.isStealEnabled() && !snipeScheduler.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())) {
       backgroundReport.discovery = await snipeScheduler.runIncrementalDiscoverySlice(adapter, httpClient, lastInLockWorld, {
         maxPages: 2,
@@ -365,22 +401,31 @@ export async function runLiveAccountTick({
   } else if (snipeScheduler?.isStealEnabled() && snipeScheduler.data.discoveryCursor) {
     nextWakeSec = Math.min(nextWakeSec, nowEndSec + 15)
   }
+  if (normalizedXian.enabled) {
+    const xianWake = Number.isFinite(backgroundReport.xian?.nextXianWakeSec)
+      ? backgroundReport.xian.nextXianWakeSec
+      : computeNextXianWakeSec(lastInLockWorld || controllerOut.world, nowEndSec, normalizedXian)
+    if (Number.isFinite(xianWake)) {
+      nextWakeSec = Math.min(nextWakeSec, Math.max(nowEndSec + 1, xianWake))
+    }
+  }
 
   // Proactive Idle PlanCache Pre-Warming: when waiting for an upcoming domestic maturity within 45s and
   // no snipe is imminent, pre-compute the next plan in the background Worker with authoritative neighbors/partner/ledger!
+  const prewarmSourceWorld = backgroundReport.xian?.worldAfter || controllerOut.world
   if (
     !dryRun &&
     activePlanner &&
     effectiveRulesPath &&
     controllerOut.status === 'waiting' &&
-    controllerOut.world &&
+    prewarmSourceWorld &&
     nextWakeSec > nowEndSec &&
     (nextWakeSec - nowEndSec) <= 45 &&
     !snipeScheduler?.shouldBlockBackgroundWork(nowEndSec)
   ) {
     try {
-      const preWorld = adapter.advanceTimeOnly(controllerOut.world, nextWakeSec)
-      preWorld.rev = controllerOut.world.rev
+      const preWorld = adapter.advanceTimeOnly(prewarmSourceWorld, nextWakeSec)
+      preWorld.rev = prewarmSourceWorld.rev
       const preStealUsed = journal ? journal.countOccupiedBudget('steal', adapter.R.isleIndex(preWorld.now)) : 0
       const preNeighbors = controllerOut.observedNeighbors || []
       const prePartnerWorld = controllerOut.observedPartnerWorld || null
@@ -476,6 +521,15 @@ if (isDirectMain) {
     const checkUpdateOnly = hasFlag('--check-update')
     const noUpdateCheck = hasFlag('--no-update-check')
     const updateWebhookUrl = getArg('--update-webhook', process.env.MEME_UPDATE_WEBHOOK_URL || '')
+    const enableXian = hasFlag('--enable-xian') || process.env.MEME_ENABLE_XIAN === '1'
+    const xianDailyStone = Math.max(
+      0,
+      Math.floor(Number(getArg('--xian-daily-stone', process.env.MEME_XIAN_DAILY_STONE || '0')) || 0)
+    )
+    const xianOptions = normalizeXianOptions({
+      enabled: enableXian,
+      dailyStoneQuota: xianDailyStone,
+    })
 
     const updateNotifier = new UpdateNotifier({
       rootDir,
@@ -580,6 +634,7 @@ if (isDirectMain) {
         asyncPlanner,
         rulesPath,
         maxTickSolveMs,
+        xianOptions,
         dryRun,
       })
       await asyncPlanner.close()
@@ -605,7 +660,10 @@ if (isDirectMain) {
       fs.mkdirSync(dataRootDir, { recursive: true })
       fs.writeFileSync(pidFilePath, `${process.pid}\n`, 'utf8')
     }
-    console.log(`[${new Date().toISOString()}] [LIVE:${account}] kernel=v${updateNotifier.localVersion} started pid=${process.pid}`)
+    const xianBootTag = xianOptions.enabled
+      ? (xianOptions.dailyStoneQuota > 0 ? `on(stone<=${xianOptions.dailyStoneQuota})` : 'on(free)')
+      : 'off'
+    console.log(`[${new Date().toISOString()}] [LIVE:${account}] kernel=v${updateNotifier.localVersion} xian=${xianBootTag} started pid=${process.pid}`)
     updateNotifier.maybeCheckInBackground()
 
     try {
@@ -628,6 +686,7 @@ if (isDirectMain) {
             asyncPlanner,
             rulesPath,
             maxTickSolveMs,
+            xianOptions,
             dryRun,
           })
           const nowSec = httpClient.estimatedServerNowSec()
@@ -641,8 +700,11 @@ if (isDirectMain) {
           if (!snipeScheduler.shouldBlockBackgroundWork(nowSec, 50)) {
             updateNotifier.maybeCheckInBackground()
           }
+          const xianTickTag = res.backgroundReport?.xian?.status === 'confirmed'
+            ? ` xian=act(${res.backgroundReport.xian.actions?.length || 0})`
+            : ''
           console.log(
-            `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${updateNotifier.inlineTag()}`
+            `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${xianTickTag}${updateNotifier.inlineTag()}`
           )
         } catch (err) {
           console.error(`[${new Date().toISOString()}] [LIVE:${account}:ERROR] ${err?.stack || err}`)

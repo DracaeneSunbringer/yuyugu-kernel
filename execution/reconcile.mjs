@@ -163,7 +163,7 @@ export function reconcileUnknownWithFreshWorld(
       continue
     }
 
-    if (tx.kind === 'act' && tx.revBefore != null && freshWorld.rev != null) {
+    if ((tx.kind === 'act' || tx.kind === 'xian-act') && tx.revBefore != null && freshWorld.rev != null) {
       if (freshWorld.rev <= tx.revBefore && tx.serverNow != null && freshWorld.now != null && freshWorld.now <= tx.serverNow) {
         // Stale or same-second snapshot cannot prove an in-flight request failed; keep unknown until server clock advances
         remainingUnknown++
@@ -435,9 +435,9 @@ export async function executeTransaction({
     if (!existing && pendingSummary.activeUnknown > 0) {
       const unresolvedTxs = reconstructed.transactions
         .filter((t) => t.status === 'unknown' || t.status === 'submitted')
-      // Domestic `act` (harvesting/planting/crafting) is ONLY blocked by unresolved `act`/non-visit mutations,
+      // Domestic `act` / `xian-act` is ONLY blocked by unresolved `act`/`xian-act`/non-visit mutations,
       // NEVER by an in-flight `visit:unknown` (eliminates the 08:21 steal-blocks-harvest outage)!
-      const blockingTxs = kind === 'act'
+      const blockingTxs = (kind === 'act' || kind === 'xian-act')
         ? unresolvedTxs.filter((t) => t.kind !== 'visit')
         : unresolvedTxs
       if (blockingTxs.length > 0) {
@@ -497,7 +497,7 @@ export async function executeTransaction({
           worldBefore?.rev != null &&
           priorTx.revBefore != null &&
           Number(priorTx.revBefore) === Number(worldBefore.rev) &&
-          priorTx.kind === 'act' &&
+          (priorTx.kind === 'act' || priorTx.kind === 'xian-act') &&
           priorTx.status === 'confirmed'
         ) {
           priorConfirmedOnSameRev = true
