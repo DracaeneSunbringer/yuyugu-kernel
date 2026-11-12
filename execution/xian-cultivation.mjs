@@ -54,7 +54,7 @@ const HERB_ENTRIES_DESC = Object.entries(HERBS).sort((a, b) => b[1].lv - a[1].lv
 const PURE_CASH_HERBS = new Set(
   Object.keys(HERBS).filter((h) => !Object.values(PILLS).some((p) => Object.hasOwn(p.need, h)))
 )
-const VARIANT_TECH_PRIORITY = ['ice', 'thunder', 'wind', 'lava', 'poison', 'metal', 'water', 'fire', 'earth', 'wood']
+const VARIANT_TECH_PRIORITY = ['poison', 'ice', 'thunder', 'lava', 'wind', 'metal', 'water', 'fire', 'earth', 'wood']
 
 export function xsDay(nowSec) {
   return Math.floor((Number(nowSec || 0) + 28800) / 86400)
@@ -239,12 +239,20 @@ function shouldAllowBreakPolicy(x, opts) {
 function computeHeldPeiyuanFloorWhileSubLv5(x, nowSec, opts) {
   if ((x.lv || 1) >= 5) return Infinity
   let hold = 0
-  if (shouldAllowBreakPolicy(x, opts) && Number(x.cv?.s || 1) >= 9) {
+  if (shouldAllowBreakPolicy(x, opts) && Number(x.cv?.s || 1) >= 8) {
     hold = Math.max(hold, Number(x.cv?.r || 0) + 1)
   }
-  if (opts.autoFuse && Number(x.cv?.r || 0) >= 1 && !(Number(x.fuseCd || 0) > nowSec)) {
+  if (opts.autoFuse && !(Number(x.fuseCd || 0) > nowSec)) {
     const pair = selectOptimalFusionPair(x.roots, opts.fuseTarget)
-    if (pair) hold = Math.max(hold, 2)
+    if (pair) {
+      if (Number(x.cv?.r || 0) >= 1) {
+        hold = Math.max(hold, 2)
+      } else if (Number(x.cv?.s || 1) >= 8 && shouldAllowBreakPolicy(x, opts)) {
+        // At 炼气 8~9 层 with `autoFuse` enabled, reserve `1 (break) + 2 (fuse) = 3` pills so the instant
+        // `xsBreak` enters 筑基 1 层 (`xp = 0`), `xsFuse` fires in the exact same zero-XP-loss window!
+        hold = Math.max(hold, 3)
+      }
+    }
   }
   return hold
 }
