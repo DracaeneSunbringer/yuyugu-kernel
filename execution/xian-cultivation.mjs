@@ -430,7 +430,7 @@ function shouldEatHuilingNow(x, nowSec, pendingEnergyNeed = 0) {
   if (dpUsedToday(x, nowSec) >= PILL_DAILY) return false
   const en = Number(x.en || 0)
   if (en >= EN_MAX) return false
-  const gainEn = PILLS.huiling.en + (x.tech === 'poison' ? 10 : 0)
+  const gainEn = 30 + (x.tech === 'poison' ? 10 : 0)
   // Normal zero-waste rule: eat when `en + gainEn <= 99 < EN_MAX` (preserving `enAt` sub-tick timer!)
   // whenever farm/alchemy work needs energy or after 20:00 CST so daily 3-pill quota never expires.
   if (en <= EN_MAX - gainEn - 1 && (en < pendingEnergyNeed || cstSecondsUntilMidnight(nowSec) <= 4 * 3600)) {
