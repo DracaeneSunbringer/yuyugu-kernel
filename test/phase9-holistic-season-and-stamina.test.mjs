@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { loadRulesAdapterFromFile } from '../model/rules-adapter.mjs'
 import { buildObservationEnvelope } from '../model/observations.mjs'
 import { buildObjectiveConfig } from '../model/objective.mjs'
@@ -11,7 +12,8 @@ import { solveUnifiedPlan } from '../planner/solve.mjs'
 import { auditDecisionAgainstReference } from '../audit/reference-solver.mjs'
 import { UpdateNotifier, compareSemver } from '../execution/update-notifier.mjs'
 
-const RULES_PATH = path.resolve('rules/pet-world-rules.js')
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const RULES_PATH = path.resolve(__dirname, '../rules/pet-world-rules.js')
 const CLOCK_START = 1794212939
 
 function makeBaseWorld(adapter, nowSec, overrides = {}) {
@@ -110,9 +112,9 @@ test('Phase 9.1 (Pillar 1 + Pillar 2): Multi-season continuation scarcity + Rene
     `Must hold 0.58x Summer tomato for multi-season ketchup/off-season premium instead of dumping raw (got ${JSON.stringify(rawTomatoSells0)})`
   )
 
-  // Case B: Final <=1 hour of Summer right before Autumn (`seasonOf(d) === 1`, `seasonOf(nextB) === 2`, `< 5184s` sprinkled tomato grow time):
-  // Tomato (`grow = 180` min -> sprinkled `5184s`) will 100% wither at Autumn boundary (`0` harvests),
-  // so physical Renewal NPV Rate naturally switches to a cross-season crop (`seasons` includes `AUTUMN`)!
+  // Case B: Late Summer right before Autumn (`seasonOf(d) === 1`, `seasonOf(nextB) === 2`, `< 5184s` sprinkled tomato grow time):
+  // Under authoritative `pet-world-rules.js:411,522`, a crop planted in Summer (`p.t` in Summer) matures legally in Autumn (`stage === 3`),
+  // while regrow crops outside Autumn seasons (`tomato`) yield 1 legal harvest + immediate `stage === -1` wither (`clear` cost = 1).
   let tLateSummer = tSummerMid
   for (let step = 0; step < 2000; step++, tLateSummer += 1800) {
     const dNow = R.isleDay(tLateSummer)
@@ -146,17 +148,20 @@ test('Phase 9.1 (Pillar 1 + Pillar 2): Multi-season continuation scarcity + Rene
   })
   const planLate = solveUnifiedPlan(adapter, envLate, objCfg)
   const latePlants = (planLate.trunkBuckets[0]?.domesticActions || []).filter((a) => a.a === 'plant')
-  assert.ok(latePlants.length > 0, 'Should plant a cross-season surviving crop right before Autumn')
-  assert.equal(
-    latePlants.some((a) => a.c === 'tomato'),
-    false,
-    'Must NEVER plant tomato <2h before Autumn when first harvest takes 12h and withers at season boundary'
-  )
-  assert.equal(
-    latePlants.every((a) => R.CROPS.find((c) => c.id === a.c)?.seasons.includes(AUTUMN)),
-    true,
-    'Every crop planted <2h before Autumn must survive into Autumn'
-  )
+  assert.ok(latePlants.length > 0, 'Should plant a profitable legal Summer crop before Autumn')
+  // Verify every chosen late-Summer plant executes & harvests legally across the Autumn boundary in real `pet-world-rules.js`:
+  const simLatePlant = adapter.simulateBatch(worldLateSummer, latePlants, { t: tLateSummer })
+  assert.equal(simLatePlant.allOk, true, 'Every late-Summer plant must succeed in R.applyActions')
+  for (const pa of latePlants) {
+    const pPlanted = simLatePlant.afterWorld.state.plots[pa.i]
+    const tm = adapter.exactPlotTimings(pPlanted, true, tLateSummer, CLOCK_START)
+    assert.ok(tm && tm.matureAt > tLateSummer)
+    assert.equal(
+      R.cropStage(pPlanted, tm.matureAt, true).stage,
+      3,
+      `Planted ${pa.c} must reach stage 3 at ${tm.matureAt} across season boundary under pet-world-rules.js`
+    )
+  }
 })
 
 test('Phase 9.2 (Pillar 3): Overnight 22:04 CST reproduction — overnight free regen + 00:00 CST coffee reset + Just-In-Time stamina eats ZERO q=2 tomatoes across consecutive fish casts', async () => {

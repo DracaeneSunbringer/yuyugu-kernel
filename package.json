@@ -1,6 +1,6 @@
 {
   "name": "yuyugu-unified-kernel",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "license": "MIT",
   "type": "module",
   "repository": "https://github.com/DracaeneSunbringer/yuyugu-kernel",
@@ -8,7 +8,7 @@
   "releaseNotes": {
     "date": "2026-11-12",
     "severity": "normal",
-    "summary": "适配新版「大肥鱼修仙记」(state.xs) 独立托管模块（默认关闭）：支持序章/斗法静默避让、log%4=3 双倍收获编排、回灵丹/培元丹冲药园 Lv5 闭环、多策略突破护盾及可选灵根融合保护",
+    "summary": "统一作物物理生命周期与跨季口径（rules-adapter 单一真源）：修正单茬/多茬跨季合法收成判定、显式传入 clockStart 与跨长夜换季边界、消除续期估值清苗体力重复扣算，并打通跨季收获后即时清苗与复种闭环",
     "upgradeCommand": "git pull"
   },
   "engines": {

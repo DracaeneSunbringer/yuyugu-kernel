@@ -19,7 +19,6 @@ import {
   deductRecipeLowStarFirst,
   expectedBombYield,
   expectedFishYieldPerCast,
-  expectedHarvestYield,
   expectedMineYieldPerHit,
 } from './resources.mjs'
 import { computeValidUpperBound } from './bounds.mjs'
@@ -1240,83 +1239,13 @@ function mergeCraftActionsPreserveTopo(list) {
 
 /**
  * Evaluates best seasonal crop to plant on an empty plot `plotIdx` at `atSec`
- * using exact weather-segment timings, regrow season-wither rule (`pet-world-rules.js:411,522`),
- * downstream multi-season marginal item values, and Renewal NPV Rate (`net / occupiedSec`).
+ * using the unified `adapter.simulateCropLifecycleFromPlant` & `adapter.nextSeasonBoundary`
+ * physical truth (`pet-world-rules.js:411,522`), downstream multi-season marginal item values,
+ * and Renewal NPV Rate (`net / occupiedSec`).
  */
-const cropCycleSkeletonMemoByAdapter = new WeakMap()
-
-function getCropCycleSkeleton(adapter, clockStart, isSpr, crop, startSec, cutoffEndSec) {
-  let memo = cropCycleSkeletonMemoByAdapter.get(adapter)
-  if (!memo) {
-    memo = new Map()
-    cropCycleSkeletonMemoByAdapter.set(adapter, memo)
-  } else if (memo.size > 8192) {
-    memo.clear()
-  }
-  const key = `${Number(clockStart || 0)}:${isSpr ? 1 : 0}:${startSec}:${cutoffEndSec}:${crop.id}`
-  let skel = memo.get(key)
-  if (skel !== undefined) return skel
-
-  const { R } = adapter
-  const startSeason = R.seasonOf(R.isleDay(startSec))
-  if (!crop.seasons.includes(startSeason)) {
-    memo.set(key, null)
-    return null
-  }
-  let simT = startSec
-  let h = 0
-  const maxTimes = crop.regrow ? (crop.times || 1) : 1
-  let totalExpectedUnits = 0
-  let totalStaminaSpent = R.WORLD?.cost?.plant ?? 2
-  const harvests = []
-
-  while (h < maxTimes) {
-    const simDay = R.isleDay(simT)
-    if (!crop.seasons.includes(R.seasonOf(simDay))) {
-      totalStaminaSpent += R.WORLD?.cost?.clear ?? 1
-      break
-    }
-    const mockPlot = { c: crop.id, t: simT, w: 0, g: 0, h }
-    const timing = adapter.exactPlotTimings(mockPlot, isSpr, simT, clockStart)
-    if (!timing || (cutoffEndSec >= 0 && timing.matureAt > cutoffEndSec)) break
-    if (!crop.seasons.includes(R.seasonOf(R.isleDay(timing.matureAt)))) {
-      // Crop withers at the season boundary before `timing.matureAt` (`cropStage === -1`)!
-      totalStaminaSpent += R.WORLD?.cost?.clear ?? 1
-      break
-    }
-
-    const isRain = R.weatherOf(simDay) === 1
-    const wateredStages = isSpr || isRain ? 3 : 2
-    if (!isSpr && !isRain) {
-      totalStaminaSpent += wateredStages * (R.WORLD?.cost?.water ?? 1)
-    }
-    totalStaminaSpent += R.WORLD?.cost?.harvest ?? 1
-
-    const yld = expectedHarvestYield(adapter, wateredStages, false)
-    totalExpectedUnits += yld.expectedUnits
-    harvests.push({ matureAt: timing.matureAt, expectedByQuality: yld.expectedByQuality })
-
-    simT = timing.matureAt
-    h++
-  }
-
-  if (h <= 0) {
-    memo.set(key, null)
-    return null
-  }
-  skel = {
-    harvests,
-    occupiedSec: Math.max(60, simT - startSec),
-    endSec: simT,
-    totalExpectedUnits,
-    totalStaminaSpent,
-  }
-  memo.set(key, skel)
-  return skel
-}
-
 function selectBestCropToPlant(adapter, {
   state,
+  clockStart = adapter.clockStart,
   plotIdx,
   atSec,
   tEnd,
@@ -1325,19 +1254,16 @@ function selectBestCropToPlant(adapter, {
   enforceHorizonCutoff = false,
 }) {
   const { R } = adapter
-  const iDay = R.isleDay(atSec)
-  const season = R.seasonOf(iDay)
   const isSpr = R.sprinkled(state, plotIdx)
 
   const evalCropAt = (crop, startSec, cutoff) => {
-    const skel = getCropCycleSkeleton(
-      adapter,
-      state?.clockStart,
-      isSpr,
-      crop,
+    const skel = adapter.simulateCropLifecycleFromPlant(crop, {
       startSec,
-      cutoff ? Math.floor(Number(tEnd || 0)) : -1
-    )
+      isSprinkled: isSpr,
+      clockStart,
+      cutoffEndSec: cutoff ? Math.floor(Number(tEnd || 0)) : -1,
+      dryManualWaterStages: 2,
+    })
     if (!skel) return null
     let totalExpectedRevenue = 0
     for (let k = 0; k < skel.harvests.length; k++) {
@@ -1360,17 +1286,26 @@ function selectBestCropToPlant(adapter, {
     }
   }
 
-  let nextSeasonBoundarySec = -1
+  const nextSeasonBoundarySec = !enforceHorizonCutoff
+    ? adapter.nextSeasonBoundary(atSec, clockStart)
+    : -1
+  const evaluated = []
+  let hasCrossSeasonSpill = false
+  for (const crop of R.CROPS || []) {
+    const res = evalCropAt(crop, atSec, enforceHorizonCutoff)
+    if (!res || !(res.net > 1e-6)) continue
+    evaluated.push({ crop, res })
+    if (nextSeasonBoundarySec > atSec && res.endSec > nextSeasonBoundarySec) {
+      hasCrossSeasonSpill = true
+    }
+  }
+
   let rNextSeason = 0
-  if (!enforceHorizonCutoff) {
-    const nextIsleB = adapter.nextIsleBoundary(atSec, state?.clockStart)
-    if (nextIsleB > atSec && R.seasonOf(R.isleDay(nextIsleB)) !== season) {
-      nextSeasonBoundarySec = nextIsleB
-      for (const futCrop of R.CROPS || []) {
-        const resNext = evalCropAt(futCrop, nextIsleB, false)
-        if (resNext && resNext.rawRatePerSec > rNextSeason) {
-          rNextSeason = resNext.rawRatePerSec
-        }
+  if (hasCrossSeasonSpill) {
+    for (const futCrop of R.CROPS || []) {
+      const resNext = evalCropAt(futCrop, nextSeasonBoundarySec, false)
+      if (resNext && resNext.rawRatePerSec > rNextSeason) {
+        rNextSeason = resNext.rawRatePerSec
       }
     }
   }
@@ -1382,12 +1317,10 @@ function selectBestCropToPlant(adapter, {
   let bestOccupiedSec = 0
   let bestTotalUnits = 0
 
-  for (const crop of R.CROPS || []) {
-    const res = evalCropAt(crop, atSec, enforceHorizonCutoff)
-    if (!res || !(res.net > 1e-6)) continue
+  for (const { crop, res } of evaluated) {
     let score = enforceHorizonCutoff ? res.net : res.rawRatePerSec
-    if (!enforceHorizonCutoff && nextSeasonBoundarySec > atSec && rNextSeason > 0) {
-      const spillNextSec = Math.max(0, res.endSec - nextSeasonBoundarySec)
+    if (hasCrossSeasonSpill && rNextSeason > 0 && res.endSec > nextSeasonBoundarySec) {
+      const spillNextSec = res.endSec - nextSeasonBoundarySec
       const surplusVsWait = res.net - spillNextSec * rNextSeason
       if (!(surplusVsWait > 1e-6)) continue
       const preBoundaryWindowSec = Math.min(res.occupiedSec, Math.max(60, nextSeasonBoundarySec - atSec))
@@ -2209,11 +2142,17 @@ function optimizeAndSimulateSequence(adapter, {
           let willBeEmpty = !p
           if (p) {
             const st = R.cropStage(p, b.atSec, R.sprinkled(s, i) || weather === 1)
-            willBeEmpty = (st.stage === 3 && allowedSet.has('harvest')) || (st.stage === -1 && allowedSet.has('clear'))
+            if (st.stage === 3 && allowedSet.has('harvest')) {
+              const post = adapter.predictPostHarvestPlot(p, b.atSec, startWorld.clockStart)
+              willBeEmpty = post.kind === 'empty' || (post.kind === 'withered' && allowedSet.has('clear'))
+            } else if (st.stage === -1 && allowedSet.has('clear')) {
+              willBeEmpty = true
+            }
           }
           if (!willBeEmpty) continue
           const bestP = selectBestCropToPlant(adapter, {
             state: s,
+            clockStart: startWorld.clockStart,
             plotIdx: i,
             atSec: b.atSec,
             tEnd: tH,
@@ -2394,8 +2333,11 @@ function optimizeAndSimulateSequence(adapter, {
         return Math.max(0, Math.floor(Number(probeWorld.state?.en || 0))) >= neededEn
       }
 
-      // (a) Ripe `harvest` & withered `clear`
+      // (a) Ripe `harvest` & withered `clear` (including immediate post-harvest cross-season wither -> `clear`)
       const hcActs = []
+      const harvestCostEnProbe = R.WORLD?.cost?.harvest ?? 1
+      const clearCostEnProbe = R.WORLD?.cost?.clear ?? 1
+      let hcPlannedEn = 0
       let expiringWaters = []
       let nonExpiringWaters = []
       for (let i = 0; i < (s.plots?.length || 0); i++) {
@@ -2407,12 +2349,21 @@ function optimizeAndSimulateSequence(adapter, {
           const cropDef = graph.cropsById.get(p.c)
           const unitVal = cropDef ? Math.max(1, marginalItemValueFn(cropDef.id, 0, b.atSec)) : 100
           const approxDelayLoss = Math.max(20, (unitVal / Math.max(3600, (cropDef?.grow || 120) * 60)) * regenStepB + 0.15 * unitVal)
-          if (ensureProbeUrgentEn(hcActs.length + 1, approxDelayLoss)) {
+          if (ensureProbeUrgentEn(hcPlannedEn + harvestCostEnProbe, approxDelayLoss)) {
             hcActs.push({ a: 'harvest', i })
+            hcPlannedEn += harvestCostEnProbe
+            const post = adapter.predictPostHarvestPlot(p, b.atSec, startWorld.clockStart)
+            if (post.kind === 'withered' && allowedSet.has('clear')) {
+              if (ensureProbeUrgentEn(hcPlannedEn + clearCostEnProbe, 500)) {
+                hcActs.push({ a: 'clear', i })
+                hcPlannedEn += clearCostEnProbe
+              }
+            }
           }
         } else if (st.stage === -1 && allowedSet.has('clear')) {
-          if (ensureProbeUrgentEn(hcActs.length + 1, 500)) {
+          if (ensureProbeUrgentEn(hcPlannedEn + clearCostEnProbe, 500)) {
             hcActs.push({ a: 'clear', i })
+            hcPlannedEn += clearCostEnProbe
           }
         } else if (st.stage >= 0 && st.stage < 3 && !auto && p.w <= st.stage && allowedSet.has('water')) {
           const stageEndSec = Number(p.t || b.atSec) + Math.ceil((Number(st.total || 3600) * (st.stage + 1)) / 3)
@@ -2435,7 +2386,9 @@ function optimizeAndSimulateSequence(adapter, {
         probeWorld = svHC.afterWorld
         s = probeWorld.state
         probeAllPreByU[u].push(...svHC.validActions)
-        estUrgentFarmEnByU[u] += svHC.validActions.length * (R.WORLD?.cost?.harvest ?? 1)
+        for (const va of svHC.validActions) {
+          estUrgentFarmEnByU[u] += va.a === 'clear' ? clearCostEnProbe : harvestCostEnProbe
+        }
       }
 
       // (b) Empty-plot `plant` (including plots newly freed by `harvest` / `clear`)
@@ -2448,6 +2401,7 @@ function optimizeAndSimulateSequence(adapter, {
           if (s.plots?.[i]) continue
           const bestP = selectBestCropToPlant(adapter, {
             state: s,
+            clockStart: startWorld.clockStart,
             plotIdx: i,
             atSec: b.atSec,
             tEnd: tH,
@@ -4521,10 +4475,8 @@ function optimizeAndSimulateSequence(adapter, {
       const v1 = marginalItemValueFn(cropId, 1, b.atSec)
       const v2 = marginalItemValueFn(cropId, 2, b.atSec)
       const expVal = (w) => {
-        const g = 0.05 + 0.1 * w
-        const sv = 0.2 + 0.08 * w
-        const q0 = Math.max(0, 1 - g - sv)
-        return (1.3 + 0.08 * w) * (q0 * v0 + sv * v1 + g * v2)
+        const eq = adapter.expectedHarvestYield(w, false).expectedByQuality
+        return eq[0] * v0 + eq[1] * v1 + eq[2] * v2
       }
       return Math.max(0, expVal(w1) - expVal(w0)) + Math.max(0, plotRatePerSec) * Math.floor(Math.max(0, Number(remLeftSec || 0)) * 0.25)
     }
@@ -4541,6 +4493,7 @@ function optimizeAndSimulateSequence(adapter, {
       const bestNextP = allowedSet.has('plant')
         ? selectBestCropToPlant(adapter, {
             state: sInitU,
+            clockStart: startWorld.clockStart,
             plotIdx: i,
             atSec: b.atSec,
             tEnd: tH,
@@ -4555,14 +4508,17 @@ function optimizeAndSimulateSequence(adapter, {
       const rPlot = Math.max(0.01, bestNextP ? bestNextP.netRatePerSec : fallbackRate)
 
       if (st.stage === 3 && allowedSet.has('harvest')) {
-        const cropDef = graph.cropsById.get(p.c)
-        const staysRegrow = !!(cropDef?.regrow && Number(p.h || 0) + 1 < Number(cropDef.times || 1))
-        if (!staysRegrow) plotWillBeEmptyAfterHC[i] = 1
+        const post = adapter.predictPostHarvestPlot(p, b.atSec, startWorld.clockStart)
+        const canImmediateClear = post.kind === 'withered' && allowedSet.has('clear')
+        if (post.kind === 'empty' || canImmediateClear) {
+          plotWillBeEmptyAfterHC[i] = 1
+        }
         const timing = adapter.exactPlotTimings(p, isSpr, b.atSec, startWorld.clockStart, { isAlreadyRipe: true })
         const unlockAt = timing ? timing.unlockAt : b.atSec + 1800
         const protectSec = Math.max(600, timing?.protectSec || 1800)
         const wEff = auto ? 3 : Number(p.w || 0)
-        const unstolenExtra = !(p.sv && p.sv.length > 0) ? (0.3 + 0.08 * wEff) : 0
+        const wasStolen = Boolean(p.sv && p.sv.length > 0)
+        const unstolenExtra = Math.max(0, adapter.expectedHarvestYield(wEff, wasStolen).expectedUnits - 1.0)
         const stealLossCap = unstolenExtra * marginalItemValueFn(p.c, 0, b.atSec)
         harvestTasks.push({
           kind: 'harvest',
@@ -4574,6 +4530,15 @@ function optimizeAndSimulateSequence(adapter, {
           stealLossCap,
           sortPriority: rPlot + (b.atSec >= unlockAt ? stealLossCap / protectSec : (stealLossCap * 0.25) / protectSec),
         })
+        if (canImmediateClear) {
+          clearTasks.push({
+            kind: 'clear',
+            i,
+            costEn: R.WORLD?.cost?.clear ?? 1,
+            ratePerSec: rPlot,
+            sortPriority: rPlot,
+          })
+        }
       } else if (st.stage === -1 && allowedSet.has('clear')) {
         plotWillBeEmptyAfterHC[i] = 1
         clearTasks.push({
@@ -4612,6 +4577,7 @@ function optimizeAndSimulateSequence(adapter, {
         if (!plotWillBeEmptyAfterHC[i]) continue
         const bestP = selectBestCropToPlant(adapter, {
           state: sInitU,
+          clockStart: startWorld.clockStart,
           plotIdx: i,
           atSec: b.atSec,
           tEnd: tH,
@@ -5456,6 +5422,10 @@ function optimizeAndSimulateSequence(adapter, {
       let urgentSpentSoFar = 0
       for (const hcTask of [...harvestTasks, ...clearTasks]) {
         if (bucketActs.length >= maxBucketActions) break
+        if (hcTask.kind === 'clear') {
+          const curPlot = execWorld.state?.plots?.[hcTask.i]
+          if (!curPlot || !adapter.isPlotWithered(curPlot, b.atSec, startWorld.clockStart)) continue
+        }
         const cEn = hcTask.costEn
         if (urgentSpentSoFar + cEn <= fundedUrgentEn) {
           ensureExecStamina(cEn, bucketEnFloor)
@@ -5478,6 +5448,7 @@ function optimizeAndSimulateSequence(adapter, {
           if (ps.plots?.[i]) continue
           const bestP = selectBestCropToPlant(adapter, {
             state: ps,
+            clockStart: startWorld.clockStart,
             plotIdx: i,
             atSec: b.atSec,
             tEnd: tH,

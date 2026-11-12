@@ -394,28 +394,45 @@ export function enumerateIndependentCandidateBatches(adapter, world, {
     }
   }
 
-  // 6. Ready farm/barn collection & harvesting (`collect`, `pet`, `harvest`, `clear`)
+  // 6. Ready farm/barn collection & harvesting (`collect`, `pet`, `harvest`, `clear`, including immediate post-harvest cross-season wither)
   const farmActs = []
+  const farmActsWithoutPostClear = []
+  let hasPostHarvestWitherClear = false
   const weather = R.weatherOf(R.isleDay(atSec))
   for (let i = 0; i < (refreshed.state.barn?.length || 0); i++) {
     const pen = refreshed.state.barn[i]
     if (!pen) continue
     if (can('pet') && !R.b12AnimalStage(pen, atSec).retired && !refreshed.state.cnt?.['pet' + i] && (pen.m || 0) < 95) {
       farmActs.push({ a: 'pet', i })
+      farmActsWithoutPostClear.push({ a: 'pet', i })
     }
     if (can('collect') && R.animalReady(pen, atSec).ready) {
       farmActs.push({ a: 'collect', i })
+      farmActsWithoutPostClear.push({ a: 'collect', i })
     }
   }
   for (let i = 0; i < (refreshed.state.plots?.length || 0); i++) {
     const p = refreshed.state.plots[i]
     if (!p) continue
     const st = R.cropStage(p, atSec, R.sprinkled(refreshed.state, i) || weather === 1)
-    if (st.stage === 3 && can('harvest')) farmActs.push({ a: 'harvest', i })
-    else if (st.stage === -1 && can('clear')) farmActs.push({ a: 'clear', i })
+    if (st.stage === 3 && can('harvest')) {
+      farmActs.push({ a: 'harvest', i })
+      farmActsWithoutPostClear.push({ a: 'harvest', i })
+      const post = adapter.predictPostHarvestPlot(p, atSec, refreshed.clockStart)
+      if (post.kind === 'withered' && can('clear')) {
+        farmActs.push({ a: 'clear', i })
+        hasPostHarvestWitherClear = true
+      }
+    } else if (st.stage === -1 && can('clear')) {
+      farmActs.push({ a: 'clear', i })
+      farmActsWithoutPostClear.push({ a: 'clear', i })
+    }
   }
   if (farmActs.length > 0) {
     addCandidate('farm-ready', farmActs)
+    if (hasPostHarvestWitherClear) {
+      addCandidate('farm-ready-no-post-clear', farmActsWithoutPostClear)
+    }
     if (can('sell')) {
       const simFm = adapter.simulateBatch(refreshed, farmActs, { t: atSec, prices })
       if (simFm.allOk) {

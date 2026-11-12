@@ -208,6 +208,34 @@ export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceTex
     return (Math.floor(t / span) + 1) * span
   }
 
+  const nextSeasonBoundaryMemo = new Map()
+
+  function nextSeasonBoundary(t, cs = null) {
+    const activeCs = syncClock(cs)
+    const t0 = Math.floor(Number(t || 0))
+    const iIdx = R.isleIndex(t0)
+    const memoKey = `${activeCs}:${iIdx}`
+    const cached = nextSeasonBoundaryMemo.get(memoKey)
+    if (cached !== undefined) return cached
+
+    if (nextSeasonBoundaryMemo.size > 4096) nextSeasonBoundaryMemo.clear()
+    const startSeason = R.seasonOf(R.isleDay(t0))
+    const maxSteps = (R.ISLE_SEASON_DAYS || 12) + 2
+    let cursor = t0
+    let found = -1
+    for (let step = 0; step < maxSteps; step++) {
+      const nxt = nextIsleBoundary(cursor, activeCs)
+      if (!(nxt > cursor)) break
+      cursor = nxt
+      if (R.seasonOf(R.isleDay(cursor)) !== startSeason) {
+        found = cursor
+        break
+      }
+    }
+    nextSeasonBoundaryMemo.set(memoKey, found)
+    return found
+  }
+
   function availableInv(state, id, q) {
     const raw = Number(state?.inv?.[id]?.[q] || 0)
     const reserved = Number(state?.b12?.vault?.[id]?.[q] || 0)
@@ -557,14 +585,42 @@ export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceTex
     return nextWorld
   }
 
+  function isPlotWithered(rawPlot, atSec, cs = null) {
+    if (!rawPlot || !rawPlot.c || !Number.isFinite(rawPlot.t) || rawPlot.t <= 0) return false
+    syncClock(cs)
+    if (!graph.cropsById.has(rawPlot.c)) return true
+    const evalSec = Math.floor(Number.isFinite(atSec) ? atSec : rawPlot.t)
+    const st = R.cropStage(rawPlot, evalSec, false)
+    return !st || st.stage === -1
+  }
+
+  function expectedHarvestYield(wateredStages = 3, wasStolen = false) {
+    const w = Math.max(0, Math.min(3, Number(wateredStages || 0)))
+    const pGold = 0.05 + 0.1 * w
+    const pSilver = 0.2 + 0.08 * w
+    const pNormal = Math.max(0, 1 - pGold - pSilver)
+    const stolen = Boolean(wasStolen)
+    const expectedUnits = stolen ? 1.0 : (1.3 + 0.08 * w)
+    return {
+      wateredStages: w,
+      wasStolen: stolen,
+      expectedUnits,
+      probs: [pNormal, pSilver, pGold],
+      expectedByQuality: [expectedUnits * pNormal, expectedUnits * pSilver, expectedUnits * pGold],
+    }
+  }
+
   // Exact plot maturity & protection unlock across weather segments (rain <-> sun)
   // Server `/api/pet/world/visit/:id` enforces `rules.protect = 1800` (30m) from maturity in the active weather segment.
   function exactPlotTimings(rawPlot, isSprinkledPlot, nowSec, cs = null, opts = {}) {
     if (!rawPlot || !rawPlot.c || !Number.isFinite(rawPlot.t) || rawPlot.t <= 0) return null
-    syncClock(cs)
+    const activeCs = syncClock(cs)
     const crop = graph.cropsById.get(rawPlot.c)
     if (!crop) return null
     const fast = rawPlot.t >= R.ISLE_LAUNCH
+    if (!opts?.isAlreadyRipe && fast && !crop.seasons.includes(R.seasonOf(R.isleDay(rawPlot.t)))) {
+      return null
+    }
     const base = (rawPlot.h && crop.regrow ? crop.regrow * (fast ? 0.8 : 1) : crop.grow) * 60 * (fast ? 0.8 : 1)
     const protectSec = Number.isFinite(opts?.protectSec) ? Math.max(0, opts.protectSec) : 1800
     const g = Number(rawPlot.g || 0)
@@ -578,7 +634,7 @@ export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceTex
       const auto = !!(isSprinkledPlot || isRain)
       const totalSeg = Math.max(1, base * (auto ? 0.6 : 1) - g)
       const candMature = Math.max(cursor, Math.ceil(rawPlot.t + totalSeg))
-      const segEnd = nextIsleBoundary(cursor, cs)
+      const segEnd = nextIsleBoundary(cursor, activeCs)
       if (candMature < segEnd) {
         matureAt = candMature
         break
@@ -586,6 +642,9 @@ export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceTex
       cursor = Math.max(cursor + 1, segEnd)
     }
     if (matureAt == null) return null
+    if (!fast && !crop.seasons.includes(R.seasonOf(R.worldDay(matureAt)))) {
+      return null
+    }
 
     let uCursor = opts?.isAlreadyRipe ? Math.max(0, matureAt) : Math.max(nowSec, matureAt)
     let unlockAt = null
@@ -595,7 +654,7 @@ export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceTex
       const auto = !!(isSprinkledPlot || isRain)
       const totalSeg = Math.max(1, base * (auto ? 0.6 : 1) - g)
       const candUnlock = Math.max(uCursor, Math.ceil(rawPlot.t + totalSeg + protectSec))
-      const segEnd = nextIsleBoundary(uCursor, cs)
+      const segEnd = nextIsleBoundary(uCursor, activeCs)
       if (candUnlock < segEnd) {
         unlockAt = candUnlock
         break
@@ -604,6 +663,265 @@ export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceTex
     }
     if (unlockAt == null) return null
     return { matureAt, unlockAt, protectSec, crop }
+  }
+
+  /**
+   * Exact server post-harvest plot transition (`rules/pet-world-rules.js:521-524` + `410-412`):
+   * - Final harvest or single-harvest crop -> `{ kind: 'empty', nextPlot: null, needsClear: false }`
+   * - Remaining regrow starting in valid season -> `{ kind: 'regrow', nextPlot, needsClear: false }`
+   * - Remaining regrow starting in invalid season -> `{ kind: 'withered', nextPlot, needsClear: true }`
+   */
+  function predictPostHarvestPlot(rawPlot, harvestAtSec, cs = null) {
+    const activeCs = syncClock(cs)
+    const simT = Math.floor(Number(harvestAtSec || 0))
+    const crop = rawPlot?.c ? graph.cropsById.get(rawPlot.c) : null
+    const nextH = Number(rawPlot?.h || 0) + 1
+    const maxTimes = crop?.regrow ? Number(crop.times || 1) : 1
+    if (!crop || !crop.regrow || nextH >= maxTimes) {
+      return { kind: 'empty', nextPlot: null, needsClear: false, clearEnCost: 0 }
+    }
+    const nextPlot = { c: crop.id, t: simT, w: 0, g: 0, h: nextH }
+    const st = R.cropStage(nextPlot, simT, false)
+    if (!st || st.stage === -1) {
+      return {
+        kind: 'withered',
+        nextPlot,
+        needsClear: true,
+        clearEnCost: R.WORLD?.cost?.clear ?? 1,
+      }
+    }
+    return { kind: 'regrow', nextPlot, needsClear: false, clearEnCost: 0 }
+  }
+
+  function simulateStandingPlotLifecycle(rawPlot, {
+    nowSec,
+    isSprinkled = false,
+    clockStart = null,
+    cutoffEndSec = -1,
+    dryManualWaterStages = 2,
+  } = {}) {
+    const activeCs = syncClock(clockStart)
+    const tStart = Math.floor(Number(nowSec || 0))
+    if (!rawPlot || !rawPlot.c) {
+      return {
+        crop: null,
+        initiallyWithered: false,
+        harvests: [],
+        releaseSec: tStart,
+        witheredAtEnd: false,
+        needsClearAtEnd: false,
+        truncatedByCutoff: false,
+        partialProgressAtCutoff: null,
+      }
+    }
+    const crop = graph.cropsById.get(rawPlot.c)
+    if (!crop) {
+      return {
+        crop: null,
+        initiallyWithered: true,
+        harvests: [],
+        releaseSec: tStart,
+        witheredAtEnd: true,
+        needsClearAtEnd: true,
+        truncatedByCutoff: false,
+        partialProgressAtCutoff: null,
+      }
+    }
+
+    const spr = Boolean(isSprinkled)
+    const waterCostUnit = R.WORLD?.cost?.water ?? 1
+    const harvestCostUnit = R.WORLD?.cost?.harvest ?? 1
+    const maxTimes = crop.regrow ? Number(crop.times || 1) : 1
+    const harvests = []
+    let curPlot = { ...rawPlot }
+    let releaseSec = tStart
+    let witheredAtEnd = false
+    let needsClearAtEnd = false
+    let truncatedByCutoff = false
+    let partialProgressAtCutoff = null
+
+    for (let guard = 0; guard < maxTimes + 2 && Number(curPlot.h || 0) < maxTimes; guard++) {
+      const evalFrom = Math.max(tStart, Number(curPlot.t || tStart))
+      if (isPlotWithered(curPlot, evalFrom, activeCs)) {
+        releaseSec = evalFrom
+        witheredAtEnd = true
+        needsClearAtEnd = true
+        return {
+          crop,
+          initiallyWithered: harvests.length === 0,
+          harvests,
+          releaseSec,
+          witheredAtEnd,
+          needsClearAtEnd,
+          truncatedByCutoff: false,
+          partialProgressAtCutoff: null,
+        }
+      }
+
+      const timing = exactPlotTimings(curPlot, spr, evalFrom, activeCs)
+      if (!timing) {
+        truncatedByCutoff = true
+        releaseSec = cutoffEndSec >= 0 ? cutoffEndSec + 1 : Infinity
+        break
+      }
+
+      const cycleStartRain = R.weatherOf(R.isleDay(Number(curPlot.t || evalFrom))) === 1
+      const harvestRain = R.weatherOf(R.isleDay(timing.matureAt)) === 1
+      const autoAtHarvest = spr || harvestRain
+      const baseW = Math.max(0, Math.min(3, Number(curPlot.w || 0)))
+      const manualWaters = spr || cycleStartRain
+        ? 0
+        : Math.max(0, Math.min(3, dryManualWaterStages) - baseW)
+      const wateredStages = autoAtHarvest ? 3 : Math.min(3, baseW + manualWaters)
+      const wasStolen = Boolean(harvests.length === 0 && rawPlot.sv && rawPlot.sv.length > 0)
+      const yld = expectedHarvestYield(wateredStages, wasStolen)
+      const stepWaterEn = manualWaters * waterCostUnit
+      const stepHarvestEn = harvestCostUnit
+      const stepEn = stepWaterEn + stepHarvestEn
+
+      if (cutoffEndSec >= 0 && timing.matureAt > cutoffEndSec) {
+        if (evalFrom < cutoffEndSec) {
+          const cycleOrigin = Number(curPlot.t || evalFrom)
+          const denom = Math.max(60, timing.matureAt - cycleOrigin)
+          const numer = Math.max(0, cutoffEndSec - cycleOrigin)
+          const frac = Math.min(1, numer / denom)
+          if (frac > 0) {
+            partialProgressAtCutoff = {
+              atSec: cutoffEndSec - 1,
+              frac,
+              wateredStages,
+              manualWaters,
+              stepEn,
+              expectedByQuality: [
+                yld.expectedByQuality[0] * frac,
+                yld.expectedByQuality[1] * frac,
+                yld.expectedByQuality[2] * frac,
+              ],
+            }
+          }
+        }
+        truncatedByCutoff = true
+        releaseSec = cutoffEndSec + 1
+        break
+      }
+
+      const harvestAt = Math.max(tStart, timing.matureAt)
+      const postHarvest = predictPostHarvestPlot(curPlot, harvestAt, activeCs)
+      harvests.push({
+        h: Number(curPlot.h || 0),
+        startSec: Number(curPlot.t || tStart),
+        matureAt: harvestAt,
+        unlockAt: timing.unlockAt,
+        wateredStages,
+        manualWaters,
+        stepWaterEn,
+        stepHarvestEn,
+        stepEn,
+        expectedUnits: yld.expectedUnits,
+        expectedByQuality: yld.expectedByQuality,
+        postHarvest,
+      })
+      releaseSec = harvestAt
+
+      if (postHarvest.kind === 'empty') {
+        witheredAtEnd = false
+        needsClearAtEnd = false
+        break
+      }
+      if (postHarvest.kind === 'withered') {
+        witheredAtEnd = true
+        needsClearAtEnd = true
+        break
+      }
+      curPlot = postHarvest.nextPlot
+    }
+
+    return {
+      crop,
+      initiallyWithered: false,
+      harvests,
+      releaseSec,
+      witheredAtEnd,
+      needsClearAtEnd,
+      truncatedByCutoff,
+      partialProgressAtCutoff,
+    }
+  }
+
+  const cropLifecycleMemo = new Map()
+
+  function simulateCropLifecycleFromPlant(cropOrId, {
+    startSec,
+    isSprinkled = false,
+    clockStart = null,
+    cutoffEndSec = -1,
+    dryManualWaterStages = 2,
+  } = {}) {
+    const activeCs = syncClock(clockStart)
+    const crop = typeof cropOrId === 'string' ? graph.cropsById.get(cropOrId) : cropOrId
+    if (!crop) return null
+    const t0 = Math.floor(Number(startSec || 0))
+    const cutoff = cutoffEndSec >= 0 ? Math.floor(Number(cutoffEndSec)) : -1
+    const spr = Boolean(isSprinkled)
+    const dryW = Math.max(0, Math.min(3, Math.floor(Number(dryManualWaterStages ?? 2))))
+
+    if (cropLifecycleMemo.size > 16384) cropLifecycleMemo.clear()
+    const key = `${activeCs}:${spr ? 1 : 0}:${t0}:${cutoff}:${dryW}:${crop.id}`
+    const cached = cropLifecycleMemo.get(key)
+    if (cached !== undefined) return cached
+
+    if (!crop.seasons.includes(R.seasonOf(R.isleDay(t0)))) {
+      cropLifecycleMemo.set(key, null)
+      return null
+    }
+
+    const standing = simulateStandingPlotLifecycle(
+      { c: crop.id, t: t0, w: 0, g: 0, h: 0 },
+      {
+        nowSec: t0,
+        isSprinkled: spr,
+        clockStart: activeCs,
+        cutoffEndSec: cutoff,
+        dryManualWaterStages: dryW,
+      }
+    )
+
+    if (!standing || standing.harvests.length === 0) {
+      cropLifecycleMemo.set(key, null)
+      return null
+    }
+
+    const plantEnCost = R.WORLD?.cost?.plant ?? 2
+    const endClearEnCost = standing.needsClearAtEnd ? (R.WORLD?.cost?.clear ?? 1) : 0
+    let careAndHarvestEn = 0
+    let totalExpectedUnits = 0
+    for (const hv of standing.harvests) {
+      careAndHarvestEn += hv.stepEn
+      totalExpectedUnits += hv.expectedUnits
+    }
+    const totalPlantAndCareEn = plantEnCost + careAndHarvestEn
+    const totalStaminaSpent = totalPlantAndCareEn + endClearEnCost
+    const endSec = standing.harvests[standing.harvests.length - 1].matureAt
+    const occupiedSec = Math.max(60, endSec - t0)
+
+    const res = {
+      crop,
+      harvests: standing.harvests,
+      endSec,
+      occupiedSec,
+      seedCost: Number(crop.seed || 0),
+      plantEnCost,
+      careAndHarvestEn,
+      totalPlantAndCareEn,
+      endClearEnCost,
+      totalStaminaSpent,
+      totalExpectedUnits,
+      witheredAtEnd: standing.witheredAtEnd,
+      needsClearAtEnd: standing.needsClearAtEnd,
+      truncatedByCutoff: standing.truncatedByCutoff,
+    }
+    cropLifecycleMemo.set(key, res)
+    return res
   }
 
   // Exact barn production & stealable unlock (cap >= 2 required for visitor steal; server `rules.protect = 1800`)
@@ -678,6 +996,7 @@ export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceTex
     nextNaturalDayBoundary,
     nextLongNightEvent,
     nextIsleBoundary,
+    nextSeasonBoundary,
     availableInv,
     availableInvSnapshot,
     deterministicPriceBase,
@@ -692,7 +1011,12 @@ export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceTex
     simulateBatch,
     enumerateExactSingleStochasticOutcomes,
     advanceTimeOnly,
+    isPlotWithered,
+    expectedHarvestYield,
     exactPlotTimings,
+    predictPostHarvestPlot,
+    simulateStandingPlotLifecycle,
+    simulateCropLifecycleFromPlant,
     exactBarnTimings,
   }
 }

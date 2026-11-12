@@ -304,19 +304,7 @@ export function deductRecipeLowStarFirst(availInv, recipe, qty = 1) {
 }
 
 export function expectedHarvestYield(adapter, wateredStages = 3, wasStolen = false) {
-  // Exact rule expectation from pet-world-rules.js:509-515:
-  // gold = 0.05 + 0.1 * w, silver = 0.2 + 0.08 * w, q0 = 1 - gold - silver
-  // n = 1 + (rand < 0.3 + 0.08 * w ? 1 : 0) minus 1 if stolen (clamped >= 1 -> always 1 when stolen!)
-  const w = Math.max(0, Math.min(3, wateredStages))
-  const pGold = 0.05 + 0.1 * w
-  const pSilver = 0.2 + 0.08 * w
-  const pNormal = Math.max(0, 1 - pGold - pSilver)
-  const expectedUnits = wasStolen ? 1.0 : (1.0 + (0.3 + 0.08 * w))
-  return {
-    expectedUnits,
-    probs: [pNormal, pSilver, pGold],
-    expectedByQuality: [expectedUnits * pNormal, expectedUnits * pSilver, expectedUnits * pGold],
-  }
+  return adapter.expectedHarvestYield(wateredStages, wasStolen)
 }
 
 export function expectedMineYieldPerHit(adapter, state, isleDayStr) {

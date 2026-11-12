@@ -54,80 +54,6 @@ export function buildTerminalPrices(adapter, worldAtHorizon, initialWorld, objec
 
 const contQuoteCacheByAdapter = new WeakMap()
 const contCraftTemplatesByAdapter = new WeakMap()
-const contFarmCycleMemoByAdapter = new WeakMap()
-
-function expectedContinuationHarvestYield(wateredStages = 3, wasStolen = false) {
-  const w = Math.max(0, Math.min(3, wateredStages))
-  const pGold = 0.05 + 0.1 * w
-  const pSilver = 0.2 + 0.08 * w
-  const pNormal = Math.max(0, 1 - pGold - pSilver)
-  const expectedUnits = wasStolen ? 1.0 : (1.3 + 0.08 * w)
-  return [expectedUnits * pNormal, expectedUnits * pSilver, expectedUnits * pGold]
-}
-
-function getMemoizedCropCycleSpec(adapter, clockStart, crop, isSpr, simT) {
-  let memo = contFarmCycleMemoByAdapter.get(adapter)
-  if (!memo) {
-    memo = new Map()
-    contFarmCycleMemoByAdapter.set(adapter, memo)
-  } else if (memo.size > 8192) {
-    memo.clear()
-  }
-  const key = `${Number(clockStart || 0)}:${isSpr ? 1 : 0}:${simT}:${crop.id}`
-  let spec = memo.get(key)
-  if (spec !== undefined) return spec
-
-  const { R } = adapter
-  const maxTimes = crop.regrow ? (crop.times || 1) : 1
-  const harvests = []
-  let curT = simT
-  let h = 0
-  let totalPlantAndCareEn = R.WORLD?.cost?.plant ?? 2
-  let witheredAtEnd = false
-
-  while (h < maxTimes) {
-    const plantedDay = R.isleDay(curT)
-    if (!crop.seasons.includes(R.seasonOf(plantedDay))) {
-      witheredAtEnd = true
-      break
-    }
-    const timing = adapter.exactPlotTimings({ c: crop.id, t: curT, w: 0, g: 0, h }, isSpr, curT, clockStart)
-    if (!timing) break
-    const isRain = R.weatherOf(plantedDay) === 1
-    const wateredStages = isSpr || isRain ? 3 : 2
-    let stepEn = R.WORLD?.cost?.harvest ?? 1
-    if (!isSpr && !isRain) {
-      stepEn += wateredStages * (R.WORLD?.cost?.water ?? 1)
-    }
-    totalPlantAndCareEn += stepEn
-    const expByQ = expectedContinuationHarvestYield(wateredStages, false)
-    harvests.push({
-      matureAt: timing.matureAt,
-      expByQ,
-      totalUnits: expByQ[0] + expByQ[1] + expByQ[2],
-      stepEn,
-    })
-    curT = timing.matureAt
-    h++
-  }
-
-  if (harvests.length === 0) {
-    memo.set(key, null)
-    return null
-  }
-
-  spec = {
-    crop,
-    harvests,
-    endSec: curT,
-    occupiedSec: Math.max(60, curT - simT),
-    seedCost: Number(crop.seed || 0),
-    totalPlantAndCareEn,
-    witheredAtEnd,
-  }
-  memo.set(key, spec)
-  return spec
-}
 
 /**
  * Unified Multi-Season Continuation Farm Flow & Renewal Engine:
@@ -182,7 +108,6 @@ export function projectContinuationFarmFlows(adapter, worldAtStart, contSlots, {
   let remFreeEn = Math.max(0, Number.isFinite(freeRegenEnPool) ? Number(freeRegenEnPool) : Infinity)
   const coffeePricePerEn = (Number(R.WORLD?.coffee?.price || 15000)) / Math.max(1, Number(R.WORLD?.coffee?.energy || 60))
   const clearEnCost = R.WORLD?.cost?.clear ?? 1
-  const harvestEnCost = R.WORLD?.cost?.harvest ?? 1
   const craftEnCost = R.WORLD?.cost?.craft ?? 1
 
   const previewStaminaCost = (enUnits, disc = 1.0) => {
@@ -339,69 +264,43 @@ export function projectContinuationFarmFlows(adapter, worldAtStart, contSlots, {
         continue
       }
       const isSpr = Boolean(R.sprinkled(state, pIdx))
-      const maxTimes = crop.regrow ? (crop.times || 1) : 1
-      let curPlot = { ...p0 }
-      let releaseSec = tStart
+      const standing = adapter.simulateStandingPlotLifecycle(p0, {
+        nowSec: tStart,
+        isSprinkled: isSpr,
+        clockStart,
+        cutoffEndSec: contEndSec,
+        dryManualWaterStages: 2,
+      })
 
-      while ((curPlot.h || 0) < maxTimes) {
-        const plantedDay = R.isleDay(curPlot.t)
-        if (!crop.seasons.includes(R.seasonOf(plantedDay))) {
-          releaseSec = Math.max(tStart, Number(curPlot.t || tStart))
-          needsClear[pIdx] = 1
-          break
-        }
-        const evalFrom = Math.max(tStart, Number(curPlot.t || tStart))
-        const timing = adapter.exactPlotTimings(curPlot, isSpr, evalFrom, clockStart)
-        if (!timing) {
-          releaseSec = contEndSec + 1
-          break
-        }
-        const plantedIsRain = R.weatherOf(plantedDay) === 1
-        const wStages = isSpr || plantedIsRain ? 3 : Math.max(Number(curPlot.w || 0), 2)
-        const wasStolen = !!(curPlot.h === p0.h && p0.sv && p0.sv.length > 0)
-        const expByQ = expectedContinuationHarvestYield(wStages, wasStolen)
-        const stepStart = Math.max(tStart, Number(curPlot.t || tStart))
-
-        if (timing.matureAt <= contEndSec) {
-          standingEvents.push({
-            atSec: Math.max(tStart, timing.matureAt),
-            cropId: crop.id,
-            expByQ,
-            frac: 1.0,
-          })
-          releaseSec = Math.max(tStart, timing.matureAt)
-          const nextH = (curPlot.h || 0) + 1
-          if (crop.regrow && nextH < maxTimes) {
-            curPlot = { c: crop.id, t: timing.matureAt, w: 0, g: 0, h: nextH }
-          } else {
-            break
-          }
-        } else {
-          if (stepStart < contEndSec) {
-            const denom = Math.max(60, timing.matureAt - Number(curPlot.t || stepStart))
-            const numer = Math.max(0, contEndSec - Number(curPlot.t || stepStart))
-            const frac = Math.min(1, numer / denom)
-            if (frac > 0) {
-              standingEvents.push({
-                atSec: contEndSec - 1,
-                cropId: crop.id,
-                expByQ: [expByQ[0] * frac, expByQ[1] * frac, expByQ[2] * frac],
-                frac,
-              })
-            }
-          }
-          releaseSec = contEndSec + 1
-          break
-        }
+      for (const hv of standing.harvests) {
+        standingEvents.push({
+          atSec: hv.matureAt,
+          cropId: crop.id,
+          expByQ: hv.expectedByQuality,
+          stepEn: hv.stepEn,
+        })
       }
-      freeAtSec[pIdx] = releaseSec
+      if (standing.partialProgressAtCutoff) {
+        const pp = standing.partialProgressAtCutoff
+        standingEvents.push({
+          atSec: pp.atSec,
+          cropId: crop.id,
+          expByQ: pp.expectedByQuality,
+          stepEn: pp.stepEn * pp.frac,
+        })
+      }
+
+      freeAtSec[pIdx] = standing.releaseSec
+      if (standing.needsClearAtEnd) {
+        needsClear[pIdx] = 1
+      }
     }
 
     standingEvents.sort((a, b) => a.atSec - b.atSec)
     for (const ev of standingEvents) {
       const disc = discountFactor(discRatePerHour, Math.max(0, ev.atSec - originSec))
       const rev = evaluateHarvestBatch(ev.cropId, ev.expByQ, ev.atSec, true)
-      const enCost = commitStaminaCost(harvestEnCost * ev.frac, disc)
+      const enCost = commitStaminaCost(ev.stepEn, disc)
       standingPlotValue += Math.max(0, rev - enCost)
     }
   }
@@ -438,31 +337,78 @@ export function projectContinuationFarmFlows(adapter, worldAtStart, contSlots, {
       const discStart = discountFactor(discRatePerHour, Math.max(0, simT - originSec))
       const extraClearEnPerPlot = ncFlag ? clearEnCost : 0
 
-      let bestSpec = null
-      let bestRate = 0
-      let bestTotalEnPerPlot = 0
-
-      for (const crop of inSeason) {
-        const spec = getMemoizedCropCycleSpec(adapter, clockStart, crop, isSpr, simT)
-        if (!spec) continue
+      const previewCyclePerPlotAt = (crop, startSec) => {
+        const spec = adapter.simulateCropLifecycleFromPlant(crop, {
+          startSec,
+          isSprinkled: isSpr,
+          clockStart,
+          cutoffEndSec: -1,
+          dryManualWaterStages: 2,
+        })
+        if (!spec) return null
         let revBatch = 0
         for (const h of spec.harvests) {
           const evalSec = Math.min(contEndSec - 1, h.matureAt)
+          const eq = h.expectedByQuality
           revBatch += evaluateHarvestBatch(
             crop.id,
-            [h.expByQ[0] * batchCount, h.expByQ[1] * batchCount, h.expByQ[2] * batchCount],
+            [eq[0] * batchCount, eq[1] * batchCount, eq[2] * batchCount],
             evalSec,
             false
           )
         }
-        const totEnPerPlot = extraClearEnPerPlot + spec.totalPlantAndCareEn + (spec.witheredAtEnd ? clearEnCost : 0)
-        const enValBatch = previewStaminaCost(totEnPerPlot * batchCount, discStart)
-        const netBatch = revBatch - spec.seedCost * batchCount * discStart - enValBatch
-        const ratePerPlotSec = netBatch / (batchCount * spec.occupiedSec)
-        if (netBatch > 1e-6 && ratePerPlotSec > bestRate + 1e-9) {
-          bestRate = ratePerPlotSec
+        const dStart = discountFactor(discRatePerHour, Math.max(0, startSec - originSec))
+        const cycleEnValBatch = previewStaminaCost(spec.totalStaminaSpent * batchCount, dStart)
+        const cycleNetPerPlot = (revBatch - spec.seedCost * batchCount * dStart - cycleEnValBatch) / batchCount
+        return {
+          spec,
+          cycleNetPerPlot,
+          rawRatePerPlotSec: cycleNetPerPlot / spec.occupiedSec,
+        }
+      }
+
+      const nextSeasonB = adapter.nextSeasonBoundary(simT, clockStart)
+      const evaluatedInSeason = []
+      let hasCrossSeasonSpill = false
+      for (const crop of inSeason) {
+        const prev = previewCyclePerPlotAt(crop, simT)
+        if (!prev || !(prev.cycleNetPerPlot > 1e-6)) continue
+        evaluatedInSeason.push(prev)
+        if (nextSeasonB > simT && nextSeasonB < contEndSec && prev.spec.endSec > nextSeasonB) {
+          hasCrossSeasonSpill = true
+        }
+      }
+
+      let rNextSeason = 0
+      if (hasCrossSeasonSpill) {
+        const nextSeason = R.seasonOf(R.isleDay(nextSeasonB))
+        for (const futCrop of cropsBySeason[nextSeason] || []) {
+          const nextPrev = previewCyclePerPlotAt(futCrop, nextSeasonB)
+          if (nextPrev && nextPrev.rawRatePerPlotSec > rNextSeason) {
+            rNextSeason = nextPrev.rawRatePerPlotSec
+          }
+        }
+      }
+
+      let bestSpec = null
+      let bestScore = 0
+      let bestTotalEnPerPlot = 0
+
+      for (const prev of evaluatedInSeason) {
+        const { spec, cycleNetPerPlot, rawRatePerPlotSec } = prev
+        let score = rawRatePerPlotSec
+        if (hasCrossSeasonSpill && rNextSeason > 0 && spec.endSec > nextSeasonB) {
+          const spillNextSec = spec.endSec - nextSeasonB
+          const surplusVsWait = cycleNetPerPlot - spillNextSec * rNextSeason
+          if (!(surplusVsWait > 1e-6)) continue
+          const preBoundaryWindowSec = Math.min(spec.occupiedSec, Math.max(60, nextSeasonB - simT))
+          score = surplusVsWait / preBoundaryWindowSec
+        }
+        if (score > bestScore + 1e-9) {
+          bestScore = score
           bestSpec = spec
-          bestTotalEnPerPlot = totEnPerPlot
+          // Note: `spec.totalStaminaSpent` ALREADY includes `spec.endClearEnCost` when `spec.needsClearAtEnd === true`!
+          bestTotalEnPerPlot = extraClearEnPerPlot + spec.totalStaminaSpent
         }
       }
 
@@ -476,18 +422,20 @@ export function projectContinuationFarmFlows(adapter, worldAtStart, contSlots, {
       if (bestSpec.endSec <= contEndSec) {
         let realizedRev = 0
         for (const h of bestSpec.harvests) {
+          const eq = h.expectedByQuality
           realizedRev += evaluateHarvestBatch(
             bestSpec.crop.id,
-            [h.expByQ[0] * batchCount, h.expByQ[1] * batchCount, h.expByQ[2] * batchCount],
+            [eq[0] * batchCount, eq[1] * batchCount, eq[2] * batchCount],
             h.matureAt,
             true
           )
         }
         const enVal = commitStaminaCost(bestTotalEnPerPlot * batchCount, discStart)
         renewalPlotValue += Math.max(0, realizedRev - bestSpec.seedCost * batchCount * discStart - enVal)
-        const nextClear = bestSpec.witheredAtEnd ? 1 : 0
+        // `bestTotalEnPerPlot` already charged both `extraClearEnPerPlot` and `bestSpec.endClearEnCost`,
+        // so `needsClear` is strictly 0 at `bestSpec.endSec` (no double-counting!).
         for (const pIdx of batchPlots) {
-          needsClear[pIdx] = nextClear
+          needsClear[pIdx] = 0
           freeAtSec[pIdx] = bestSpec.endSec
         }
       } else {
@@ -496,9 +444,10 @@ export function projectContinuationFarmFlows(adapter, worldAtStart, contSlots, {
           let realizedRev = 0
           for (const h of bestSpec.harvests) {
             const evalSec = Math.min(contEndSec - 1, h.matureAt)
+            const eq = h.expectedByQuality
             realizedRev += evaluateHarvestBatch(
               bestSpec.crop.id,
-              [h.expByQ[0] * frac * batchCount, h.expByQ[1] * frac * batchCount, h.expByQ[2] * frac * batchCount],
+              [eq[0] * frac * batchCount, eq[1] * frac * batchCount, eq[2] * frac * batchCount],
               evalSec,
               true
             )
