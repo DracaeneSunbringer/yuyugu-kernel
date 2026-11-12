@@ -9,17 +9,26 @@ import { loadRulesAdapterFromFile } from '../model/rules-adapter.mjs'
 import { ContentAddressedJournal } from '../audit/journal.mjs'
 import { auditTransactionReplay } from '../audit/replay.mjs'
 import { buildAuditDecisionReport } from '../audit/report.mjs'
-import { executeTransaction, reconcileUnknownWithFreshWorld } from '../execution/reconcile.mjs'
+import { reconcileUnknownWithFreshWorld } from '../execution/reconcile.mjs'
 import {
+  BREW_READY_SEC,
   FORBIDDEN_XIAN_ACTIONS,
+  MAX_XS_BATCH,
   assertSafeXianBatch,
   computeNextXianWakeSec,
-  estimateBattleWinProb,
+  fromWireXsAction,
   normalizeXianOptions,
   planXianActions,
   runXianCultivationSlice,
+  selectOptimalFusionPair,
 } from '../execution/xian-cultivation.mjs'
-import { xianAction, xianDay, xianNeed, xianTowerEnemy } from '../rules/b16-xian-rules.js'
+import {
+  MED_MAX,
+  act as xsAct,
+  cvNeed,
+  newXs,
+  tick as xsTick,
+} from '../rules/xs-xian-rules.js'
 import { runLiveAccountTick } from '../cli/live-daemon.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -27,7 +36,7 @@ const ROOT_DIR = path.resolve(__dirname, '..')
 const RULES_PATH = path.join(ROOT_DIR, 'rules/pet-world-rules.js')
 const CLOCK_START = 1794212939
 
-function makeTempDir(prefix = 'kernel-p11-xian-') {
+function makeTempDir(prefix = 'kernel-p11-xs-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 }
 
@@ -41,7 +50,22 @@ function makeRng(seed = 0x12345678) {
   }
 }
 
-function makeBaseWorld(adapter, nowSec, overrides = {}) {
+function makePostPrologueXs(nowSec, roots = ['metal', 'water']) {
+  const x = newXs(nowSec)
+  x.st = 4
+  x.root = roots[0]
+  x.roots = { e: [...roots], v: [] }
+  x.hv = 1
+  // Prologue harvested plot 14 (`lingcao`) and story 4 awarded +30 stone & +3 `jingu` seeds
+  x.plots[14] = { s: 'soil' }
+  x.bag.lingcao = 1
+  x.xp = 4
+  x.stone = 130
+  x.seeds.jingu = 3
+  return x
+}
+
+function makeBaseWorld(adapter, nowSec, xsState = null, overrides = {}) {
   const s = adapter.R.newWorld(nowSec)
   s.inv = {
     iron: [10, 0, 0],
@@ -57,6 +81,7 @@ function makeBaseWorld(adapter, nowSec, overrides = {}) {
   s.enT = nowSec
   s.enDay = adapter.R.worldDay(nowSec)
   s.iq = { d: adapter.R.isleIndex(nowSec), craft: 0, mine: 0, fish: 0, bomb: 0 }
+  if (xsState) s.xs = structuredClone(xsState)
   const prices = {}
   for (const id of adapter.graph.sellableIds) {
     prices[id] = Number(adapter.R.BASE_PRICE[id])
@@ -73,36 +98,33 @@ function makeBaseWorld(adapter, nowSec, overrides = {}) {
   }
 }
 
-function applyAuthoritativeXianBatch(world, actions, rng) {
+function applyAuthoritativeXsBatch(world, wireActions, rng = Math.random) {
+  assert.ok(wireActions.length <= MAX_XS_BATCH, `Batch size ${wireActions.length} exceeds server MAX=${MAX_XS_BATCH}`)
   const next = structuredClone(world)
+  next.state.xs ||= newXs(next.now)
   const out = []
-  let totalSpend = 0
-  for (const act of actions) {
-    const res = xianAction(next.state, act, {
-      t: next.now,
-      coins: next.coins,
-      rand: rng,
-    })
-    assert.ok(res && res.ok, `Expected xianAction(${JSON.stringify(act)}) to succeed, got: ${JSON.stringify(res)}`)
-    const sp = Number(res.spend || 0)
-    if (sp > 0) {
-      next.coins -= sp
-      totalSpend += sp
-    }
+  for (const wire of wireActions) {
+    const internal = fromWireXsAction(wire)
+    assert.ok(internal, `Expected valid xs* wire action, got: ${JSON.stringify(wire)}`)
+    const res = xsAct(next.state.xs, internal, next.now, rng)
+    assert.ok(res && res.ok, `Expected xsAct(${JSON.stringify(wire)}) to succeed, got: ${JSON.stringify(res)}`)
     out.push(res)
   }
   next.rev = Number(next.rev || 0) + 1
-  return { afterWorld: next, out, spend: totalSpend }
+  return { afterWorld: next, out }
 }
 
-test('Phase 11.1: Default-OFF isolation guarantees zero xian actions, zero wake perturbation, and null backgroundReport.xian', async () => {
+test('Phase 11.1: Default-OFF isolation guarantees zero xs actions, zero wake perturbation, and null backgroundReport.xian', async () => {
   const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: CLOCK_START })
   const t0 = 1794450000
-  const world = makeBaseWorld(adapter, t0)
+  const world = makeBaseWorld(adapter, t0, makePostPrologueXs(t0))
 
   const defOpts = normalizeXianOptions()
   assert.equal(defOpts.enabled, false)
-  assert.equal(defOpts.dailyStoneQuota, 0)
+  assert.equal(defOpts.breakMode, 'smart')
+  assert.equal(defOpts.autoFuse, false)
+  assert.equal(defOpts.fuseTarget, 'auto')
+  assert.equal(defOpts.maxActionsPerBatch, 30)
 
   const plan = planXianActions(world, t0)
   assert.equal(plan.enabled, false)
@@ -121,371 +143,424 @@ test('Phase 11.1: Default-OFF isolation guarantees zero xian actions, zero wake 
     observedWorld: world,
   })
   assert.equal(sliceOut.status, 'disabled')
-  assert.deepEqual(sliceOut.actions, [])
 
-  const tmpDir = makeTempDir('kernel-p11-defoff-')
-  let postActCalls = 0
-  const mockHttp = {
-    stats: { getCount: 0, postCount: 0 },
-    nowMsFn: () => t0 * 1000,
-    estimatedServerNowSec: () => t0,
-    estimatedServerNowMs: () => t0 * 1000,
-    getJson: async (apiPath) => {
-      if (apiPath === '/api/pet/world') return structuredClone(world)
-      if (apiPath === '/api/pet') return { adopted: false }
-      if (apiPath === '/api/pet/battle/home') return { adopted: false }
-      return {}
-    },
-    postJson: async (apiPath) => {
-      if (apiPath === '/api/pet/world/act') postActCalls++
-      return { ok: true, status: 200, networkError: false, body: {} }
-    },
+  const tmp = makeTempDir('p11-def-off-')
+  try {
+    let curWorld = makeBaseWorld(adapter, t0, makePostPrologueXs(t0), {
+      coins: 0,
+      state: {
+        en: 0,
+        enT: t0,
+        inv: {},
+        barnN: 0,
+        barn: [],
+        trapN: 0,
+        traps: [],
+        plots: Array.from({ length: 24 }, () => ({ c: 'corn', t: t0, w: 3, g: 0, h: 0 })),
+        iq: { d: adapter.R.isleIndex(t0), craft: 80, mine: 30, fish: 20, bomb: 0 },
+      },
+    })
+    const journal = new ContentAddressedJournal({ rootDir: path.join(tmp, 'journal'), account: 'main' })
+    const postedPayloads = []
+    const mockHttp = {
+      nowMsFn: () => curWorld.now * 1000,
+      estimatedServerNowSec: () => curWorld.now,
+      estimatedServerNowMs: () => curWorld.now * 1000,
+      serverSecToLocalMs: (s) => s * 1000,
+      stats: { getCount: 0, postCount: 0 },
+      getJson: async (url) => {
+        if (url === '/api/pet/world') return structuredClone(curWorld)
+        if (url === '/api/pet/home' || url === '/api/pet/status') return { adopted: false }
+        if (url === '/api/pet/huancai') return { boughtToday: true }
+        return {}
+      },
+      postJson: async (url, payload) => {
+        postedPayloads.push({ url, payload: structuredClone(payload) })
+        if (url === '/api/pet/world/act') {
+          const { afterWorld, out } = applyAuthoritativeXsBatch(curWorld, payload.actions, makeRng(101))
+          curWorld = afterWorld
+          return { ok: true, status: 200, networkError: false, body: { ok: true, rev: curWorld.rev, out, world: structuredClone(curWorld) } }
+        }
+        return { ok: true, status: 200, networkError: false, body: { ok: true } }
+      },
+    }
+    const commonTickArgs = {
+      account: 'main',
+      adapter,
+      httpClient: mockHttp,
+      journal,
+      snipeScheduler: {
+        isStealEnabled: () => false,
+        shouldBlockBackgroundWork: () => false,
+        nextExactUnlockInfo: () => null,
+        computeImminentSnipeStaminaReservation: () => ({ staminaReserveFloor: 0, staminaReserveUntilSec: 0 }),
+      },
+      lockRootDir: path.join(tmp, 'locks'),
+      profileStorePath: path.join(tmp, 'profiles.json'),
+      huancaiStatePath: path.join(tmp, 'huancai.json'),
+      runtimeState: {
+        lastPetCareAtSec: t0,
+        lastBattlePrepAtSec: t0,
+        lastHuancaiCheckAtSec: t0,
+        arenaRemaining: 0,
+      },
+      baseUserConstraints: { allowCapex: false, maxStealsPerIsleDay: 0, minStealSpots: 999999 },
+      objectiveCfg: { horizonSec: 3600 },
+      solverOptions: { checkHorizonStability: false, stochasticPolicySamples: 1 },
+    }
+
+    // Default-OFF tick: zero POSTs, null `backgroundReport.xian`, wake time unperturbed by xs timers
+    const tickOff = await runLiveAccountTick(commonTickArgs)
+    assert.equal(tickOff.phase, 'full-tick')
+    assert.equal(tickOff.controllerOut.status, 'waiting')
+    assert.equal(tickOff.backgroundReport.xian, null)
+    assert.equal(postedPayloads.length, 0)
+
+    // Explicit `--enable-xian` tick on the exact same idle main island: executes `xs*` slice cleanly and incorporates xs wake timer
+    const tickOn = await runLiveAccountTick({
+      ...commonTickArgs,
+      xianOptions: { enabled: true },
+    })
+    assert.equal(tickOn.phase, 'full-tick')
+    assert.equal(tickOn.backgroundReport.xian?.status, 'confirmed')
+    assert.equal(postedPayloads.length, 1)
+    assert.ok(postedPayloads[0].payload.actions.every((a) => String(a.a).startsWith('xs')))
+    assert.ok(tickOn.nextWakeSec <= tickOff.nextWakeSec)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
   }
-
-  const tickRes = await runLiveAccountTick({
-    account: 'secondary',
-    adapter,
-    httpClient: mockHttp,
-    partnerHttpClient: null,
-    journal: null,
-    partnerJournal: null,
-    snipeScheduler: null,
-    lockRootDir: path.join(tmpDir, 'locks'),
-    profileStorePath: path.join(tmpDir, 'profiles.json'),
-    huancaiStatePath: path.join(tmpDir, 'huancai.json'),
-    runtimeState: {
-      lastPetCareAtSec: t0,
-      lastBattlePrepAtSec: t0,
-      lastHuancaiCheckAtSec: t0,
-      arenaRemaining: 0,
-    },
-    baseUserConstraints: { allowCapex: false, maxStealsPerIsleDay: 0, minStealSpots: 999999 },
-    objectiveCfg: { horizonSec: 600, continuationIsleDays: 0 },
-    solverOptions: { runStability: false, allowedActionTypes: ['sell', 'wait'] },
-    dryRun: true,
-  })
-  assert.equal(tickRes.backgroundReport?.xian, null, 'Default xianOptions must leave backgroundReport.xian === null')
-  assert.equal(postActCalls, 0)
 })
 
-test('Phase 11.2: Free bootstrap & 72-hour autonomous cultivation loop spends strictly 0 D-coins and 0 island materials', async () => {
+test('Phase 11.2: Prologue standby (st < 4 / unchosen root), manual danmaku/NPC-duel yield, and static batch firewall', async () => {
+  const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: CLOCK_START })
+  const t0 = 1794450000
+  const opts = { enabled: true }
+
+  // 1. Brand-new world without `state.xs` or mid-prologue (`st = 2`) stays in standby
+  const wNoXs = makeBaseWorld(adapter, t0, null)
+  const p0 = planXianActions(wNoXs, t0, opts)
+  assert.equal(p0.reason, 'prologue-manual-standby')
+  assert.deepEqual(p0.actions, [])
+  assert.equal(computeNextXianWakeSec(wNoXs, t0, opts), t0 + 120)
+
+  const midPrologue = newXs(t0)
+  midPrologue.st = 2
+  midPrologue.root = 'water'
+  midPrologue.roots = { e: ['water', 'wood'], v: [] }
+  const pMid = planXianActions(makeBaseWorld(adapter, t0, midPrologue), t0, opts)
+  assert.equal(pMid.reason, 'prologue-manual-standby')
+  assert.deepEqual(pMid.actions, [])
+
+  // 2. Active manual stage fight (`secret`) or NPC duel (`duel`) cleanly yields without clobbering `rev`
+  const xsInDuel = makePostPrologueXs(t0)
+  xsInDuel.fight = { s: 'duel', t: t0 - 15, npc: 'castle' }
+  const wDuel = makeBaseWorld(adapter, t0, xsInDuel)
+  const pDuel = planXianActions(wDuel, t0, opts)
+  assert.equal(pDuel.reason, 'manual-fight-in-progress')
+  assert.deepEqual(pDuel.actions, [])
+  assert.ok(computeNextXianWakeSec(wDuel, t0, opts) > t0)
+
+  // Once 1800s fight timeout has elapsed, automation resumes normally
+  const pExpiredFight = planXianActions(wDuel, t0 + 1850, opts)
+  assert.equal(pExpiredFight.reason, 'actions-ready')
+  assert.ok(pExpiredFight.actions.length > 0)
+
+  // 3. Static firewall assertions
+  for (const forbidden of FORBIDDEN_XIAN_ACTIONS) {
+    assert.throws(() => assertSafeXianBatch([{ a: forbidden }], wDuel, opts), /Forbidden manual-only/)
+  }
+  assert.throws(() => assertSafeXianBatch([{ a: 'sell', id: 'corn', n: 1 }], wDuel, opts), /Illegal non-xs/)
+  assert.throws(() => assertSafeXianBatch([{ a: 'xsFuse', el: 'metal+water' }], wDuel, { enabled: true, autoFuse: false }), /autoFuse is disabled/)
+  assert.throws(() => assertSafeXianBatch([{ a: 'xsBreak' }], wDuel, { enabled: true, breakMode: 'manual' }), /breakMode is manual/)
+})
+
+test('Phase 11.3: Deterministic log % 4 === 3 orchestration achieves 2x yield across multi-plot leizhu harvests', async () => {
+  const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: CLOCK_START })
+  const t0 = 1794450000
+
+  for (const startLogMod of [0, 1, 2, 3]) {
+    const xs = makePostPrologueXs(t0, ['metal'])
+    xs.lv = 5
+    xs.en = 90
+    xs.stone = 600
+    xs.log = 100 + startLogMod
+    xs.seeds = {}
+    xs.bag = { lingcao: 6, jingu: 2, linglan: 2 }
+    xs.pills = { huiling: 6, peiyuan: 4 }
+    xs.techs = ['metal']
+    xs.tech = 'metal'
+    xs.med = { t: t0 - 300 }
+    // 6 mature `leizhu` plots (`g = 3`), remaining open plots already watered & growing
+    for (let i = 0; i < 8; i++) {
+      xs.plots[i] = i < 6
+        ? { s: 'soil', c: 'leizhu', g: 3, w: 0 }
+        : { s: 'soil', c: 'leizhu', g: 1, w: t0 - 100 }
+    }
+    xs.plots[14] = { s: 'soil', c: 'leizhu', g: 1, w: t0 - 100 }
+    xs.plots[15] = { s: 'soil', c: 'leizhu', g: 1, w: t0 - 100 }
+
+    let world = makeBaseWorld(adapter, t0, xs)
+    const plan = planXianActions(world, t0, { enabled: true })
+    assert.ok(plan.actions.length > 0 && plan.actions.length <= MAX_XS_BATCH)
+
+    const { afterWorld, out } = applyAuthoritativeXsBatch(world, plan.actions)
+    const harvestOuts = out.filter((o) => o.herb === 'leizhu')
+    assert.equal(harvestOuts.length, 6, `Expected all 6 mature leizhu harvested for startLogMod=${startLogMod}`)
+    for (const hOut of harvestOuts) {
+      assert.equal(hOut.n, 2, `Expected 2x leizhu yield via log%4===3 alignment (startLogMod=${startLogMod}), got ${JSON.stringify(hOut)}`)
+    }
+    assert.equal(afterWorld.coins, world.coins)
+  }
+})
+
+test('Phase 11.4: 72-hour autonomous loop progresses st=4 -> Farm Lv5 leizhu with 0 island resource drift and 0 spin wakes', async () => {
   const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: CLOCK_START })
   const rng = makeRng(0x20261112)
-  let t = 1794451200
-  let world = makeBaseWorld(adapter, t)
+  const tStart = 1794450000
+  let curT = tStart
+  let world = makeBaseWorld(adapter, curT, makePostPrologueXs(curT, ['water', 'wood']))
   const initialCoins = world.coins
+  const initialEn = world.state.en
+  const initialInvJson = JSON.stringify(world.state.inv)
 
-  // First tick on fresh account (`!world.state.xian`): enters, turns on heal carry, talks to all 21 NPCs, plants & waters dew
-  const bootPlan = planXianActions(world, t, { enabled: true })
-  assert.equal(bootPlan.reason, 'bootstrap-enter')
-  assert.equal(bootPlan.expectedSpendCoins, 0)
-  assert.equal(bootPlan.actions[0]?.a, 'xianEnter')
-  assert.ok(bootPlan.actions.some((a) => a.a === 'xianCarry' && a.on === true))
-  assert.equal(bootPlan.actions.filter((a) => a.a === 'xianTalk').length, 21)
-  assert.ok(bootPlan.actions.some((a) => a.a === 'xianPlant' && a.id === 'dew'))
-  assert.ok(bootPlan.actions.some((a) => a.a === 'xianWater'))
+  const opts = { enabled: true, breakMode: 'smart', autoFuse: false }
+  let totalBatches = 0
+  let brewFinishes = 0
+  let maxBatchSeen = 0
 
-  let applied = applyAuthoritativeXianBatch(world, bootPlan.actions, rng)
-  world = applied.afterWorld
-  assert.equal(world.coins, initialCoins, 'Bootstrap entry must spend 0 D-coins')
-  assert.equal(world.state.xian?.v, 1)
-  assert.ok(world.state.xian.stone >= 300, 'Starter 100 stones + 21 NPC daily talks (~268) must exceed 360 stones')
-
-  // Simulate 72 hours of event-driven wakeups (`computeNextXianWakeSec` / `followUpSoon`)
-  const endSec = t + 72 * 3600
-  let batchesExecuted = 1
-  let harvests = 0
-  let brews = 0
-  let duelsOrTowers = 0
-
-  while (t < endSec) {
-    const plan = planXianActions(world, t, { enabled: true, dailyStoneQuota: 0 })
+  const tEnd = tStart + 72 * 3600
+  let guard = 0
+  while (curT < tEnd && guard++ < 1500) {
+    world.now = curT
+    const plan = planXianActions(world, curT, opts)
     if (plan.actions.length > 0) {
-      for (const act of plan.actions) {
-        assert.equal(FORBIDDEN_XIAN_ACTIONS.has(act.a), false, `Forbidden action emitted: ${act.a}`)
-        assert.notEqual(act.a, 'xianStoneBuy')
-        if (act.a === 'xianTower') assert.notEqual(act.pay, true)
-        if (act.a === 'xianHarvest') harvests++
-        if (act.a === 'xianBrew') brews++
-        if (act.a === 'xianDuel' || act.a === 'xianTower') duelsOrTowers++
+      maxBatchSeen = Math.max(maxBatchSeen, plan.actions.length)
+      assertSafeXianBatch(plan.actions, world, opts)
+      assert.ok(!plan.actions.some((a) => a.a === 'xsFuse'), 'Must never auto-fuse when autoFuse=false')
+      for (const a of plan.actions) {
+        if (a.a === 'xsFinish') {
+          const d = curT - world.state.xs.brew.t
+          assert.ok(d >= 15 && d <= 1800, `Cauldron finished outside valid window: d=${d}s`)
+          assert.equal(a.n, 2)
+          brewFinishes++
+        }
       }
-      applied = applyAuthoritativeXianBatch(world, plan.actions, rng)
-      world = applied.afterWorld
-      batchesExecuted++
-      assert.equal(world.coins, initialCoins, 'Pure F2P xian loop must never spend a single D-coin')
-      assert.deepEqual(world.state.inv.iron, [10, 0, 0], 'Main-island iron must never be touched')
-      assert.deepEqual(world.state.inv.bomb, [10, 0, 0], 'Main-island bomb must never be touched')
+      const { afterWorld } = applyAuthoritativeXsBatch(world, plan.actions, rng)
+      world = afterWorld
+      totalBatches++
+      assert.equal(world.coins, initialCoins)
+      assert.equal(world.state.en, initialEn)
+      assert.equal(JSON.stringify(world.state.inv), initialInvJson)
+      curT += plan.followUpSoon ? 3 : Math.max(3, computeNextXianWakeSec(world, curT, opts) - curT)
+    } else {
+      const wake = computeNextXianWakeSec(world, curT, opts)
+      assert.ok(Number.isFinite(wake) && wake > curT, `Expected strictly future wake > ${curT}, got ${wake}`)
+      curT = wake
     }
-    const wake = plan.followUpSoon ? t + 3 : computeNextXianWakeSec(world, t, { enabled: true })
-    t = Math.min(endSec, Math.max(t + 3, wake))
-    world.now = t
   }
 
-  assert.ok(batchesExecuted >= 15, `Expected multi-day autonomous progress, ran ${batchesExecuted} batches`)
-  assert.ok(harvests >= 6, `Expected regular spirit herb harvests, got ${harvests}`)
-  assert.ok(brews >= 3, `Expected autonomous pill brewing, got ${brews}`)
-  assert.ok(duelsOrTowers >= 10, `Expected NPC duels & free tower climbs, got ${duelsOrTowers}`)
-  assert.ok(world.state.xian.lv >= 4, `Expected cultivation level progression, reached Lv${world.state.xian.lv}`)
+  const finalXs = world.state.xs
+  xsTick(finalXs, curT)
+  assert.ok(totalBatches > 20)
+  assert.ok(maxBatchSeen <= MAX_XS_BATCH)
+  assert.equal(finalXs.lv, 5, `Expected Farm to reach Lv5 within 72h, got lv=${finalXs.lv} xp=${finalXs.xp}`)
+  assert.ok(brewFinishes >= 4, `Expected multiple q=2 cauldron batches, got ${brewFinishes}`)
+  assert.ok(finalXs.techs.includes('water') && finalXs.techs.includes('wood'), 'Expected both base root techs learned')
+  assert.ok(finalXs.stone > 2000, `Expected strong stone accumulation at Lv5, got ${finalXs.stone}`)
+  const openPlots = finalXs.plots.filter((p) => p.s === 'soil').length
+  assert.ok(openPlots > 10, `Expected surplus xs.en to expand open plots past initial 10, got ${openPlots}`)
 })
 
-test('Phase 11.3: Hard firewall blocks forbidden actions/paid tower and protects x.pend, gun/cannon, and g>=3 gear during salvage', async () => {
+test('Phase 11.5: Breakthrough policies (smart vs eager vs manual), free s=9 over-buffering, and xsBreak-before-xsRise shield', async () => {
   const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: CLOCK_START })
-  const t = 1794460000
-  const rng = makeRng(0x99887766)
-  let world = makeBaseWorld(adapter, t)
-  world = applyAuthoritativeXianBatch(world, [{ a: 'xianEnter' }], rng).afterWorld
+  const t0 = 1794450000
 
-  for (const forbidden of FORBIDDEN_XIAN_ACTIONS) {
-    assert.throws(
-      () => assertSafeXianBatch([{ a: forbidden }], world, { enabled: true }),
-      /Forbidden xian action blocked by firewall/
-    )
-  }
-  assert.throws(
-    () => assertSafeXianBatch([{ a: 'xianTower', pay: true }], world, { enabled: true }),
-    /Paid xianTower is strictly forbidden/
-  )
-  assert.throws(
-    () => assertSafeXianBatch([{ a: 'xianStoneBuy', n: 10 }], world, { enabled: true, dailyStoneQuota: 0 }),
-    /xianStoneBuy blocked when dailyStoneQuota=0/
-  )
-  assert.throws(
-    () => assertSafeXianBatch([{ a: 'sell', id: 'corn', q: 0, n: 1 }], world, { enabled: true }),
-    /Non-xian action leaked/
-  )
+  // 1. While `lv < 5` at `r = 1` (筑基 9 层), `smart` mode prioritizes eating `peiyuan` for Farm Lv5 instead of burning 2 pills on 金丹,
+  //    AND continues 30m meditation cycles at `s = 9` to stack free failure-buffer XP!
+  const xsSubLv5 = makePostPrologueXs(t0, ['metal'])
+  xsSubLv5.lv = 3
+  xsSubLv5.en = 4
+  xsSubLv5.cv = { r: 1, s: 9, xp: cvNeed(1, 9) + 50 }
+  xsSubLv5.pills = { peiyuan: 2 }
+  xsSubLv5.med = { t: t0 - MED_MAX - 10 }
+  for (let i = 0; i < 8; i++) xsSubLv5.plots[i] = { s: 'soil', c: 'binglian', g: 1, w: t0 - 60 }
+  xsSubLv5.plots[14] = { s: 'soil', c: 'binglian', g: 1, w: t0 - 60 }
+  xsSubLv5.plots[15] = { s: 'soil', c: 'binglian', g: 1, w: t0 - 60 }
 
-  // Populate 26 items in bag including:
-  // - id=5: low-score g=0 wood sword currently referenced by `x.pend = { k: 'i', i: 5, ... }`
-  // - id=6: g=0 `gun` (bomb-forged special base)
-  // - id=7: g=1 `cannon` (bomb-forged special base)
-  // - id=8: g=3 `gourd` (`仙器` grade >= 3)
-  // - 22 weak g=0 `wood`/`talisman`/`abacus` filler items
-  const items = [
-    { id: 5, b: 'wood', g: 0, lv: 1, a: [['hp', 0.01]], el: 'wood' },
-    { id: 6, b: 'gun', g: 0, lv: 1, a: [['atk', 0.02]], el: 'fire' },
-    { id: 7, b: 'cannon', g: 1, lv: 2, a: [['atk', 0.03]], el: 'metal' },
-    { id: 8, b: 'gourd', g: 3, lv: 3, a: [['hp', 0.12]] },
-  ]
-  for (let i = 10; i < 32; i++) {
-    items.push({ id: i, b: i % 2 === 0 ? 'wood' : 'talisman', g: 0, lv: 1, a: [['spd', 0.01]], el: 'earth' })
-  }
-  world.state.xian.items = items
-  world.state.xian.nid = 40
-  world.state.xian.eq = { weapon: 10 }
-  world.state.xian.pend = { k: 'i', i: 5, v: [['atk', 0.18]] }
-  world.state.xian.dy = {
-    d: xianDay(t),
-    stone: 0,
-    water: 4,
-    tower: 5,
-    extra: 0,
-    duel: 10,
-    talk: Array.from({ length: 21 }, (_, idx) => `n${idx}`),
-    won: [],
-  }
-  // Mark all real NPCs talked so batch focuses on gear & salvage
-  const plan = planXianActions(world, t, { enabled: true })
-  const salvagedIds = new Set(plan.actions.filter((a) => a.a === 'xianSalvage').map((a) => a.id))
-  assert.ok(salvagedIds.size >= 5, 'Should salvage weak filler items when bag has 26/30 items')
-  assert.equal(salvagedIds.has(5), false, 'Must NEVER salvage item referenced by user pending reforge x.pend!')
-  assert.equal(salvagedIds.has(6), false, 'Must NEVER salvage bomb-forged gun!')
-  assert.equal(salvagedIds.has(7), false, 'Must NEVER salvage bomb-forged cannon!')
-  assert.equal(salvagedIds.has(8), false, 'Must NEVER salvage g>=3 gear!')
-  assert.equal(plan.actions.some((a) => a.a === 'xianPending'), false, 'Must NEVER touch x.pend!')
+  const wSubLv5 = makeBaseWorld(adapter, t0, xsSubLv5)
+  const smartPlan = planXianActions(wSubLv5, t0, { enabled: true, breakMode: 'smart' })
+  assert.ok(!smartPlan.actions.some((a) => a.a === 'xsBreak'), 'smart mode must not burn multi-pill r>=1 break before Farm Lv5')
+  assert.equal(smartPlan.actions.filter((a) => a.a === 'xsUse' && a.herb === 'peiyuan').length, 2, 'smart mode feeds peiyuan to rush Farm Lv5')
+  assert.ok(smartPlan.actions.some((a) => a.a === 'xsRise') && smartPlan.actions.some((a) => a.a === 'xsSit'), 'keeps cycling s=9 meditation for free XP cushion')
 
-  const after = applyAuthoritativeXianBatch(world, plan.actions, rng).afterWorld
-  assert.deepEqual(after.state.xian.pend, { k: 'i', i: 5, v: [['atk', 0.18]] }, 'x.pend must survive untouched')
+  // `eager` mode on the exact same state breaks immediately!
+  const eagerPlan = planXianActions(wSubLv5, t0, { enabled: true, breakMode: 'eager' })
+  assert.ok(eagerPlan.actions.some((a) => a.a === 'xsBreak'), 'eager mode breaks immediately when pills >= r+1')
+
+  // `manual` mode even at `lv = 5` never emits `xsBreak`
+  const xsLv5Full = structuredClone(xsSubLv5)
+  xsLv5Full.lv = 5
+  const manualPlan = planXianActions(makeBaseWorld(adapter, t0, xsLv5Full), t0, { enabled: true, breakMode: 'manual' })
+  assert.ok(!manualPlan.actions.some((a) => a.a === 'xsBreak'))
+
+  // 2. Verify `xsBreak` BEFORE `xsRise` shields in-flight meditation XP on BOTH 60% success and 40% failure!
+  const xsShield = structuredClone(xsLv5Full)
+  xsShield.med = { t: t0 - 1500 } // 25 minutes of accrued meditation
+  const wShield = makeBaseWorld(adapter, t0, xsShield)
+  const shieldPlan = planXianActions(wShield, t0, { enabled: true, breakMode: 'smart' })
+  const breakIdx = shieldPlan.actions.findIndex((a) => a.a === 'xsBreak')
+  const riseIdx = shieldPlan.actions.findIndex((a) => a.a === 'xsRise')
+  assert.ok(breakIdx >= 0 && riseIdx > breakIdx, `Expected xsBreak (${breakIdx}) strictly BEFORE xsRise (${riseIdx})`)
+
+  // Success branch (`rand = 0.1 < 0.6`): enters `r = 2` AND keeps the 25-min session XP in the new realm (`xp > 0`)!
+  const succOut = applyAuthoritativeXsBatch(wShield, shieldPlan.actions, () => 0.1)
+  assert.equal(succOut.afterWorld.state.xs.cv.r, 2)
+  assert.ok(succOut.afterWorld.state.xs.cv.xp > 0, 'Shielded meditation XP must carry into new realm after xsBreak!')
+
+  // Failure branch (`rand = 0.9 >= 0.6`): 25-min session XP is added AFTER `Math.floor(xp * 0.7)` (100% untaxed!)
+  const failOut = applyAuthoritativeXsBatch(wShield, shieldPlan.actions, () => 0.9)
+  const expectedUntaxedFloor = Math.floor(xsShield.cv.xp * 0.7)
+  assert.ok(failOut.afterWorld.state.xs.cv.xp > expectedUntaxedFloor + 200)
 })
 
-test('Phase 11.4: Optional --xian-daily-stone respects daily quota and cashReserveFloor', async () => {
+test('Phase 11.6: Pentagon C_5 4-root dual-fusion protection, target filter, and pre-fusion base-tech preservation', async () => {
   const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: CLOCK_START })
-  const t = 1794470000
-  const rng = makeRng(0x55443322)
-  let world = makeBaseWorld(adapter, t, { coins: 320000 })
-  world = applyAuthoritativeXianBatch(world, [{ a: 'xianEnter' }], rng).afterWorld
+  const t0 = 1794450000
 
-  // Request up to 300 stones/day (`300,000 D`), but with `coins = 320,000` and `cashReserveFloor = 150,000`,
-  // affordable budget is `170,000 D` -> must buy exactly `170` stones!
-  const p1 = planXianActions(world, t, {
-    enabled: true,
-    dailyStoneQuota: 300,
-    cashReserveFloor: 150000,
-  })
-  const buyAct1 = p1.actions.find((a) => a.a === 'xianStoneBuy')
-  assert.deepEqual(buyAct1, { a: 'xianStoneBuy', n: 170 })
-  assert.equal(p1.expectedSpendCoins, 170000)
+  // 1. 4-root chain `fire - metal - water - wood`:
+  //    Middle edge `metal+water` (`ice`) would strand `fire` & `wood` (`totalReachableFusions = 1`).
+  //    `selectOptimalFusionPair` with `auto` MUST select an endpoint (`fire+metal -> thunder` or `water+wood -> wind`, `totalReachableFusions = 2`)!
+  const fourRoots = { e: ['fire', 'metal', 'water', 'wood'], v: [] }
+  const bestAuto = selectOptimalFusionPair(fourRoots, 'auto')
+  assert.ok(bestAuto)
+  assert.equal(bestAuto.totalReachableFusions, 2)
+  assert.notEqual(bestAuto.variantId, 'ice', 'Must NEVER pick middle edge on P_4 4-root chain!')
+  assert.ok(['thunder', 'wind'].includes(bestAuto.variantId))
 
-  world = applyAuthoritativeXianBatch(world, p1.actions, rng).afterWorld
-  assert.equal(world.coins, 150000, 'Post-exchange coins must never dip below cashReserveFloor')
+  // Explicit user `--xian-fuse-target wind` picks `water+wood`
+  const pickWind = selectOptimalFusionPair(fourRoots, 'wind')
+  assert.equal(pickWind?.variantId, 'wind')
+  assert.equal(pickWind?.key, 'water+wood')
 
-  // Once coins increase later in the same CST day (`+200,000 D`), only the remaining `300 - 170 = 130` stones are bought!
-  world.coins += 200000
-  const p2 = planXianActions(world, t + 60, {
-    enabled: true,
-    dailyStoneQuota: 300,
-    cashReserveFloor: 150000,
-  })
-  const buyAct2 = p2.actions.find((a) => a.a === 'xianStoneBuy')
-  assert.deepEqual(buyAct2, { a: 'xianStoneBuy', n: 130 })
-  world = applyAuthoritativeXianBatch(world, p2.actions, rng).afterWorld
-  assert.equal(world.state.xian.dy.stone, 300)
+  // 2. Pre-fusion tech preservation + low-`cv.xp` window gate
+  const xsFuseState = makePostPrologueXs(t0, ['metal', 'water'])
+  xsFuseState.lv = 5
+  xsFuseState.en = 4
+  xsFuseState.stone = 500
+  xsFuseState.cv = { r: 1, s: 1, xp: 0 }
+  xsFuseState.pills = { peiyuan: 2 }
+  xsFuseState.techs = ['metal'] // `water` tech NOT learned yet!
+  xsFuseState.tech = 'metal'
+  xsFuseState.med = { t: t0 - 120 }
+  for (let i = 0; i < 8; i++) xsFuseState.plots[i] = { s: 'soil', c: 'leizhu', g: 1, w: t0 - 60 }
+  xsFuseState.plots[14] = { s: 'soil', c: 'leizhu', g: 1, w: t0 - 60 }
+  xsFuseState.plots[15] = { s: 'soil', c: 'leizhu', g: 1, w: t0 - 60 }
 
-  // Further ticks on the same CST day emit 0 xianStoneBuy
-  const p3 = planXianActions(world, t + 120, {
-    enabled: true,
-    dailyStoneQuota: 300,
-    cashReserveFloor: 150000,
-  })
-  assert.equal(p3.actions.some((a) => a.a === 'xianStoneBuy'), false)
+  const wFuse = makeBaseWorld(adapter, t0, xsFuseState)
+  const fusePlan = planXianActions(wFuse, t0, { enabled: true, autoFuse: true, fuseTarget: 'auto' })
+  // Must learn `water` (`xsLearn`) BEFORE emitting `xsFuse` in the same or prior batch!
+  const learnWaterIdx = fusePlan.actions.findIndex((a) => a.a === 'xsLearn' && a.el === 'water')
+  const fuseIdx = fusePlan.actions.findIndex((a) => a.a === 'xsFuse' && a.el === 'metal+water')
+  assert.ok(learnWaterIdx >= 0, 'Must learn water tech before fusing metal+water!')
+  assert.ok(fuseIdx > learnWaterIdx, 'xsFuse must run strictly after both base techs are learned!')
+
+  // Verify after fusion succeeds (`rand = 0.1 < 0.55`), both `metal` and `water` remain permanently equippable in `techs`!
+  const fusedRes = applyAuthoritativeXsBatch(wFuse, fusePlan.actions, () => 0.1)
+  const afterXs = fusedRes.afterWorld.state.xs
+  assert.deepEqual(afterXs.roots.v, ['ice'])
+  assert.deepEqual(afterXs.roots.e, [])
+  assert.ok(afterXs.techs.includes('metal') && afterXs.techs.includes('water'))
+  const equipCheck = xsAct(structuredClone(afterXs), { a: 'equip', el: 'water' }, t0 + 5)
+  assert.equal(equipCheck.ok, true, 'Previously learned base tech stays permanently equippable after root fusion!')
 })
 
-test('Phase 11.5: Breakthrough shields accrued cAt XP before xianCultivate/qi, and hatched pets execute feed -> claim -> sell feather', async () => {
+test('Phase 11.7: Journal recording, deterministic xs Layer 1/3 audit verification, and unknown-receipt reconciliation', async () => {
   const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: CLOCK_START })
-  const t = 1794480000
-  const rng = makeRng(0x77771111)
-  let world = makeBaseWorld(adapter, t)
-  world = applyAuthoritativeXianBatch(world, [{ a: 'xianEnter' }], rng).afterWorld
+  const t0 = 1794450000
+  const tmp = makeTempDir('p11-audit-')
 
-  const x = world.state.xian
-  x.lv = 9 // 练气九层 bottleneck (`XIAN_BREAK[9] === 'found'`)
-  x.xp = xianNeed(9) + 25
-  x.cAt = t - 14 * 3600 // 14 hours of uncollected passive XP sitting safely in `cAt`!
-  x.pills = {
-    found: [0, 1, 0, 0, 0],
-    qi: [2, 0, 0, 0, 0],
-    beast: [1, 0, 0, 0, 0],
-    heal: [2, 0, 0, 0, 0],
-  }
-  x.herbs = {
-    dew: [8, 0, 0, 0, 0],
-    gold: [4, 0, 0, 0, 0],
-  }
-  x.pets = [{ k: 'fox', h: t - 60, gr: 50, a: [['crit', 0.04]] }]
-  x.pet = -1
+  try {
+    const journal = new ContentAddressedJournal({ rootDir: path.join(tmp, 'journal'), account: 'main' })
+    let serverWorld = makeBaseWorld(adapter, t0, makePostPrologueXs(t0, ['metal']))
 
-  const plan = planXianActions(world, t, { enabled: true })
-  const idxBreak = plan.actions.findIndex((a) => a.a === 'xianBreak')
-  const idxCult = plan.actions.findIndex((a) => a.a === 'xianCultivate')
-  const idxQi = plan.actions.findIndex((a) => a.a === 'xianEat' && a.id === 'qi')
-
-  assert.ok(idxBreak >= 0, 'Must emit xianBreak when Lv9 XP and found pill are ready')
-  assert.equal(idxCult, -1, 'Must NOT call xianCultivate in the same batch as stochastic xianBreak (shields accrued cAt XP from 20% fail penalty!)')
-  assert.equal(idxQi, -1, 'Must NOT eat qi pill before resolving stochastic xianBreak')
-
-  // Verify pet activation + beast pill + 1-herb feed + feather claim in same batch
-  assert.ok(plan.actions.some((a) => a.a === 'xianPetActive' && a.i === 0))
-  assert.ok(plan.actions.some((a) => a.a === 'xianEat' && a.id === 'beast' && a.i === 0))
-  assert.ok(plan.actions.some((a) => a.a === 'xianPetFeed' && a.i === 0))
-  assert.ok(plan.actions.some((a) => a.a === 'xianPetClaim'))
-  assert.ok(plan.actions.some((a) => a.a === 'xianSell' && a.kind === 'mat' && a.id === 'feather'))
-
-  const after = applyAuthoritativeXianBatch(world, plan.actions, rng).afterWorld
-  assert.equal(after.state.xian.cAt, t - 14 * 3600, 'Accrued passive XP timestamp cAt remains intact across xianBreak!')
-  assert.equal(after.state.xian.mats.feather || 0, 0, 'Claimed feathers were immediately converted into spirit stones')
-
-  // Also sanity-check Monte Carlo battle estimator monotonic win probability
-  const floor1 = xianTowerEnemy(1)
-  const floor40 = xianTowerEnemy(40)
-  const w1 = estimateBattleWinProb(after.state.xian, floor1, { trials: 30 })
-  const w40 = estimateBattleWinProb(after.state.xian, floor40, { trials: 30 })
-  assert.ok(w1.winProb > w40.winProb, `Expected floor 1 winProb (${w1.winProb}) > floor 40 (${w40.winProb})`)
-})
-
-test('Phase 11.6: End-to-end runXianCultivationSlice + Journal + Unknown rev reconcile + Audit Replay/Report', async () => {
-  const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: CLOCK_START })
-  const tmpDir = makeTempDir('kernel-p11-e2e-')
-  const journal = new ContentAddressedJournal({ rootDir: path.join(tmpDir, 'journal'), account: 'main' })
-  const lockRootDir = path.join(tmpDir, 'locks')
-  const rng = makeRng(0xabcdef01)
-
-  let t = 1794490000
-  let serverWorld = makeBaseWorld(adapter, t)
-
-  const mockHttp = {
-    estimatedServerNowSec: () => t,
-    getJson: async (apiPath) => {
-      assert.equal(apiPath, '/api/pet/world')
-      return structuredClone(serverWorld)
-    },
-    postJson: async (apiPath, body) => {
-      assert.equal(apiPath, '/api/pet/world/act')
-      assert.equal(body.rev, serverWorld.rev)
-      const applied = applyAuthoritativeXianBatch(serverWorld, body.actions, rng)
-      serverWorld = applied.afterWorld
-      return {
-        ok: true,
-        status: 200,
-        networkError: false,
-        body: {
+    const mockHttp = {
+      estimatedServerNowSec: () => serverWorld.now,
+      getJson: async (url) => {
+        assert.equal(url, '/api/pet/world')
+        return structuredClone(serverWorld)
+      },
+      postJson: async (url, payload) => {
+        assert.equal(url, '/api/pet/world/act')
+        const { afterWorld, out } = applyAuthoritativeXsBatch(serverWorld, payload.actions, () => 0.25)
+        serverWorld = afterWorld
+        return {
           ok: true,
-          rev: serverWorld.rev,
-          coins: serverWorld.coins,
-          spend: applied.spend,
-          out: applied.out,
-          state: structuredClone(serverWorld.state),
-        },
-      }
-    },
+          status: 200,
+          body: {
+            ok: true,
+            rev: serverWorld.rev,
+            now: serverWorld.now,
+            coins: serverWorld.coins,
+            state: structuredClone(serverWorld.state),
+            out,
+          },
+        }
+      },
+    }
+
+    const sliceOut = await runXianCultivationSlice({
+      account: 'main',
+      adapter,
+      httpClient: mockHttp,
+      journal,
+      lockRootDir: path.join(tmp, 'locks'),
+      observedWorld: serverWorld,
+      xianOptions: { enabled: true },
+    })
+    assert.equal(sliceOut.status, 'confirmed')
+    assert.ok(sliceOut.actions.length > 0)
+    assert.ok(sliceOut.nextXianWakeSec === t0 + BREW_READY_SEC || sliceOut.nextXianWakeSec > t0)
+
+    const { transactions } = journal.reconstructTransactions()
+    assert.equal(transactions.length, 1)
+    const tx = transactions[0]
+    assert.equal(tx.kind, 'xian-act')
+    assert.equal(tx.status, 'confirmed')
+
+    const replay = await auditTransactionReplay(journal, tx, { fallbackAdapter: adapter })
+    assert.equal(replay.status, 'consistent-external-xian')
+    assert.deepEqual(replay.serverDrifts, [])
+
+    const report = await buildAuditDecisionReport({ journal, tx, adapter })
+    assert.equal(report.verdict, 'ex-ante-consistent')
+
+    // Simulate network drop (`unknown`) followed by `reconcileUnknownWithFreshWorld` when `rev` did not advance
+    serverWorld.now += 600
+    xsTick(serverWorld.state.xs, serverWorld.now)
+    serverWorld.state.xs.plots[0] = { s: 'soil', c: 'jingu', g: 3, w: 0 }
+
+    const dropHttp = {
+      estimatedServerNowSec: () => serverWorld.now,
+      getJson: async () => structuredClone(serverWorld),
+      postJson: async () => ({ ok: false, status: null, networkError: true }),
+    }
+    const dropOut = await runXianCultivationSlice({
+      account: 'main',
+      adapter,
+      httpClient: dropHttp,
+      journal,
+      lockRootDir: path.join(tmp, 'locks'),
+      observedWorld: serverWorld,
+      xianOptions: { enabled: true },
+    })
+    assert.equal(dropOut.status, 'unknown')
+
+    const freshUnchanged = structuredClone(serverWorld)
+    freshUnchanged.now += 5
+    const rec = reconcileUnknownWithFreshWorld(journal, adapter, freshUnchanged)
+    assert.equal(rec.reconciled, 1)
+    assert.equal(rec.remainingNonVisitUnknown, 0)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
   }
-
-  const slice1 = await runXianCultivationSlice({
-    account: 'main',
-    adapter,
-    httpClient: mockHttp,
-    journal,
-    lockRootDir,
-    observedWorld: serverWorld,
-    xianOptions: { enabled: true, dailyStoneQuota: 0 },
-  })
-  assert.equal(slice1.status, 'confirmed')
-  assert.ok(slice1.actions.length >= 20)
-  assert.equal(serverWorld.rev, 11)
-
-  // Verify Layer 1 replay and Layer 3 decision report on the recorded `xian-act` transaction
-  const { transactions: txs } = journal.reconstructTransactions()
-  assert.equal(txs.length, 1)
-  assert.equal(txs[0].kind, 'xian-act')
-  assert.equal(txs[0].status, 'confirmed')
-
-  const replay = await auditTransactionReplay(journal, txs[0], { fallbackAdapter: adapter })
-  assert.equal(replay.status, 'consistent-external-xian')
-  assert.deepEqual(replay.serverDrifts, [])
-
-  const report = await buildAuditDecisionReport({
-    journal,
-    tx: txs[0],
-    adapter,
-  })
-  assert.equal(report.verdict, 'ex-ante-consistent')
-  assert.equal(report.identifiableDecisionRegretLowerBound, 0)
-
-  // Simulate a network-timeout `unknown` `xian-act` transaction whose batch DID apply on server (`rev: 11 -> 12`)
-  t += 8 * 3600
-  serverWorld.now = t
-  const nextPlan = planXianActions(serverWorld, t, { enabled: true })
-  assert.ok(nextPlan.actions.length > 0)
-  const beforeUnknownWorld = structuredClone(serverWorld)
-
-  const unknownTxOut = await executeTransaction({
-    journal,
-    adapter,
-    lockRootDir,
-    account: 'main',
-    kind: 'xian-act',
-    worldBefore: beforeUnknownWorld,
-    requestPayload: { actions: nextPlan.actions },
-    sendFn: async () => {
-      serverWorld = applyAuthoritativeXianBatch(serverWorld, nextPlan.actions, rng).afterWorld
-      return { ok: false, status: 0, networkError: true, body: null }
-    },
-    fetchAfterWorldFn: async () => null,
-  })
-  assert.equal(unknownTxOut.status, 'unknown')
-  assert.equal(journal.reconstructTransactions().coverage.unknownCount, 1)
-
-  const rec = reconcileUnknownWithFreshWorld(journal, adapter, serverWorld)
-  assert.equal(rec.remainingUnknown, 0)
-  assert.equal(rec.remainingNonVisitUnknown, 0)
-  assert.equal(rec.reconciled, 1)
-  assert.equal(journal.reconstructTransactions().txMap.get(unknownTxOut.operation)?.status, 'unknown-state-reanchored')
 })

@@ -1,14 +1,14 @@
 {
   "name": "yuyugu-unified-kernel",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "license": "MIT",
   "type": "module",
   "repository": "https://github.com/DracaeneSunbringer/yuyugu-kernel",
   "description": "Zero-hardcoded-ID unified rolling-horizon economic decision kernel, staged raid scheduler, CRN combat optimizer, and counterfactual audit engine for 52dmeme Pet World (鱼鱼谷)",
   "releaseNotes": {
     "date": "2026-11-12",
-    "severity": "important",
-    "summary": "根治大库存下规划耗时与 25s 硬年龄门控冲突引发的 plan-invalid 活锁：引入物理因果有效性模型、Worker 基础计划流式检查点恢复、跨回滚精确记忆化与完整诊断日志",
+    "severity": "normal",
+    "summary": "适配新版「大肥鱼修仙记」(state.xs) 独立托管模块（默认关闭）：支持序章/斗法静默避让、log%4=3 双倍收获编排、回灵丹/培元丹冲药园 Lv5 闭环、多策略突破护盾及可选灵根融合保护",
     "upgradeCommand": "git pull"
   },
   "engines": {

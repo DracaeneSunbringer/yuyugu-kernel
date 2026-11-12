@@ -1,959 +1,853 @@
 import { sanitizeWorldSnapshot } from '../model/observations.mjs'
 import { executeTransaction, reconcileUnknownWithFreshWorld, withAccountLock } from './reconcile.mjs'
 import {
-  XIAN_BREAK,
-  XIAN_ECON,
-  XIAN_HERBS,
-  XIAN_MAX_LV,
-  XIAN_NPCS,
-  XIAN_PILLS,
-  XIAN_QMUL,
-  XIAN_SLOTS,
-} from '../rules/b16-xian-content.js'
-import {
-  XIAN_CULT_CAP,
-  xianAccrued,
-  xianAction,
-  xianBase,
-  xianBattle,
-  xianBreakNeed,
-  xianDay,
-  xianEffects,
-  xianFurnaceBatch,
-  xianHerb,
-  xianNeed,
-  xianNpcEnemy,
-  xianPill,
-  xianPlotReady,
-  xianQtyTotal,
-  xianRate,
-  xianSpringCharges,
-  xianStats,
-  xianStoneCost,
-  xianStoneDailyMax,
-  xianTalent,
-  xianToday,
-  xianTowerEnemy,
-} from '../rules/b16-xian-rules.js'
+  BREW_MAX,
+  BREW_MIN,
+  CAN_MAX,
+  COST,
+  EN_MAX,
+  EN_REGEN,
+  FUSIONS,
+  HERBS,
+  LV_NEED,
+  MED_MAX,
+  MED_MIN,
+  PILL_DAILY,
+  PILLS,
+  PLOTS,
+  REALMS,
+  ROOT_GROW,
+  STORY_END,
+  TECH_PRICE,
+  TECHS,
+  act as xsAct,
+  cvNeed,
+  fuseKey,
+  plotView,
+  rootMult,
+  tick as xsTick,
+} from '../rules/xs-xian-rules.js'
 
 /**
- * Actions that cross irreversible D-coin CapEx, manual reroll choices, or main-island
- * `iron`/`bomb` inventory boundaries. Strictly forbidden in automated cultivation batches.
+ * Actions reserved strictly for manual player interaction in 「大肥鱼修仙记」 (`state.xs`):
+ *   - `xsRoot`, `xsStory`: Prologue & irreversible initial root element choice (`st < 4`).
+ *   - `xsFight`, `xsWin`, `xsLose`: Client-side danmaku stages & NPC duels (also inferior stone/en to Lv2+ farming).
+ * Additionally, `xsFuse` is gated behind `--xian-auto-fuse` (default OFF because root fusion is permanent),
+ * and `xsBreak` is gated by `--xian-break-mode <smart|eager|manual>`.
  */
 export const FORBIDDEN_XIAN_ACTIONS = new Set([
-  'xianPlot',
-  'xianSpringUp',
-  'xianFurnaceUp',
-  'xianTalentReroll',
-  'xianRootReroll',
-  'xianReforge',
-  'xianPending',
-  'xianForge',
-  'xianBombForge',
-  'xianPetWash',
-  'xianPetRelease',
+  'xsRoot',
+  'xsStory',
+  'xsFight',
+  'xsWin',
+  'xsLose',
 ])
 
-const HERBS_BY_SEED_ASC = [...XIAN_HERBS].sort((a, b) => a.seed - b.seed || a.hours - b.hours)
-const CHEAPEST_HERB = HERBS_BY_SEED_ASC[0] || null
-const BREAK_STEPS = Object.entries(XIAN_BREAK)
-  .map(([lvStr, pillId]) => ({ breakLv: Number(lvStr), pillId }))
-  .sort((a, b) => a.breakLv - b.breakLv)
-const BREAK_PILL_IDS = new Set(BREAK_STEPS.map((s) => s.pillId))
+export const VALID_XIAN_BREAK_MODES = new Set(['smart', 'eager', 'manual'])
+export const VALID_XIAN_FUSE_TARGETS = new Set(['auto', 'ice', 'thunder', 'wind', 'lava', 'poison'])
 
-export function normalizeXianOptions(raw = {}) {
-  const dailyStoneQuotaRaw = Number(raw?.dailyStoneQuota ?? 0)
-  const dailyStoneQuota = Number.isFinite(dailyStoneQuotaRaw) && dailyStoneQuotaRaw > 0
-    ? Math.min(xianStoneDailyMax, Math.floor(dailyStoneQuotaRaw))
-    : 0
-  const cashReserveRaw = Number(raw?.cashReserveFloor ?? 10)
-  const maxActionsRaw = Number(raw?.maxActionsPerBatch ?? 40)
-  return {
-    enabled: Boolean(raw?.enabled),
-    dailyStoneQuota,
-    cashReserveFloor: Number.isFinite(cashReserveRaw) ? Math.max(0, cashReserveRaw) : 10,
-    maxActionsPerBatch: Number.isFinite(maxActionsRaw)
-      ? Math.max(1, Math.min(40, Math.floor(maxActionsRaw)))
-      : 40,
-  }
-}
+export const MAX_XS_BATCH = 30
+// Client `BREW_GAME` is 18s and server `BREW_MIN` is 15s; 19s guarantees `q=2` (上品, 3 pills) with 1s skew buffer.
+export const BREW_READY_SEC = Math.max(BREW_MIN + 4, 19)
 
-function createMulberry32(seed) {
-  let a = seed >>> 0
-  return () => {
-    a = (a + 0x6d2b79f5) | 0
-    let t = Math.imul(a ^ (a >>> 15), 1 | a)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
+const HERB_ENTRIES_DESC = Object.entries(HERBS).sort((a, b) => b[1].lv - a[1].lv || b[1].sell - a[1].sell)
+const PURE_CASH_HERBS = new Set(
+  Object.keys(HERBS).filter((h) => !Object.values(PILLS).some((p) => Object.hasOwn(p.need, h)))
+)
+const VARIANT_TECH_PRIORITY = ['ice', 'thunder', 'wind', 'lava', 'poison', 'metal', 'water', 'fire', 'earth', 'wood']
 
-function cstHourOf(nowSec) {
-  const secInDay = (((Math.floor(nowSec) + 28800) % 86400) + 86400) % 86400
-  return secInDay / 3600
+export function xsDay(nowSec) {
+  return Math.floor((Number(nowSec || 0) + 28800) / 86400)
 }
 
 function nextCstMidnightSec(nowSec) {
-  return (xianDay(nowSec) + 1) * 86400 - 28800
+  return (xsDay(nowSec) + 1) * 86400 - 28800
 }
 
-function highestOwnedPillMultiplier(pills, pillId) {
-  const arr = pills?.[pillId]
-  if (!Array.isArray(arr)) return 0
-  for (let q = 4; q >= 0; q--) {
-    if ((arr[q] || 0) > 0) return XIAN_QMUL[q]
-  }
-  return 0
+function cstSecondsUntilMidnight(nowSec) {
+  return Math.max(0, nextCstMidnightSec(nowSec) - Number(nowSec || 0))
 }
 
-function bagTakeSim(bag, id, n, best = false) {
-  const arr = bag?.[id]
-  if (!arr || xianQtyTotal(bag, id) < n) return null
-  let left = n
-  const order = best ? [4, 3, 2, 1, 0] : [0, 1, 2, 3, 4]
-  for (const q of order) {
-    const k = Math.min(left, arr[q] || 0)
-    if (k > 0) {
-      arr[q] -= k
-      left -= k
-    }
-    if (!left) break
-  }
-  if (!arr.some(Boolean)) delete bag[id]
-  return true
+export function toWireXsAction(internalAct) {
+  const short = String(internalAct?.a || '')
+  const wire = { a: 'xs' + short[0].toUpperCase() + short.slice(1) }
+  if (internalAct.i != null) wire.i = internalAct.i
+  if (internalAct.herb != null) wire.herb = internalAct.herb
+  if (internalAct.n != null) wire.n = internalAct.n
+  if (internalAct.el != null) wire.el = internalAct.el
+  return wire
 }
 
-/**
- * Computes true combat effectiveness of a cultivation loadout (`eq` + active `pet`),
- * capturing weapon specials (`gun` 3x0.45x(1+gunBoost), `cannon` 1.5x avg), armor pierce,
- * freeze control, shield/regen/dodge/guard EHP, and speed initiative.
- */
-export function effectiveCombatScore(x, { overrideEq = null, overridePet = undefined } = {}) {
-  if (!x?.v) return 0
-  const view = {
-    ...x,
-    eq: overrideEq ? { ...(x.eq || {}), ...overrideEq } : (x.eq || {}),
-    pet: overridePet !== undefined ? overridePet : x.pet,
-  }
-  const s = xianStats(view, { pet: true, buff: false })
-  const baseHitMult = s.wsp === 'gun'
-    ? 3 * 0.45 * (1 + (s.gunBoost || 0))
-    : (s.wsp === 'cannon' ? (1 + 1 + 2.5) / 3 : 1.0)
-  const critFactor = 1 + s.crit * (s.critDmg - 1) + 0.08 * (s.firstCrit || 0)
-  const doubleFactor = 1 + (s.double || 0)
-  const pierceFactor = 1 + 0.25 * (s.pierce || 0)
-  const burnFactor = 1 + 0.75 * (s.burn || 0)
-  const controlFactor = 1 / Math.max(0.55, 1 - 0.75 * (s.freeze || 0))
-  const lateLowFactor = 1 + 0.18 * (s.late || 0) + 0.12 * (s.lowAtk || 0) + 0.08 * (s.elem || 0)
-  const dps = s.atk * baseHitMult * critFactor * doubleFactor * pierceFactor * burnFactor * controlFactor * lateLowFactor
-
-  const K = 50 + (s.lv || 1) * 12
-  const armorMitigation = 1 + s.def / K
-  const sustainMult = 1 + (s.shield || 0) + 6 * (s.regen || 0) + 0.45 * (s.lifesteal || 0) + 0.25 * (s.thorns || 0)
-  const avoidDenom = Math.max(0.25, (1 - (s.dodge || 0)) * (1 - (s.guard || 0)))
-  const ehp = (s.hp * armorMitigation * sustainMult) / avoidDenom
-  const spdFactor = 1 + 0.008 * s.spd
-  return Math.sqrt(Math.max(1, dps * ehp)) * spdFactor
+export function fromWireXsAction(wireAct) {
+  const raw = String(wireAct?.a || '')
+  if (!raw.startsWith('xs') || raw.length < 3) return null
+  const short = raw[2].toLowerCase() + raw.slice(3)
+  if (!Object.hasOwn(COST, short)) return null
+  const internal = { a: short }
+  if (wireAct.i != null) internal.i = wireAct.i
+  if (wireAct.herb != null) internal.herb = wireAct.herb
+  if (wireAct.n != null) internal.n = wireAct.n
+  if (wireAct.el != null) internal.el = wireAct.el
+  return internal
 }
 
-export function estimateBattleWinProb(x, enemy, { trials = 36, seed = 0x51a9b16, withCarry = undefined } = {}) {
-  if (!x?.v || !enemy) return 0
-  const me = { ...xianStats(x, { pet: true, buff: true }), name: '我' }
-  const useCarry = withCarry !== undefined ? Boolean(withCarry) : Boolean(x.carry)
-  const healPill = useCarry ? highestOwnedPillMultiplier(x.pills, 'heal') : 0
-  const rng = createMulberry32(seed ^ ((enemy.lv || 1) * 2654435761))
-  let wins = 0
-  let pillTriggered = 0
-  for (let i = 0; i < trials; i++) {
-    const res = xianBattle(me, enemy, rng, { healPill })
-    if (res.win) wins++
-    if (healPill > 0 && res.log.some((row) => row[1] === 'pill' && row[0] === 0)) {
-      pillTriggered++
-    }
-  }
+export function normalizeXianOptions(raw = {}) {
+  const breakRaw = String(raw?.breakMode || 'smart').trim().toLowerCase()
+  const breakMode = VALID_XIAN_BREAK_MODES.has(breakRaw) ? breakRaw : 'smart'
+  const fuseTargetRaw = String(raw?.fuseTarget || 'auto').trim().toLowerCase()
+  const fuseTarget = VALID_XIAN_FUSE_TARGETS.has(fuseTargetRaw) ? fuseTargetRaw : 'auto'
+  const maxActionsRaw = Number(raw?.maxActionsPerBatch ?? MAX_XS_BATCH)
   return {
-    winProb: wins / trials,
-    pillTriggerRate: pillTriggered / trials,
+    enabled: Boolean(raw?.enabled),
+    breakMode,
+    autoFuse: Boolean(raw?.autoFuse),
+    fuseTarget,
+    maxActionsPerBatch: Number.isFinite(maxActionsRaw)
+      ? Math.max(1, Math.min(MAX_XS_BATCH, Math.floor(maxActionsRaw)))
+      : MAX_XS_BATCH,
   }
 }
 
-function buildPillDemandPlan(x, confirmedPills, nowSec) {
-  const lv = x.lv || 1
-  const list = []
-
-  // 1. Primary realm breakthrough pills derived table-driven from `XIAN_BREAK`
-  const nextBreak = BREAK_STEPS.find((s) => lv <= s.breakLv)
-  if (nextBreak) {
-    const urgent = lv >= nextBreak.breakLv - 2
-    list.push({ id: nextBreak.pillId, targetQty: 2, best: true, urgent, weight: urgent ? 3.2 : 2.2 })
-  }
-
-  // 2. Minimum combat heal pill buffer
-  list.push({ id: 'heal', targetQty: 2, best: false, urgent: true, weight: 2.0 })
-
-  // 3. Stockpile manual reroll pills (`marrow` / `insight`) so user can reroll anytime without waiting
-  if ((x.root?.g ?? 0) < 4 && lv >= 5) {
-    list.push({ id: 'marrow', targetQty: 2, best: false, urgent: false, weight: 1.35 })
-  }
-  const hasSuboptimalTalent = (x.talents || []).some((tid) => (xianTalent(tid)?.r || 1) < 4)
-  if (hasSuboptimalTalent && lv >= 6) {
-    list.push({ id: 'insight', targetQty: 2, best: false, urgent: false, weight: 1.25 })
-  }
-
-  // 4. Cultivation XP & pet growth & comfortable heal/buff reserves
-  if (lv < XIAN_MAX_LV) {
-    list.push({ id: 'qi', targetQty: 4, best: true, urgent: false, weight: 1.4 })
-  }
-  if ((x.pets || []).some((p) => nowSec >= p.h && (p.gr || 0) < 300)) {
-    list.push({ id: 'beast', targetQty: 2, best: true, urgent: false, weight: 1.2 })
-  }
-  list.push({ id: 'heal', targetQty: 4, best: false, urgent: false, weight: 0.9 })
-  if (lv >= 8) {
-    list.push({ id: 'rage', targetQty: 2, best: true, urgent: false, weight: 0.85 })
-    list.push({ id: 'stone', targetQty: 1, best: true, urgent: false, weight: 0.75 })
-    if ((x.pets || []).some((p) => nowSec >= p.h)) {
-      list.push({ id: 'spirit', targetQty: 1, best: false, urgent: false, weight: 0.7 })
-    }
-  }
-
-  // Deduplicate keeping max targetQty per pill id while preserving first-seen priority order
-  const merged = new Map()
-  for (const row of list) {
-    const have = xianQtyTotal(confirmedPills, row.id)
-    const deficit = Math.max(0, row.targetQty - have)
-    if (deficit <= 0) continue
-    const prev = merged.get(row.id)
-    if (!prev) {
-      merged.set(row.id, { ...row, have, deficit })
-    } else {
-      prev.targetQty = Math.max(prev.targetQty, row.targetQty)
-      prev.deficit = Math.max(0, prev.targetQty - have)
-      prev.urgent = prev.urgent || row.urgent
-      prev.weight = Math.max(prev.weight, row.weight)
-    }
-  }
-  return [...merged.values()]
-}
-
-function chooseProtectedItemIds(x) {
-  const protectedIds = new Set()
-  for (const eqId of Object.values(x.eq || {})) {
-    if (eqId != null) protectedIds.add(eqId)
-  }
-  if (x.pend?.k === 'i' && x.pend.i != null) {
-    protectedIds.add(x.pend.i)
-  }
-  for (const it of x.items || []) {
-    const base = xianBase(it.b)
-    // Protect special-mechanic weapons (bomb-forged bases excluded from Tower drops) and high-grade gear (`仙器`/`神器`)
-    if ((base?.k === 'weapon' && Boolean(base?.sp)) || (it.g || 0) >= 3) {
-      protectedIds.add(it.id)
-    }
-  }
-  for (const slot of Object.keys(XIAN_SLOTS)) {
-    const slotItems = (x.items || [])
-      .filter((it) => xianBase(it.b)?.k === slot)
-      .map((it) => ({
-        it,
-        score: effectiveCombatScore(x, { overrideEq: { [slot]: it.id } }),
-      }))
-      .sort((a, b) => b.score - a.score || (b.it.g || 0) - (a.it.g || 0) || (b.it.lv || 0) - (a.it.lv || 0))
-    for (const keep of slotItems.slice(0, 2)) {
-      protectedIds.add(keep.it.id)
-    }
-  }
-  return protectedIds
-}
-
-function npcGiftUtility(npc, x) {
-  const g = npc.gift || {}
-  let val = (npc.lv || 1) * 1.5
-  if (g.stone) val += g.stone
-  if (g.seed) {
-    const h = xianHerb(g.seed)
-    val += (h ? h.seed : 10) * (g.n || 1) * 1.25
-  }
-  if (g.pill) {
-    const p = xianPill(g.pill)
-    val += (p ? p.price : 20) * (g.n || 1) * 1.2
-  }
-  if ((x.lv || 1) >= XIAN_MAX_LV) val -= (npc.lv || 1) * 1.2
-  return val
-}
-
-export function assertSafeXianBatch(actions, worldBefore, rawOptions = {}) {
+export function assertSafeXianBatch(actions, _world = null, rawOptions = {}) {
   const opts = normalizeXianOptions(rawOptions)
   if (!Array.isArray(actions)) {
-    throw new Error('Xian batch actions must be an array')
+    throw new Error('Invalid xian batch: actions must be an array')
   }
   if (actions.length > opts.maxActionsPerBatch) {
     throw new Error(`Xian batch length ${actions.length} exceeds maxActionsPerBatch=${opts.maxActionsPerBatch}`)
   }
-  let stoneBuyTotalCoins = 0
-  const x = worldBefore?.state?.xian
-  const nowSec = Number(worldBefore?.now || 0)
-  let boughtToday = x?.v && x.dy?.d === xianDay(nowSec) ? Number(x.dy.stone || 0) : 0
-
   for (const act of actions) {
-    const a = String(act?.a || '')
-    if (!a.startsWith('xian')) {
-      throw new Error(`Non-xian action leaked into xian batch: ${a}`)
+    const name = String(act?.a || '')
+    if (FORBIDDEN_XIAN_ACTIONS.has(name)) {
+      throw new Error(`Forbidden manual-only xian action in automated batch: ${name}`)
     }
-    if (FORBIDDEN_XIAN_ACTIONS.has(a)) {
-      throw new Error(`Forbidden xian action blocked by firewall: ${a}`)
+    const parsed = fromWireXsAction(act)
+    if (!parsed) {
+      throw new Error(`Illegal non-xs action in xian batch: ${name}`)
     }
-    if (a === 'xianTower' && act.pay === true) {
-      throw new Error('Paid xianTower is strictly forbidden by D-coin firewall')
+    if (name === 'xsFuse' && !opts.autoFuse) {
+      throw new Error('xsFuse is forbidden when autoFuse is disabled')
     }
-    if (a === 'xianStoneBuy') {
-      if (opts.dailyStoneQuota <= 0) {
-        throw new Error('xianStoneBuy blocked when dailyStoneQuota=0')
-      }
-      const n = Number(act.n || 0)
-      if (!Number.isInteger(n) || n < 1 || boughtToday + n > opts.dailyStoneQuota) {
-        throw new Error(`xianStoneBuy exceeds configured dailyStoneQuota=${opts.dailyStoneQuota}`)
-      }
-      const cost = xianStoneCost(boughtToday, n)
-      if (cost == null) {
-        throw new Error('Invalid xianStoneBuy tier cost')
-      }
-      stoneBuyTotalCoins += cost
-      boughtToday += n
+    if (name === 'xsBreak' && opts.breakMode === 'manual') {
+      throw new Error('xsBreak is forbidden when breakMode is manual')
     }
   }
-  if (stoneBuyTotalCoins > 0) {
-    const availCoins = Number(worldBefore?.coins || 0) - opts.cashReserveFloor
-    if (stoneBuyTotalCoins > availCoins) {
-      throw new Error(`xianStoneBuy cost ${stoneBuyTotalCoins} violates cashReserveFloor=${opts.cashReserveFloor}`)
+}
+
+function maxPentagonMatchingCount(baseElements) {
+  if (!Array.isArray(baseElements) || baseElements.length < 2) return 0
+  let best = 0
+  for (let i = 0; i < baseElements.length; i++) {
+    for (let j = i + 1; j < baseElements.length; j++) {
+      const k = fuseKey(baseElements[i], baseElements[j])
+      if (!FUSIONS[k]) continue
+      const rest = baseElements.filter((_, idx) => idx !== i && idx !== j)
+      const cand = 1 + maxPentagonMatchingCount(rest)
+      if (cand > best) best = cand
     }
   }
-  return { expectedSpendCoins: stoneBuyTotalCoins }
+  return best
 }
 
 /**
- * Deterministic single-batch planner for `b16 云梦仙途`.
- * Never guesses stochastic server drops/yields inside the same batch; if a stochastic action
- * (`xianEnter`, `xianHarvest`, `xianCollect`, `xianBreak`, `xianTower`, uncertain `xianDuel`)
- * executes, sets `followUpSoon: true` so the next tick inspects the authoritative server outcome.
+ * Selects an optimal adjacent root pair on the `C_5` pentagon (`metal-water-wood-earth-fire-metal`).
+ * On a 4-root chain (`P_4`), strictly selects an endpoint edge (`totalReachableFusions === 2`) and
+ * never picks the middle edge (`totalReachableFusions === 1`), preserving dual-variant fusion.
+ */
+export function selectOptimalFusionPair(roots, fuseTarget = 'auto') {
+  const base = Array.isArray(roots?.e) ? roots.e : []
+  if (base.length < 2) return null
+  const candidates = []
+  for (let i = 0; i < base.length; i++) {
+    for (let j = i + 1; j < base.length; j++) {
+      const key = fuseKey(base[i], base[j])
+      const f = FUSIONS[key]
+      if (!f) continue
+      if (fuseTarget !== 'auto' && f.id !== fuseTarget) continue
+      const rest = base.filter((_, idx) => idx !== i && idx !== j)
+      const totalReachableFusions = 1 + maxPentagonMatchingCount(rest)
+      const rank = VARIANT_TECH_PRIORITY.indexOf(f.id)
+      candidates.push({
+        key,
+        e1: base[i],
+        e2: base[j],
+        variantId: f.id,
+        variantName: f.name,
+        totalReachableFusions,
+        priorityRank: rank >= 0 ? rank : 99,
+      })
+    }
+  }
+  if (candidates.length === 0) return null
+  candidates.sort(
+    (a, b) =>
+      b.totalReachableFusions - a.totalReachableFusions ||
+      a.priorityRank - b.priorityRank ||
+      a.key.localeCompare(b.key)
+  )
+  return candidates[0]
+}
+
+function countInGroundByHerb(x) {
+  const counts = {}
+  let total = 0
+  for (const p of x.plots || []) {
+    if (p?.c) {
+      counts[p.c] = (counts[p.c] || 0) + 1
+      total++
+    }
+  }
+  return { counts, total }
+}
+
+function countOpenSoilPlots(x) {
+  let open = 0
+  let empty = 0
+  for (const p of x.plots || []) {
+    if (p?.s === 'soil') {
+      open++
+      if (!p.c) empty++
+    }
+  }
+  return { open, empty }
+}
+
+function dpUsedToday(x, nowSec) {
+  const d = xsDay(nowSec)
+  return x.dp?.d === d ? Number(x.dp.n || 0) : 0
+}
+
+function shouldAllowBreakPolicy(x, opts) {
+  if (opts.breakMode === 'manual') return false
+  const r = Number(x.cv?.r || 0)
+  if (r >= REALMS.length - 1) return false
+  if (opts.breakMode === 'eager') return true
+
+  // `smart` mode:
+  // While Farm `lv < 5`, `peiyuan` (+40 Farm XP/pill) strongly prioritizes unlocking Lv5 `leizhu` first.
+  // Only allow the cheap 1-pill `炼气 -> 筑基` (`r: 0 -> 1`) early when `autoFuse` is enabled (unlocking fusion)
+  // or when `ROOT_GROW[n] > 1` (4/5-root where realm advancement increases `rootMult`).
+  if ((x.lv || 1) < 5) {
+    if (r > 0) return false
+    const rootCount = (x.roots?.e?.length || 0) + (x.roots?.v?.length || 0)
+    const grow = ROOT_GROW[rootCount] || 1
+    return Boolean(opts.autoFuse) || grow > 1
+  }
+  return true
+}
+
+function computeHeldPeiyuanFloorWhileSubLv5(x, nowSec, opts) {
+  if ((x.lv || 1) >= 5) return Infinity
+  let hold = 0
+  if (shouldAllowBreakPolicy(x, opts) && Number(x.cv?.s || 1) >= 9) {
+    hold = Math.max(hold, Number(x.cv?.r || 0) + 1)
+  }
+  if (opts.autoFuse && Number(x.cv?.r || 0) >= 1 && !(Number(x.fuseCd || 0) > nowSec)) {
+    const pair = selectOptimalFusionPair(x.roots, opts.fuseTarget)
+    if (pair) hold = Math.max(hold, 2)
+  }
+  return hold
+}
+
+function computeDesiredPeiyuanStock(x, nowSec, opts) {
+  const r = Number(x.cv?.r || 0)
+  const breakNeed = r < REALMS.length - 1 ? r + 1 : 0
+  if ((x.lv || 1) < 5) {
+    // Keep brewing `peiyuan` continuously until Farm Lv5!
+    return Math.max(6, breakNeed + 3)
+  }
+  if (opts.breakMode === 'manual') {
+    // Keep a convenient manual reserve (`max(2, r + 1)` pills) in bag for manual fusion or manual breakthrough,
+    // then dedicate 100% of plots to Lv5 `leizhu`.
+    const pair = selectOptimalFusionPair(x.roots, opts.fuseTarget)
+    return Math.max(pair ? 2 : 0, breakNeed)
+  }
+  const fuseReserve = opts.autoFuse && r >= 1 && selectOptimalFusionPair(x.roots, opts.fuseTarget) ? 2 : 0
+  const retryMultiplier = Number(x.cv?.s || 1) >= 8 ? 2 : 1
+  return breakNeed * retryMultiplier + fuseReserve
+}
+
+function computeAlchemyHerbTargets(x, nowSec, opts) {
+  const usedDp = dpUsedToday(x, nowSec)
+  const targetHuilingPills = (PILL_DAILY - usedDp) + PILL_DAILY
+  const haveHuiling = Number(x.pills?.huiling || 0) + (x.brew?.p === 'huiling' ? 3 : 0)
+  const huilingBatches = Math.min(2, Math.max(0, Math.ceil((targetHuilingPills - haveHuiling) / 3)))
+
+  const canGrowLinglan = (x.lv || 1) >= 2
+  const desiredPeiyuan = computeDesiredPeiyuanStock(x, nowSec, opts)
+  const havePeiyuan = Number(x.pills?.peiyuan || 0) + (x.brew?.p === 'peiyuan' ? 3 : 0)
+  const peiyuanBatches = canGrowLinglan
+    ? Math.min(2, Math.max(0, Math.ceil((desiredPeiyuan - havePeiyuan) / 3)))
+    : 0
+
+  return {
+    huilingBatches,
+    peiyuanBatches,
+    needHerbs: {
+      lingcao: huilingBatches * 3 + peiyuanBatches * 2,
+      jingu: huilingBatches * 1,
+      linglan: peiyuanBatches * 1,
+    },
+    bagReserve: {
+      lingcao: Math.max(6, huilingBatches * 3 + peiyuanBatches * 2),
+      jingu: Math.max(2, huilingBatches * 1),
+      linglan: canGrowLinglan ? Math.max(2, peiyuanBatches * 1) : 0,
+    },
+  }
+}
+
+function chooseCropForEmptyPlot(x, nowSec, opts) {
+  const { counts: inGround, total: totalInGround } = countInGroundByHerb(x)
+  const { needHerbs } = computeAlchemyHerbTargets(x, nowSec, opts)
+  const canUse = (herbId) => {
+    const H = HERBS[herbId]
+    if (!H || H.lv > (x.lv || 1)) return false
+    return Number(x.seeds?.[herbId] || 0) > 0 || Number(x.stone || 0) >= H.seed
+  }
+  const projected = (herbId) => Number(x.bag?.[herbId] || 0) + Number(inGround[herbId] || 0)
+
+  if (projected('jingu') < needHerbs.jingu && canUse('jingu')) return 'jingu'
+  if (projected('lingcao') < needHerbs.lingcao && canUse('lingcao')) return 'lingcao'
+  if ((x.lv || 1) >= 2 && projected('linglan') < needHerbs.linglan && canUse('linglan')) return 'linglan'
+
+  // Pick highest unlocked herb; if temporarily short on stones for top herb, wait for in-ground harvest
+  // unless field is sparse (`< 3` growing) or `xs.en` is near cap (`>= 85`).
+  const unlocked = HERB_ENTRIES_DESC.filter(([, H]) => H.lv <= (x.lv || 1))
+  const topHerbId = unlocked[0]?.[0] || 'lingcao'
+  if (canUse(topHerbId)) return topHerbId
+
+  if (totalInGround < 3 || Number(x.en || 0) >= 85) {
+    for (const [herbId] of unlocked) {
+      if (canUse(herbId)) return herbId
+    }
+  }
+  return null
+}
+
+function findSellableHerb(x, nowSec, opts) {
+  const { bagReserve } = computeAlchemyHerbTargets(x, nowSec, opts)
+  // Sell pure cash herbs (`leizhu`, `chizhi`, `binglian`) first, then surplus alchemy herbs above reserve
+  for (const [herbId] of HERB_ENTRIES_DESC) {
+    const qty = Number(x.bag?.[herbId] || 0)
+    if (qty <= 0) continue
+    const keep = PURE_CASH_HERBS.has(herbId) ? 0 : Number(bagReserve[herbId] || 0)
+    if (qty > keep) {
+      return { herb: herbId, sellableQty: qty - keep }
+    }
+  }
+  // Emergency dead-broke liquidity recovery if 0 crops in ground, 0 seeds, and `< 5` stones
+  const { total: inGround } = countInGroundByHerb(x)
+  const totalSeeds = Object.values(x.seeds || {}).reduce((s, n) => s + Number(n || 0), 0)
+  if (inGround === 0 && totalSeeds === 0 && Number(x.stone || 0) < HERBS.lingcao.seed) {
+    for (const [herbId] of HERB_ENTRIES_DESC) {
+      const qty = Number(x.bag?.[herbId] || 0)
+      if (qty > 0) return { herb: herbId, sellableQty: qty }
+    }
+  }
+  return null
+}
+
+function computeUpcomingPlotEnergyNeed(x, nowSec, horizonSec = 1800) {
+  let need = 0
+  for (const p of x.plots || []) {
+    if (!p) continue
+    if (p.c && p.g >= 3) {
+      need += COST.harvest + COST.plant + COST.water
+    } else if (p.c && p.g < 3 && !p.w) {
+      need += COST.water
+    } else if (p.s === 'soil' && !p.c) {
+      need += COST.plant + COST.water
+    } else if (p.c && p.g < 3 && p.w) {
+      const v = plotView(p, nowSec)
+      if (v.left <= horizonSec) {
+        need += p.g === 2 ? (COST.harvest + COST.plant + COST.water) : COST.water
+      }
+    }
+  }
+  const naturalRegenInHorizon = x.en < EN_MAX
+    ? Math.floor((Math.max(0, nowSec - Number(x.enAt || nowSec)) + horizonSec) / EN_REGEN)
+    : 0
+  return Math.max(0, need - naturalRegenInHorizon)
+}
+
+function computeSurplusEnergy(x, nowSec) {
+  const upcomingNeed = computeUpcomingPlotEnergyNeed(x, nowSec, 1800)
+  return Number(x.en || 0) - upcomingNeed
+}
+
+function hasBrewIngredients(x, pillId) {
+  const P = PILLS[pillId]
+  if (!P) return false
+  return Object.entries(P.need).every(([h, n]) => Number(x.bag?.[h] || 0) >= n)
+}
+
+function findLearnableTech(x) {
+  if (!x.roots) return null
+  const learned = new Set(x.techs || [])
+  const ownedRoots = [...(x.roots.v || []), ...(x.roots.e || [])]
+  const ordered = [...ownedRoots].sort((a, b) => {
+    const ia = VARIANT_TECH_PRIORITY.indexOf(a)
+    const ib = VARIANT_TECH_PRIORITY.indexOf(b)
+    return (ia >= 0 ? ia : 99) - (ib >= 0 ? ib : 99)
+  })
+  const unlearned = ordered.filter((el) => TECHS[el] && !learned.has(el))
+  if (unlearned.length === 0) return null
+
+  const { open } = countOpenSoilPlots(x)
+  const topHerb = HERB_ENTRIES_DESC.find(([, H]) => H.lv <= (x.lv || 1))?.[1] || HERBS.lingcao
+  // Learn first tech as soon as affordable with small seed buffer; learn remaining techs once working capital is comfortable
+  const stoneBuffer = learned.size === 0 ? Math.max(24, topHerb.seed * 2) : Math.max(80, open * Math.min(topHerb.seed, 45))
+  if (Number(x.stone || 0) >= TECH_PRICE + stoneBuffer) {
+    return unlearned[0]
+  }
+  return null
+}
+
+function shouldEatHuilingNow(x, nowSec, pendingEnergyNeed = 0) {
+  if (Number(x.pills?.huiling || 0) < 1) return false
+  if (dpUsedToday(x, nowSec) >= PILL_DAILY) return false
+  const en = Number(x.en || 0)
+  if (en >= EN_MAX) return false
+  // Normal zero-waste rule: eat when `en <= 69` (`en + 30 <= 99 < EN_MAX`, preserving `enAt` sub-tick timer!)
+  // whenever farm/alchemy work needs energy or after 20:00 CST so daily 3-pill quota never expires.
+  if (en <= EN_MAX - 31 && (en < pendingEnergyNeed || cstSecondsUntilMidnight(nowSec) <= 4 * 3600)) {
+    return true
+  }
+  // Final 25-minute pre-midnight rescue if daily quota would otherwise vanish unused at `00:00` CST
+  if (cstSecondsUntilMidnight(nowSec) <= 1500 && en <= EN_MAX - 10) {
+    return true
+  }
+  return false
+}
+
+function projectMeditationAfterRise(x, nowSec) {
+  if (!x.med) return null
+  const d = Math.min(Math.max(0, nowSec - Number(x.med.t || nowSec)), MED_MAX)
+  if (d < MED_MIN) return { d, gainCv: 0, s: x.cv.s, xp: x.cv.xp }
+  const gainCv = Math.floor((d / 60) * 10 * rootMult(x))
+  let s = Number(x.cv?.s || 1)
+  let xp = Number(x.cv?.xp || 0) + gainCv
+  const r = Number(x.cv?.r || 0)
+  while (s < 9 && xp >= cvNeed(r, s)) {
+    xp -= cvNeed(r, s)
+    s++
+  }
+  return { d, gainCv, s, xp }
+}
+
+/**
+ * Pure deterministic planner for 「大肥鱼修仙记」 (`state.xs`).
+ * Spends 0 main-island D-coins and 0 main-island stamina.
  */
 export function planXianActions(world, nowSec = Number(world?.now || 0), rawOptions = {}) {
   const opts = normalizeXianOptions(rawOptions)
   if (!opts.enabled) {
-    return {
-      enabled: false,
-      actions: [],
-      expectedSpendCoins: 0,
-      followUpSoon: false,
-      reason: 'disabled',
-    }
+    return { enabled: false, actions: [], expectedSpendCoins: 0, followUpSoon: false, reason: 'disabled' }
   }
-  if (!world || !world.state) {
+
+  const t = Math.floor(Number(nowSec || world?.now || 0))
+  const rawXs = world?.state?.xs
+  if (!rawXs?.v || !rawXs.roots || !Array.isArray(rawXs.roots.e) || Number(rawXs.st || 0) < STORY_END) {
     return {
       enabled: true,
       actions: [],
       expectedSpendCoins: 0,
       followUpSoon: false,
-      reason: 'missing-world-state',
+      reason: 'prologue-manual-standby',
     }
   }
 
-  const t = Math.floor(Number(nowSec || world.now || 0))
-  const stateCopy = structuredClone(world.state)
-  let simCoins = Number(world.coins || 0)
-  let expectedSpendCoins = 0
-  let followUpSoon = false
+  if (rawXs.fight && t - Number(rawXs.fight.t || 0) < 1800) {
+    return {
+      enabled: true,
+      actions: [],
+      expectedSpendCoins: 0,
+      followUpSoon: false,
+      reason: 'manual-fight-in-progress',
+    }
+  }
+
+  const sim = structuredClone(rawXs)
+  xsTick(sim, t)
+
   const actions = []
-  const simRng = createMulberry32((t ^ Number(world.rev || 1)) >>> 0)
+  let truncatedByBatchCap = false
+  let emittedStochastic = false
 
-  const canPush = (reserve = 0) => actions.length + reserve < opts.maxActionsPerBatch
-  const emit = (act) => {
-    if (!canPush(0)) return null
-    if (!String(act?.a || '').startsWith('xian') || FORBIDDEN_XIAN_ACTIONS.has(act.a)) {
-      throw new Error(`Blocked illegal xian action candidate: ${act?.a}`)
+  const emit = (internalAct) => {
+    if (actions.length >= opts.maxActionsPerBatch) {
+      truncatedByBatchCap = true
+      return false
     }
-    const res = xianAction(stateCopy, act, { t, coins: simCoins, rand: simRng })
-    if (!res || !res.ok) return null
-    const sp = Number(res.spend || 0)
-    if (sp > 0) {
-      simCoins -= sp
-      expectedSpendCoins += sp
-    }
-    actions.push(act)
-    return res
+    const res = xsAct(sim, internalAct, t, () => 0.99)
+    if (!res?.ok) return false
+    actions.push(toWireXsAction(internalAct))
+    return true
   }
 
-  // Step 0: Free initial entry (`xianEnter`) + starter deterministic bootstrap
-  if (!stateCopy.xian?.v) {
-    emit({ a: 'xianEnter' })
-    emit({ a: 'xianCarry', on: true })
-    if (opts.dailyStoneQuota > 0 && canPush()) {
-      const maxBuy = Math.min(opts.dailyStoneQuota, xianStoneDailyMax)
-      for (let n = maxBuy; n >= 1; n--) {
-        const c = xianStoneCost(0, n)
-        if (c != null && simCoins - c >= opts.cashReserveFloor) {
-          emit({ a: 'xianStoneBuy', n })
-          break
+  // Will an already-ready `cv.xp >= cvNeed(r, 9)` use `sim.med` as an `xsBreak`-before-`xsRise` shield at the end?
+  const isHoldingMedShieldForBreak = () =>
+    Boolean(sim.med) &&
+    shouldAllowBreakPolicy(sim, opts) &&
+    Number(sim.cv?.s || 1) >= 9 &&
+    Number(sim.cv?.xp || 0) >= cvNeed(Number(sim.cv?.r || 0), 9) &&
+    Number(sim.pills?.peiyuan || 0) >= Number(sim.cv?.r || 0) + 1
+
+  // Helper to advance `sim.log` toward `3 mod 4` using ONLY strictly productive actions before `xsHarvest`!
+  const alignLogForDoubleHarvest = (upcomingHarvestCount) => {
+    let guard = 0
+    while (sim.log % 4 !== 3 && actions.length + 1 < opts.maxActionsPerBatch && guard++ < 6) {
+      if (sim.brew && t - Number(sim.brew.t || 0) >= BREW_READY_SEC) {
+        if (emit({ a: 'finish', n: 2 })) continue
+      }
+      if (shouldEatHuilingNow(sim, t, upcomingHarvestCount * (COST.harvest + COST.plant + COST.water))) {
+        if (emit({ a: 'use', herb: 'huiling' })) continue
+      }
+      if (
+        (sim.lv || 1) < 5 &&
+        Number(sim.pills?.peiyuan || 0) > computeHeldPeiyuanFloorWhileSubLv5(sim, t, opts)
+      ) {
+        if (emit({ a: 'use', herb: 'peiyuan' })) continue
+      }
+      if (!sim.med) {
+        if (emit({ a: 'sit' })) continue
+      } else if (t - Number(sim.med.t || 0) >= MED_MAX && !isHoldingMedShieldForBreak()) {
+        if (emit({ a: 'rise' })) continue
+      }
+
+      // Water an existing dry growing plot if doing so keeps `>= COST.harvest` energy for the mature plot
+      const dryIdx = sim.plots.findIndex((p) => p?.c && p.g < 3 && !p.w)
+      if (dryIdx >= 0 && sim.en >= COST.harvest + COST.water) {
+        if (sim.can < 1) {
+          if (emit({ a: 'refill' })) continue
+        } else if (emit({ a: 'water', i: dryIdx })) {
+          continue
         }
       }
-    }
-    for (const npc of XIAN_NPCS) {
-      if (!canPush(4)) break
-      emit({ a: 'xianTalk', id: npc.id })
-    }
-    if (CHEAPEST_HERB) {
-      emit({ a: 'xianPlant', i: 'all', id: CHEAPEST_HERB.id })
-    }
-    emit({ a: 'xianWater', i: 'all' })
-    assertSafeXianBatch(actions, world, opts)
-    return {
-      enabled: true,
-      actions,
-      expectedSpendCoins,
-      followUpSoon: true,
-      reason: 'bootstrap-enter',
-    }
-  }
 
-  const x = stateCopy.xian
-  const dy = xianToday(x, t)
-
-  // Step 1: Optional configured daily D-coin -> spirit stone exchange (`0` by default)
-  if (opts.dailyStoneQuota > dy.stone && canPush()) {
-    const remQuota = Math.min(opts.dailyStoneQuota - dy.stone, xianStoneDailyMax - dy.stone)
-    let chosenN = 0
-    for (let n = remQuota; n >= 1; n--) {
-      const c = xianStoneCost(dy.stone, n)
-      if (c != null && simCoins - c >= opts.cashReserveFloor) {
-        chosenN = n
-        break
-      }
-    }
-    if (chosenN >= 1) {
-      emit({ a: 'xianStoneBuy', n: chosenN })
-    }
-  }
-
-  // Step 2: Daily free talks with all 21 NPCs (~268 free spirit stones/day)
-  for (const npc of XIAN_NPCS) {
-    if (!canPush()) break
-    if (!dy.talk.includes(npc.id)) {
-      emit({ a: 'xianTalk', id: npc.id })
-    }
-  }
-
-  // Snapshot pre-existing deterministic herbs & pills BEFORE stochastic `xianHarvest` / `xianCollect`
-  const confirmedHerbs = structuredClone(x.herbs || {})
-  const confirmedPills = structuredClone(x.pills || {})
-  let confirmedStone = Number(x.stone || 0)
-
-  // Step 3: Harvest ready spirit plots & collect finished furnace job
-  if (x.plots.some((p) => xianPlotReady(p, t)) && canPush()) {
-    if (emit({ a: 'xianHarvest' })) {
-      followUpSoon = true
-    }
-  }
-  if (x.job && t >= x.job.done && canPush()) {
-    if (emit({ a: 'xianCollect' })) {
-      followUpSoon = true
-    }
-  }
-  // Sync deterministic stone balance (`xianTalk` added deterministic stones; `xianHarvest`/`xianCollect` do not change `x.stone`)
-  confirmedStone = Number(x.stone || 0)
-
-  // Step 4: Breakthrough (`xianBreak`) BEFORE `xianCultivate` / `xianEat('qi')` to shield accrued XP from 20% fail loss
-  let attemptedBreak = false
-  const brkNeed = xianBreakNeed(x)
-  const xpNeed = xianNeed(x.lv)
-  if (brkNeed && x.xp >= xpNeed && xianQtyTotal(confirmedPills, brkNeed) >= 1 && canPush()) {
-    if (emit({ a: 'xianBreak' })) {
-      bagTakeSim(confirmedPills, brkNeed, 1, true)
-      attemptedBreak = true
-      followUpSoon = true
-    }
-  }
-
-  if (!attemptedBreak) {
-    const acc = xianAccrued(x, t)
-    const elapsedCult = Math.max(0, t - (x.cAt || t))
-    const canLevelUpNow = x.lv < XIAN_MAX_LV && !brkNeed && (x.xp + acc) >= xpNeed
-    const canReachBreakNow = Boolean(brkNeed) && x.xp < xpNeed && (x.xp + acc) >= xpNeed
-    const nearCap = elapsedCult >= 12 * 3600
-    if (acc > 0 && (canLevelUpNow || canReachBreakNow || nearCap) && canPush()) {
-      emit({ a: 'xianCultivate' })
-    }
-
-    // Consume `qi` (`聚气丹`) when below max level and not sitting at a full-XP breakthrough wall
-    while (canPush() && x.lv < XIAN_MAX_LV && xianQtyTotal(confirmedPills, 'qi') > 0) {
-      const curBrk = xianBreakNeed(x)
-      const curNeed = xianNeed(x.lv)
-      if (curBrk && x.xp >= curNeed) break
-      if (!emit({ a: 'xianEat', id: 'qi', best: true })) break
-      bagTakeSim(confirmedPills, 'qi', 1, true)
-    }
-  }
-
-  // Re-check if leveling / `qi` pills just unlocked a breakthrough in the same batch!
-  if (!attemptedBreak && canPush()) {
-    const brkAfter = xianBreakNeed(x)
-    if (brkAfter && x.xp >= xianNeed(x.lv) && xianQtyTotal(confirmedPills, brkAfter) >= 1) {
-      if (emit({ a: 'xianBreak' })) {
-        bagTakeSim(confirmedPills, brkAfter, 1, true)
-        attemptedBreak = true
-        followUpSoon = true
-      }
-    }
-  }
-
-  // Step 5: Optimal gear equip (`xianEquip`) & safe bag cleanup (`xianSalvage`)
-  for (let pass = 0; pass < 2; pass++) {
-    let changed = false
-    for (const slot of Object.keys(XIAN_SLOTS)) {
-      if (!canPush()) break
-      const candidates = (x.items || []).filter((it) => xianBase(it.b)?.k === slot)
-      if (candidates.length === 0) continue
-      let bestId = x.eq?.[slot] ?? null
-      let bestScore = bestId != null ? effectiveCombatScore(x) : 0
-      for (const it of candidates) {
-        const sc = effectiveCombatScore(x, { overrideEq: { [slot]: it.id } })
-        if (sc > bestScore + 1e-6) {
-          bestScore = sc
-          bestId = it.id
-        }
-      }
-      if (bestId != null && x.eq?.[slot] !== bestId) {
-        if (emit({ a: 'xianEquip', id: bestId })) {
-          changed = true
-        }
-      }
-    }
-    if (!changed) break
-  }
-
-  const emptyPlotCountBeforePlant = x.plots.filter((p) => !p).length
-  const totalSeedsOwned = Object.values(x.seeds || {}).reduce((s, v) => s + (v || 0), 0)
-  const needStoneRescue = confirmedStone < 24 && emptyPlotCountBeforePlant > 0 && totalSeedsOwned === 0
-  if (((x.items || []).length >= 22 || needStoneRescue) && canPush()) {
-    const protectedIds = chooseProtectedItemIds(x)
-    const salvageable = (x.items || [])
-      .filter((it) => !protectedIds.has(it.id))
-      .map((it) => {
-        const slot = xianBase(it.b)?.k || 'weapon'
-        return {
-          it,
-          score: effectiveCombatScore(x, { overrideEq: { [slot]: it.id } }),
-        }
-      })
-      .sort((a, b) => a.score - b.score || (a.it.g || 0) - (b.it.g || 0))
-
-    for (const cand of salvageable) {
-      if (!canPush()) break
-      const stillCrowded = (x.items || []).length > 20
-      const stillNeedRescue = needStoneRescue && confirmedStone < 40
-      if (!stillCrowded && !stillNeedRescue) break
-      const gain = 20 * ((cand.it.g || 0) + 1) * ((cand.it.g || 0) + 1)
-      if (emit({ a: 'xianSalvage', id: cand.it.id })) {
-        confirmedStone += gain
-      }
-    }
-  }
-
-  // Step 6: Furnace alchemy (`xianBrew`) using pre-confirmed herbs so server success is 100% deterministic
-  const pillPlan = buildPillDemandPlan(x, confirmedPills, t)
-  if (!x.job && canPush()) {
-    const eff = xianEffects(x)
-    const hardRate = Math.min(0.98, 0.70 + ((x.furnace || 1) - 1) * 0.05 + (eff.pillRate || 0) - 0.10)
-    for (const target of pillPlan) {
-      const pDef = xianPill(target.id)
-      if (!pDef) continue
-      const maxByHerbs = Math.min(
-        ...Object.entries(pDef.in).map(([hid, req]) => Math.floor(xianQtyTotal(confirmedHerbs, hid) / req))
-      )
-      if (maxByHerbs < 1) continue
-      const batchCap = xianFurnaceBatch(x)
-      const isSingleUsePill = BREAK_PILL_IDS.has(target.id) || ['marrow', 'insight', 'spirit'].includes(target.id)
-      const wantCap = isSingleUsePill
-        ? Math.min(batchCap, target.deficit + 1)
-        : Math.min(batchCap, Math.max(target.deficit, 2))
-      const n = Math.max(1, Math.min(maxByHerbs, wantCap))
-      const fire = target.best && hardRate >= 0.85 ? 'hard' : 'soft'
-      if (emit({ a: 'xianBrew', id: target.id, n, fire, best: target.best })) {
-        for (const [hid, req] of Object.entries(pDef.in)) {
-          bagTakeSim(confirmedHerbs, hid, req * n, target.best)
-        }
-        break
-      }
-    }
-  }
-
-  // Step 7: Spirit pets (activate best hatched pet, feed `beast` pills, daily herb feed -> claim feathers -> sell feathers, buy eggs)
-  const hatchedPetIndices = (x.pets || [])
-    .map((p, idx) => (t >= p.h ? idx : -1))
-    .filter((idx) => idx >= 0)
-
-  if (hatchedPetIndices.length > 0 && canPush()) {
-    let bestPetIdx = x.pet
-    let bestPetScore = x.pet >= 0 && t >= (x.pets[x.pet]?.h || Infinity) ? effectiveCombatScore(x) : -1
-    for (const idx of hatchedPetIndices) {
-      const sc = effectiveCombatScore(x, { overridePet: idx })
-      if (sc > bestPetScore + 1e-6) {
-        bestPetScore = sc
-        bestPetIdx = idx
-      }
-    }
-    if (bestPetIdx >= 0 && x.pet !== bestPetIdx) {
-      emit({ a: 'xianPetActive', i: bestPetIdx })
-    }
-
-    while (canPush() && xianQtyTotal(confirmedPills, 'beast') > 0) {
-      const growCandidates = hatchedPetIndices
-        .filter((idx) => (x.pets[idx]?.gr || 0) < 300)
-        .sort((a, b) => (a === x.pet ? -1 : b === x.pet ? 1 : (x.pets[b].gr || 0) - (x.pets[a].gr || 0)))
-      if (growCandidates.length === 0) break
-      const targetIdx = growCandidates[0]
-      if (!emit({ a: 'xianEat', id: 'beast', i: targetIdx, best: true })) break
-      bagTakeSim(confirmedPills, 'beast', 1, true)
-    }
-
-    // Feed 1 cheapest herb to any unfed hatched pet today to unlock its daily feathers (30~90 stones!),
-    // plus surplus cheapest herbs for pets still growing toward `gr = 300` (`灵化`).
-    for (const idx of hatchedPetIndices) {
-      if (!canPush()) break
-      const pet = x.pets[idx]
-      const fedToday = pet.fd === dy.d ? (pet.fn || 0) : 0
-      if (fedToday === 0) {
-        for (const h of HERBS_BY_SEED_ASC.filter((cand) => cand.hours <= 8)) {
-          if (xianQtyTotal(confirmedHerbs, h.id) >= 1) {
-            if (emit({ a: 'xianPetFeed', i: idx, id: h.id, n: 1, best: false })) {
-              bagTakeSim(confirmedHerbs, h.id, 1, false)
-            }
-            break
+      // Plant an already-empty soil plot (or buy 1 needed seed for it) if energy covers `harvest + plant`
+      const emptyIdx = sim.plots.findIndex((p) => p?.s === 'soil' && !p.c)
+      if (emptyIdx >= 0 && sim.en >= COST.harvest + COST.plant) {
+        const crop = chooseCropForEmptyPlot(sim, t, opts)
+        if (crop) {
+          if (Number(sim.seeds?.[crop] || 0) < 1 && sim.stone >= HERBS[crop].seed) {
+            if (emit({ a: 'buy', herb: crop, n: 1 })) continue
+          } else if (Number(sim.seeds?.[crop] || 0) >= 1) {
+            if (emit({ a: 'plant', i: emptyIdx, herb: crop })) continue
           }
         }
       }
-      const fedNow = pet.fd === dy.d ? (pet.fn || 0) : 0
-      const room = XIAN_ECON.feedDaily - fedNow
-      if (CHEAPEST_HERB && (pet.gr || 0) < 300 && room > 0 && canPush()) {
-        const spareCheap = Math.max(0, xianQtyTotal(confirmedHerbs, CHEAPEST_HERB.id) - 10)
-        const feedN = Math.min(room, spareCheap)
-        if (feedN >= 1) {
-          if (emit({ a: 'xianPetFeed', i: idx, id: CHEAPEST_HERB.id, n: feedN, best: false })) {
-            bagTakeSim(confirmedHerbs, CHEAPEST_HERB.id, feedN, false)
+
+      // Sell 1 surplus herb from bag (identical to 1 UI shop click)
+      const sellCand = findSellableHerb(sim, t, opts)
+      if (sellCand) {
+        if (emit({ a: 'sell', herb: sellCand.herb, n: 1 })) continue
+      }
+
+      // Pre-buy 1 seed for the mature plot we are about to replant if seeds on hand don't already cover it
+      if (sim.en >= COST.harvest + COST.plant) {
+        const nextCrop = chooseCropForEmptyPlot(sim, t, opts)
+        if (nextCrop) {
+          const { empty } = countOpenSoilPlots(sim)
+          const neededSeeds = empty + upcomingHarvestCount
+          if (Number(sim.seeds?.[nextCrop] || 0) < neededSeeds && sim.stone >= HERBS[nextCrop].seed) {
+            if (emit({ a: 'buy', herb: nextCrop, n: 1 })) continue
           }
         }
       }
-    }
 
-    if ((x.pets || []).some((p) => t >= p.h && p.fd === dy.d && p.pd !== dy.d) && canPush()) {
-      emit({ a: 'xianPetClaim' })
+      const techToLearn = findLearnableTech(sim)
+      if (techToLearn) {
+        if (emit({ a: 'learn', el: techToLearn })) continue
+      }
+
+      if (sim.can < CAN_MAX) {
+        if (emit({ a: 'refill' })) continue
+      }
+
+      break
     }
   }
 
-  if ((x.mats?.feather || 0) > 0 && canPush()) {
-    const fn = x.mats.feather
-    if (emit({ a: 'xianSell', kind: 'mat', id: 'feather', q: 0, n: fn })) {
-      confirmedStone += 30 * fn
+  // 1. Finish ready cauldron immediately if no mature plots are waiting to claim its `log` step (or if `log % 4 !== 3`)
+  if (sim.brew && t - Number(sim.brew.t || 0) >= BREW_READY_SEC) {
+    const hasRipe = sim.plots.some((p) => p?.c && p.g >= 3)
+    if (!hasRipe || sim.log % 4 !== 3) {
+      emit({ a: 'finish', n: 2 })
     }
   }
 
-  // Buy spirit pet eggs (`800` stones) once seed working reserve is comfortable
-  const seedWorkingReserve = Math.max(120, x.plots.length * 25)
-  while (
-    canPush() &&
-    (x.pets || []).length < XIAN_ECON.petMax &&
-    confirmedStone >= XIAN_ECON.egg + seedWorkingReserve
+  // 1b. Urgent `huiling` cauldron BEFORE farm plots can drain `sim.en` below `COST.brew = 5`!
+  //     Spending 5 `xs.en` here returns +90 `xs.en` today (+85 net `xs.en`), preventing farm energy starvation.
+  if (
+    !sim.brew &&
+    sim.en >= COST.brew &&
+    Number(sim.pills?.huiling || 0) < PILL_DAILY - dpUsedToday(sim, t) &&
+    hasBrewIngredients(sim, 'huiling') &&
+    (!sim.plots.some((p) => p?.c && p.g >= 3) || sim.log % 4 !== 3)
   ) {
-    if (!emit({ a: 'xianEggBuy' })) break
-    confirmedStone -= XIAN_ECON.egg
+    emit({ a: 'brew', herb: 'huiling' })
   }
 
-  // Step 8: Spirit field seed replenishment, planting (`xianPlant`), & spring watering (`xianWater`)
-  const emptyIndices = x.plots.map((p, idx) => (p ? -1 : idx)).filter((idx) => idx >= 0)
-  const minSeedCost = CHEAPEST_HERB?.seed || 4
-  if (emptyIndices.length > 0 && canPush()) {
-    // Emergency anti-deadlock: if 0 seeds and stones < minSeedCost, sell 1~2 surplus low-q herbs to fund starter seeds
-    const ownedSeedsTotal = Object.values(x.seeds || {}).reduce((s, v) => s + (v || 0), 0)
-    if (confirmedStone < minSeedCost && ownedSeedsTotal === 0) {
-      for (const h of XIAN_HERBS) {
-        if (confirmedStone >= minSeedCost * 3 || !canPush()) break
-        for (let q = 0; q <= 2; q++) {
-          const cnt = confirmedHerbs?.[h.id]?.[q] || 0
-          if (cnt > 0) {
-            const sellN = Math.min(cnt, 2)
-            if (emit({ a: 'xianSell', kind: 'herb', id: h.id, q, n: sellN })) {
-              confirmedHerbs[h.id][q] -= sellN
-              confirmedStone += Math.floor(h.price * XIAN_QMUL[q] * sellN)
-              break
-            }
+  // 2. Harvest mature plots (`g >= 3`), highest-value herb first, aligning onto `sim.log % 4 === 3` (`2x` yield!)
+  const ripeIndices = sim.plots
+    .map((p, idx) => (p?.c && p.g >= 3 ? { idx, sell: HERBS[p.c]?.sell || 0 } : null))
+    .filter(Boolean)
+    .sort((a, b) => b.sell - a.sell || a.idx - b.idx)
+
+  for (let k = 0; k < ripeIndices.length; k++) {
+    if (actions.length >= opts.maxActionsPerBatch) {
+      truncatedByBatchCap = true
+      break
+    }
+    const { idx } = ripeIndices[k]
+    const p = sim.plots[idx]
+    if (!p?.c || p.g < 3) continue
+    const remainingRipe = ripeIndices.length - k
+    if (sim.en < COST.harvest && shouldEatHuilingNow(sim, t, remainingRipe * 4)) {
+      emit({ a: 'use', herb: 'huiling' })
+    }
+    if (sim.en < COST.harvest) break
+    const stepsForDouble = (3 - (sim.log % 4) + 4) % 4
+    if (stepsForDouble > 0 && actions.length + stepsForDouble + 1 > opts.maxActionsPerBatch) {
+      // Defer this mature plot to the follow-up batch 3s later rather than sacrificing 2x harvest at batch tail!
+      truncatedByBatchCap = true
+      break
+    }
+    alignLogForDoubleHarvest(remainingRipe)
+    if (!emit({ a: 'harvest', i: idx })) break
+  }
+
+  // Finish ready cauldron if still pending after harvests
+  if (sim.brew && t - Number(sim.brew.t || 0) >= BREW_READY_SEC) {
+    emit({ a: 'finish', n: 2 })
+  }
+
+  // Start urgent today's `huiling` (+85 net `xs.en`) or sub-Lv5 `peiyuan` (+134 Farm XP / 5 `xs.en`) right after harvests!
+  if (!sim.brew && sim.en >= COST.brew && actions.length < opts.maxActionsPerBatch) {
+    const needHuilingToday = Number(sim.pills?.huiling || 0) < PILL_DAILY - dpUsedToday(sim, t)
+    if (needHuilingToday && hasBrewIngredients(sim, 'huiling')) {
+      emit({ a: 'brew', herb: 'huiling' })
+    } else if ((sim.lv || 1) < 5 && sim.en >= COST.brew + 4 && hasBrewIngredients(sim, 'peiyuan')) {
+      emit({ a: 'brew', herb: 'peiyuan' })
+    }
+  }
+
+  // 3. Eat `peiyuan` while `lv < 5` so any Farm level-up unlocks higher-tier seeds BEFORE planting!
+  while (
+    (sim.lv || 1) < 5 &&
+    Number(sim.pills?.peiyuan || 0) > computeHeldPeiyuanFloorWhileSubLv5(sim, t, opts) &&
+    actions.length < opts.maxActionsPerBatch
+  ) {
+    if (!emit({ a: 'use', herb: 'peiyuan' })) break
+  }
+
+  // 4. Sell surplus herbs in compact batches (`n <= 99`) so stone capital is liquid before seed buying
+  while (actions.length < opts.maxActionsPerBatch) {
+    const sellCand = findSellableHerb(sim, t, opts)
+    if (!sellCand) break
+    const n = Math.min(99, sellCand.sellableQty)
+    if (!emit({ a: 'sell', herb: sellCand.herb, n })) break
+  }
+
+  // 5. Water existing growing dry plots FIRST (`p.c && p.g < 3 && !p.w`) so no crop growth timer sits paused
+  for (let i = 0; i < PLOTS; i++) {
+    if (actions.length >= opts.maxActionsPerBatch) {
+      truncatedByBatchCap = true
+      break
+    }
+    const p = sim.plots[i]
+    if (!p?.c || p.g >= 3 || p.w) continue
+    if (sim.en < COST.water && shouldEatHuilingNow(sim, t, COST.water + 4)) {
+      emit({ a: 'use', herb: 'huiling' })
+    }
+    if (sim.en < COST.water) break
+    if (sim.can < 1 && !emit({ a: 'refill' })) break
+    emit({ a: 'water', i })
+  }
+
+  // 6. Plant & water all open empty `soil` plots
+  for (let i = 0; i < PLOTS; i++) {
+    if (actions.length >= opts.maxActionsPerBatch) {
+      truncatedByBatchCap = true
+      break
+    }
+    const p = sim.plots[i]
+    if (!p || p.s !== 'soil' || p.c) continue
+    if (sim.en < COST.plant + COST.water && shouldEatHuilingNow(sim, t, COST.plant + COST.water + 4)) {
+      emit({ a: 'use', herb: 'huiling' })
+    }
+    if (sim.en < COST.plant) break
+    let crop = chooseCropForEmptyPlot(sim, t, opts)
+    if (!crop) break
+    if (Number(sim.seeds?.[crop] || 0) < 1) {
+      // Count how many empty plots remain so we buy up to `min(10, affordable)` in 1 action instead of 1 by 1
+      const remEmpty = sim.plots.slice(i).filter((pl) => pl?.s === 'soil' && !pl.c).length
+      const maxBuy = Math.min(10, remEmpty, Math.floor(sim.stone / HERBS[crop].seed))
+      if (maxBuy < 1 || !emit({ a: 'buy', herb: crop, n: maxBuy })) break
+    }
+    if (!emit({ a: 'plant', i, herb: crop })) break
+    if (sim.en >= COST.water) {
+      if (sim.can < 1) emit({ a: 'refill' })
+      if (sim.can >= 1) emit({ a: 'water', i })
+    }
+  }
+
+  // 7. Daily `huiling` quota top-up if late in CST day (`>= 20:00` or `< 25m` to midnight)
+  while (shouldEatHuilingNow(sim, t, 0) && actions.length < opts.maxActionsPerBatch) {
+    if (!emit({ a: 'use', herb: 'huiling' })) break
+  }
+
+  // 8. Alchemy Cauldron (`xsBrew`, `COST.brew = 5` `xs.en`)
+  //    At `lv >= 5`, `peiyuan` yields 0 Farm XP and is strictly gated behind open-plot completion + surplus `xs.en`!
+  if (!sim.brew && sim.en >= COST.brew && actions.length < opts.maxActionsPerBatch) {
+    const usedDp = dpUsedToday(sim, t)
+    const needHuilingToday = Number(sim.pills?.huiling || 0) < (PILL_DAILY - usedDp)
+    const { huilingBatches, peiyuanBatches } = computeAlchemyHerbTargets(sim, t, opts)
+    const surplusEn = computeSurplusEnergy(sim, t)
+    const allOpenWatered = !sim.plots.some(
+      (p) => p?.s === 'soil' && (!p.c || (p.g < 3 && !p.w) || p.g >= 3)
+    )
+
+    if (needHuilingToday && hasBrewIngredients(sim, 'huiling')) {
+      emit({ a: 'brew', herb: 'huiling' })
+    } else if (huilingBatches > 0 && hasBrewIngredients(sim, 'huiling') && (allOpenWatered || surplusEn >= COST.brew || sim.en >= 80)) {
+      emit({ a: 'brew', herb: 'huiling' })
+    } else if (
+      peiyuanBatches > 0 &&
+      hasBrewIngredients(sim, 'peiyuan') &&
+      ((sim.lv || 1) < 5 || (allOpenWatered && (surplusEn >= COST.brew || sim.en >= 60)) || sim.en >= 85)
+    ) {
+      emit({ a: 'brew', herb: 'peiyuan' })
+    }
+  }
+
+  // 9. Surplus-`xs.en` Weed Expansion (`xsHoe` `3` + `xsPlant` `1` + `xsWater` `1` = `5` `xs.en`)
+  //    While `lv < 4`, 10 initial open plots of fast herbs (0.5h–3h) already exceed sustainable 325/day `xs.en`,
+  //    so only hoe weeds below Lv4 if `sim.en >= 92` (anti-cap overflow); once `lv >= 4` (4.5h–6h herbs), expand with surplus `xs.en`!
+  while (actions.length + 3 <= opts.maxActionsPerBatch) {
+    const hasUnfinishedOpenPlot = sim.plots.some(
+      (p) => p?.s === 'soil' && (!p.c || (p.g < 3 && !p.w) || p.g >= 3)
+    )
+    if (hasUnfinishedOpenPlot) break
+    const weedIdx = sim.plots.findIndex((p) => p?.s === 'weed')
+    if (weedIdx < 0) break
+    const surplusEn = computeSurplusEnergy(sim, t)
+    const canExpand = (sim.lv || 1) < 4
+      ? sim.en >= 92
+      : (surplusEn >= 8 || sim.en >= 65)
+    if (!canExpand) break
+    const crop = chooseCropForEmptyPlot(sim, t, opts)
+    if (!crop) break
+    if (Number(sim.seeds?.[crop] || 0) < 1) {
+      if (sim.stone < HERBS[crop].seed) break
+      if (!emit({ a: 'buy', herb: crop, n: 1 })) break
+    }
+    if (!emit({ a: 'hoe', i: weedIdx })) break
+    if (!emit({ a: 'plant', i: weedIdx, herb: crop })) break
+    if (sim.can < 1) emit({ a: 'refill' })
+    if (sim.can >= 1 && sim.en >= COST.water) {
+      emit({ a: 'water', i: weedIdx })
+    }
+  }
+
+  // 10. Learn all matching root techniques (`50` stones each) BEFORE any root fusion can consume base roots!
+  while (actions.length < opts.maxActionsPerBatch) {
+    const techEl = findLearnableTech(sim)
+    if (!techEl) break
+    if (!emit({ a: 'learn', el: techEl })) break
+  }
+  if (!sim.tech && Array.isArray(sim.techs) && sim.techs.length > 0 && actions.length < opts.maxActionsPerBatch) {
+    const preferred = [...sim.techs].sort((a, b) => {
+      const ia = VARIANT_TECH_PRIORITY.indexOf(a)
+      const ib = VARIANT_TECH_PRIORITY.indexOf(b)
+      return (ia >= 0 ? ia : 99) - (ib >= 0 ? ib : 99)
+    })[0]
+    emit({ a: 'equip', el: preferred })
+  }
+
+  // 11. Tail Stochastic & Meditation Section (`xsBreak` shield -> `xsRise` -> `xsSit` / `xsFuse`)
+  const allowBreak = shouldAllowBreakPolicy(sim, opts)
+  const curR = Number(sim.cv?.r || 0)
+  const breakPillsNeed = curR + 1
+  const haveBreakPills = Number(sim.pills?.peiyuan || 0) >= breakPillsNeed
+
+  if (
+    allowBreak &&
+    haveBreakPills &&
+    Number(sim.cv?.s || 1) >= 9 &&
+    Number(sim.cv?.xp || 0) >= cvNeed(curR, 9) &&
+    actions.length < opts.maxActionsPerBatch
+  ) {
+    // Case A: `cv.xp` is ALREADY full! Execute `xsBreak` BEFORE `xsRise` to shield in-flight `sim.med`!
+    if (emit({ a: 'break' })) {
+      emittedStochastic = true
+      if (sim.med && t - Number(sim.med.t || 0) >= MED_MIN + 5 && actions.length + 1 < opts.maxActionsPerBatch) {
+        if (emit({ a: 'rise' })) emit({ a: 'sit' })
+      } else if (!sim.med && actions.length < opts.maxActionsPerBatch) {
+        emit({ a: 'sit' })
+      }
+    }
+  } else if (
+    allowBreak &&
+    haveBreakPills &&
+    sim.med &&
+    t - Number(sim.med.t || 0) >= MED_MIN + 5 &&
+    actions.length + 2 <= opts.maxActionsPerBatch
+  ) {
+    // Case B: Check if rising right now reaches `s=9 && xp >= cvNeed(r, 9)` so we break without sitting past cap
+    const proj = projectMeditationAfterRise(sim, t)
+    if (proj && proj.s >= 9 && proj.xp >= cvNeed(curR, 9)) {
+      if (emit({ a: 'rise' }) && emit({ a: 'break' })) {
+        emittedStochastic = true
+        if (actions.length < opts.maxActionsPerBatch) emit({ a: 'sit' })
+      }
+    }
+  }
+
+  // Normal 30-minute meditation cycle (continues even at `s=9` when break is deferred to build `>=1.43x` failure cushion!)
+  if (!emittedStochastic) {
+    if (sim.med && t - Number(sim.med.t || 0) >= MED_MAX && actions.length + 1 <= opts.maxActionsPerBatch) {
+      if (emit({ a: 'rise' }) && actions.length < opts.maxActionsPerBatch) {
+        emit({ a: 'sit' })
+      }
+    } else if (!sim.med && actions.length < opts.maxActionsPerBatch) {
+      emit({ a: 'sit' })
+    }
+
+    // Optional Root Fusion (`--xian-auto-fuse`, default OFF):
+    // Requires `r >= 1`, `!(fuseCd > t)`, `peiyuan >= 2`, `stone >= 200`, BOTH base root techs already learned in `sim.techs`,
+    // and low `cv.xp` window (`<= max(15, 12% of cvNeed)`) so 45% failure loses ~0 XP!
+    if (
+      opts.autoFuse &&
+      Number(sim.cv?.r || 0) >= 1 &&
+      !(Number(sim.fuseCd || 0) > t) &&
+      Number(sim.pills?.peiyuan || 0) >= 2 &&
+      Number(sim.stone || 0) >= 200 &&
+      actions.length < opts.maxActionsPerBatch
+    ) {
+      const pair = selectOptimalFusionPair(sim.roots, opts.fuseTarget)
+      if (pair) {
+        const learned = new Set(sim.techs || [])
+        const bothBaseTechsLearned = learned.has(pair.e1) && learned.has(pair.e2)
+        const lowXpCap = Math.max(15, Math.floor(cvNeed(Number(sim.cv?.r || 0), Number(sim.cv?.s || 1)) * 0.12))
+        if (bothBaseTechsLearned && Number(sim.cv?.xp || 0) <= lowXpCap) {
+          if (emit({ a: 'fuse', el: pair.key })) {
+            emittedStochastic = true
           }
         }
-      }
-    }
-
-    const growingByHerb = {}
-    for (const p of x.plots) {
-      if (p?.h) growingByHerb[p.h] = (growingByHerb[p.h] || 0) + 1
-    }
-
-    // Aggregate weighted herb demand table-driven from `XIAN_HERBS` & active pill deficits
-    const herbNeed = {}
-    const herbWeight = {}
-    for (const h of XIAN_HERBS) {
-      if (h.hours <= 2) {
-        herbNeed[h.id] = 9 + hatchedPetIndices.length * 2
-      } else if (h.hours <= 6) {
-        herbNeed[h.id] = 6
-      } else if (h.hours <= 9) {
-        herbNeed[h.id] = x.lv >= 4 ? 6 : 3
-      } else {
-        herbNeed[h.id] = x.lv >= Math.max(5, Math.floor(h.hours / 2)) ? 4 : 0
-      }
-      herbWeight[h.id] = 1 + Math.min(0.35, h.hours / 70)
-    }
-    for (const target of buildPillDemandPlan(x, confirmedPills, t)) {
-      const pDef = xianPill(target.id)
-      if (!pDef) continue
-      for (const [hid, req] of Object.entries(pDef.in)) {
-        herbNeed[hid] = (herbNeed[hid] || 0) + req * target.deficit
-        herbWeight[hid] = Math.max(herbWeight[hid] || 1, target.weight)
-      }
-    }
-
-    const totalPlots = x.plots.length
-    const maxConcurrentForHerb = (h) => {
-      if (h.hours >= 20) {
-        const urgentLongHerb = BREAK_STEPS.some(
-          (bs) =>
-            x.lv >= bs.breakLv - 1 &&
-            xianQtyTotal(confirmedPills, bs.pillId) < 1 &&
-            (xianPill(bs.pillId)?.in?.[h.id] || 0) > 0
-        )
-        return urgentLongHerb ? Math.max(2, Math.ceil(totalPlots * 0.6)) : Math.max(1, Math.floor(totalPlots / 3))
-      }
-      if (h.hours >= 10) {
-        return Math.max(2, Math.floor(totalPlots / 2))
-      }
-      return totalPlots
-    }
-
-    const plannedPerPlot = []
-    const simSeeds = { ...(x.seeds || {}) }
-    const simGrowing = { ...growingByHerb }
-    let budgetStone = confirmedStone
-
-    for (let slotIdx = 0; slotIdx < emptyIndices.length; slotIdx++) {
-      const remEmptyAfterThis = emptyIndices.length - slotIdx - 1
-      let chosenHerb = null
-      let bestPriority = -Infinity
-
-      for (const h of XIAN_HERBS) {
-        if ((simGrowing[h.id] || 0) >= maxConcurrentForHerb(h)) continue
-        const haveFreeSeed = (simSeeds[h.id] || 0) > 0
-        // Keep enough stones (`minSeedCost * remEmptyAfterThis`) so remaining empty plots can afford starter seeds!
-        if (!haveFreeSeed && budgetStone - h.seed < remEmptyAfterThis * minSeedCost) continue
-        const projectedSupply =
-          xianQtyTotal(confirmedHerbs, h.id) +
-          (simGrowing[h.id] || 0) * 3.3 +
-          Math.max(0, (simSeeds[h.id] || 0) - (haveFreeSeed ? 0 : 0)) * 3.3
-        const deficit = (herbNeed[h.id] || 0) - projectedSupply
-        const rootMatchBonus = (x.root?.e || []).includes(h.el) ? 0.15 : 0
-        const score = deficit > 0
-          ? (deficit / Math.max(3, herbNeed[h.id] || 3)) * 10 * (herbWeight[h.id] || 1) + rootMatchBonus + (haveFreeSeed ? 0.5 : 0)
-          : -h.hours * 0.1 + rootMatchBonus + (haveFreeSeed ? 1.0 : 0)
-        if (score > bestPriority) {
-          bestPriority = score
-          chosenHerb = h
-        }
-      }
-
-      if (!chosenHerb) {
-        const fallback = XIAN_HERBS.find((h) => (simSeeds[h.id] || 0) > 0 || budgetStone >= h.seed)
-        if (!fallback) break
-        chosenHerb = fallback
-      }
-
-      if ((simSeeds[chosenHerb.id] || 0) > 0) {
-        simSeeds[chosenHerb.id]--
-      } else {
-        budgetStone -= chosenHerb.seed
-      }
-      simGrowing[chosenHerb.id] = (simGrowing[chosenHerb.id] || 0) + 1
-      plannedPerPlot.push({ plotIndex: emptyIndices[slotIdx], herbId: chosenHerb.id })
-    }
-
-    // Aggregate seed purchases per herb id first so batch stays compact
-    const buyCounts = {}
-    const curSeedsSnapshot = { ...(x.seeds || {}) }
-    for (const item of plannedPerPlot) {
-      if ((curSeedsSnapshot[item.herbId] || 0) > 0) {
-        curSeedsSnapshot[item.herbId]--
-      } else {
-        buyCounts[item.herbId] = (buyCounts[item.herbId] || 0) + 1
-      }
-    }
-    for (const [hid, cnt] of Object.entries(buyCounts)) {
-      if (cnt > 0 && canPush(2)) {
-        if (emit({ a: 'xianSeedBuy', id: hid, n: cnt })) {
-          confirmedStone = Number(x.stone || 0)
-        }
-      }
-    }
-
-    // If all planned plots share the same herb id and cover all empty plots, collapse into `{ a: 'xianPlant', i: 'all', id }`
-    const distinctHerbs = [...new Set(plannedPerPlot.map((p) => p.herbId))]
-    if (distinctHerbs.length === 1 && plannedPerPlot.length === emptyIndices.length && canPush()) {
-      emit({ a: 'xianPlant', i: 'all', id: distinctHerbs[0] })
-    } else {
-      for (const item of plannedPerPlot) {
-        if (!canPush()) break
-        emit({ a: 'xianPlant', i: item.plotIndex, id: item.herbId })
-      }
-    }
-  }
-
-  // Water highest-value unwatered growing plots with remaining Spirit Spring charges
-  const remWater = xianSpringCharges(x) - dy.water
-  if (remWater > 0 && canPush()) {
-    const cstHour = cstHourOf(t)
-    const waterCandidates = x.plots
-      .map((p, idx) => {
-        if (!p || p.w || xianPlotReady(p, t)) return null
-        const h = xianHerb(p.h)
-        if (!h) return null
-        // Preserve scarce spring charges for >2h herbs during daytime once past Lv3 unless matching root element
-        if (
-          h.hours <= 2 &&
-          (x.lv || 1) >= 4 &&
-          cstHour < 17 &&
-          remWater <= 3 &&
-          !(x.root?.e || []).includes(h.el)
-        ) {
-          return null
-        }
-        const rootMult = (x.root?.e || []).includes(h.el) ? 1.35 : 1.0
-        return { idx, priority: h.price * rootMult }
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.priority - a.priority)
-
-    const toWater = waterCandidates.slice(0, remWater)
-    const allUnwateredCount = x.plots.filter((p) => p && !p.w && !xianPlotReady(p, t)).length
-    if (toWater.length > 0 && toWater.length === allUnwateredCount && toWater.length <= remWater) {
-      emit({ a: 'xianWater', i: 'all' })
-    } else {
-      for (const wc of toWater) {
-        if (!canPush()) break
-        emit({ a: 'xianWater', i: wc.idx })
-      }
-    }
-  }
-
-  // Step 9: Combat — NPC Duels (`xianDuel`, 10/day) & Free Secret Tower (`xianTower`, 5/day, NEVER paid!)
-  const haveHealForCombat = xianQtyTotal(confirmedPills, 'heal') > 0
-  const cstHour = cstHourOf(t)
-
-  if (dy.duel < 10 && canPush(2)) {
-    const unbeatenNpcs = XIAN_NPCS
-      .filter((npc) => !dy.won.includes(npc.id))
-      .map((npc) => {
-        const enemy = xianNpcEnemy(npc)
-        const sim = estimateBattleWinProb(x, enemy, {
-          trials: 36,
-          seed: (t ^ (npc.lv * 9973)) >>> 0,
-          withCarry: haveHealForCombat,
-        })
-        return {
-          npc,
-          enemy,
-          winProb: sim.winProb,
-          pillTriggerRate: sim.pillTriggerRate,
-          utility: npcGiftUtility(npc, x),
-        }
-      })
-
-    const sureWins = unbeatenNpcs
-      .filter((c) => c.winProb >= 0.98 && (!haveHealForCombat || c.pillTriggerRate <= 0.05))
-      .sort((a, b) => b.utility - a.utility)
-
-    if (sureWins.length > 0) {
-      if (haveHealForCombat && !x.carry) emit({ a: 'xianCarry', on: true })
-      const quotaLeft = 10 - dy.duel
-      for (const sw of sureWins.slice(0, quotaLeft)) {
-        if (!canPush()) break
-        emit({ a: 'xianDuel', id: sw.npc.id })
-      }
-      if (dy.duel < 10 && unbeatenNpcs.length > sureWins.length) {
-        followUpSoon = true
-      }
-    } else {
-      const minDuelWinProb = cstHour >= 21 ? 0.08 : 0.45
-      const viable = unbeatenNpcs
-        .filter((c) => c.winProb >= minDuelWinProb)
-        .sort((a, b) => (b.winProb * b.utility) - (a.winProb * a.utility))
-
-      if (viable.length > 0 && canPush(2)) {
-        const pick = viable[0]
-        if (haveHealForCombat && !x.carry) emit({ a: 'xianCarry', on: true })
-        if (pick.winProb < 0.85 && !x.buff?.atk && xianQtyTotal(confirmedPills, 'rage') > 0 && canPush(2)) {
-          if (emit({ a: 'xianEat', id: 'rage', best: true })) {
-            bagTakeSim(confirmedPills, 'rage', 1, true)
-          }
-        }
-        if (emit({ a: 'xianDuel', id: pick.npc.id })) {
-          followUpSoon = true
-        }
-      }
-    }
-  }
-
-  // Secret Tower: strictly free tries only (`dy.tower < XIAN_ECON.towerFree`), 1 floor per batch so new gear equips immediately
-  if (dy.tower < XIAN_ECON.towerFree && (x.items || []).length < XIAN_ECON.bagMax && canPush(2)) {
-    const nextFloor = (x.tw?.f || 0) + 1
-    const towerEnemy = xianTowerEnemy(nextFloor)
-    const simWithHeal = estimateBattleWinProb(x, towerEnemy, {
-      trials: 40,
-      seed: (t ^ (nextFloor * 131071)) >>> 0,
-      withCarry: haveHealForCombat,
-    })
-    const simNoHeal = estimateBattleWinProb(x, towerEnemy, {
-      trials: 40,
-      seed: (t ^ (nextFloor * 131071)) >>> 0,
-      withCarry: false,
-    })
-
-    if (simWithHeal.winProb >= 0.25) {
-      if (haveHealForCombat && !x.carry && canPush(2)) {
-        emit({ a: 'xianCarry', on: true })
-      }
-      if (simWithHeal.winProb < 0.85 && nextFloor % 10 === 0) {
-        if (!x.buff?.atk && xianQtyTotal(confirmedPills, 'rage') > 0 && canPush(2)) {
-          if (emit({ a: 'xianEat', id: 'rage', best: true })) bagTakeSim(confirmedPills, 'rage', 1, true)
-        }
-        if (!x.buff?.def && xianQtyTotal(confirmedPills, 'stone') > 0 && canPush(2)) {
-          if (emit({ a: 'xianEat', id: 'stone', best: true })) bagTakeSim(confirmedPills, 'stone', 1, true)
-        }
-      }
-      if (emit({ a: 'xianTower' })) {
-        followUpSoon = true
-      }
-    } else if (cstHour >= 21 && simWithHeal.winProb >= 0.03) {
-      // Late-day free quota hail-mary; avoid wasting `heal` pill if heal doesn't meaningfully lift win rate
-      const healHelps = haveHealForCombat && (simWithHeal.winProb - simNoHeal.winProb) >= 0.05
-      if (!healHelps && x.carry && canPush(2)) {
-        emit({ a: 'xianCarry', on: false })
-      } else if (healHelps && !x.carry && canPush(2)) {
-        emit({ a: 'xianCarry', on: true })
-      }
-      if (emit({ a: 'xianTower' })) {
-        followUpSoon = true
       }
     }
   }
 
   assertSafeXianBatch(actions, world, opts)
+
+  // If cauldron was just started (`t - brew.t < BREW_READY_SEC`), don't force 3s followUp; wake at `brew.t + 19` instead!
+  const followUpSoon = Boolean(truncatedByBatchCap || emittedStochastic)
   return {
     enabled: true,
     actions,
-    expectedSpendCoins,
+    expectedSpendCoins: 0,
     followUpSoon,
     reason: actions.length > 0 ? 'actions-ready' : 'idle',
   }
@@ -963,61 +857,91 @@ export function computeNextXianWakeSec(world, nowSec = Number(world?.now || 0), 
   const opts = normalizeXianOptions(rawOptions)
   if (!opts.enabled) return Infinity
   const t = Math.floor(Number(nowSec || world?.now || 0))
-  const x = world?.state?.xian
-  if (!x?.v) return t + 2
+  const rawXs = world?.state?.xs
+  if (!rawXs?.v || !rawXs.roots || !Array.isArray(rawXs.roots.e) || Number(rawXs.st || 0) < STORY_END) {
+    return t + 120
+  }
+  if (rawXs.fight && t - Number(rawXs.fight.t || 0) < 1800) {
+    return Math.min(t + 60, Number(rawXs.fight.t) + 1802)
+  }
 
+  // If actions are already executable right now, wake promptly (`t + 3s` > `GAP = 2.2s`).
+  const preview = planXianActions(world, t, opts)
+  if (preview.actions.length > 0) {
+    return t + 3
+  }
+
+  // Otherwise, every candidate MUST be strictly `> t` so idle states never spin!
+  const sim = structuredClone(rawXs)
+  xsTick(sim, t)
   const candidates = [nextCstMidnightSec(t) + 3]
 
-  for (const p of x.plots || []) {
-    if (!p?.h) continue
-    const h = xianHerb(p.h)
-    if (!h) continue
-    const readyAt = p.t + h.hours * 3600
-    candidates.push(readyAt <= t ? t + 2 : readyAt + 1)
+  if (sim.brew) {
+    const brewReadyAt = Number(sim.brew.t || t) + BREW_READY_SEC
+    if (brewReadyAt > t) candidates.push(brewReadyAt)
   }
 
-  if (x.job?.done) {
-    candidates.push(x.job.done <= t ? t + 2 : x.job.done + 1)
-  }
-
-  for (const pet of x.pets || []) {
-    if (pet?.h && pet.h > t) {
-      candidates.push(pet.h + 1)
+  let waitingOnPlotEnergy = false
+  for (const p of sim.plots || []) {
+    if (!p) continue
+    if (p.c && p.g < 3 && p.w) {
+      const stageReadyAt = Number(p.w) + HERBS[p.c].grow + 1
+      if (stageReadyAt > t) candidates.push(stageReadyAt)
+    } else if ((p.c && p.g >= 3) || (p.c && p.g < 3 && !p.w)) {
+      waitingOnPlotEnergy = true
+    } else if (p.s === 'soil' && !p.c && chooseCropForEmptyPlot(sim, t, opts)) {
+      waitingOnPlotEnergy = true
     }
   }
 
-  const cAt = Number(x.cAt || t)
-  const capSafeAt = cAt + Math.min(12 * 3600, XIAN_CULT_CAP - 1800)
-  candidates.push(capSafeAt <= t ? t + 10 : capSafeAt)
+  if (sim.en < EN_MAX) {
+    const enBase = Number(sim.enAt || t)
+    if (waitingOnPlotEnergy) {
+      const nextTick = enBase + EN_REGEN + 1
+      candidates.push(nextTick > t ? nextTick : t + EN_REGEN)
+    }
+    const ticksTo88 = Math.max(1, 88 - Number(sim.en || 0))
+    const nearCapAt = enBase + ticksTo88 * EN_REGEN + 1
+    if (nearCapAt > t) candidates.push(nearCapAt)
+  }
 
-  if ((x.lv || 1) < XIAN_MAX_LV) {
-    const need = xianNeed(x.lv)
-    const brk = xianBreakNeed(x)
-    if (!brk || (x.xp || 0) < need) {
-      const remXp = Math.max(1, need - (x.xp || 0))
-      const rate = xianRate(x)
-      if (rate > 0) {
-        const secNeeded = Math.ceil((remXp * 3600) / rate)
-        if (secNeeded <= XIAN_CULT_CAP) {
-          const targetAt = cAt + secNeeded + 2
-          candidates.push(targetAt <= t ? t + 5 : targetAt)
+  if (sim.med) {
+    const medCapAt = Number(sim.med.t || t) + MED_MAX + 1
+    if (medCapAt > t) candidates.push(medCapAt)
+
+    // Exact early wake if in-flight meditation will hit `s=9 && cv.xp >= cvNeed(r, 9)` with breakthrough ready
+    const curR = Number(sim.cv?.r || 0)
+    if (shouldAllowBreakPolicy(sim, opts) && Number(sim.pills?.peiyuan || 0) >= curR + 1) {
+      let remXp = 0
+      const curS = Number(sim.cv?.s || 1)
+      for (let s = curS; s <= 9; s++) remXp += cvNeed(curR, s)
+      remXp -= Number(sim.cv?.xp || 0)
+      const ratePerSec = (10 * rootMult(sim)) / 60
+      if (remXp > 0 && ratePerSec > 0) {
+        const secNeeded = Math.max(MED_MIN + 5, Math.ceil((remXp + 1) / ratePerSec))
+        if (secNeeded < MED_MAX) {
+          const breakReadyAt = Number(sim.med.t || t) + secNeeded
+          if (breakReadyAt > t) candidates.push(breakReadyAt)
         }
       }
     }
   }
 
-  const dy = x.dy?.d === xianDay(t) ? x.dy : { duel: 0, tower: 0 }
-  if (cstHourOf(t) < 21 && ((dy.duel || 0) < 10 || (dy.tower || 0) < XIAN_ECON.towerFree)) {
-    const today21Cst = xianDay(t) * 86400 - 28800 + 21 * 3600 + 5
-    if (today21Cst > t) candidates.push(today21Cst)
+  if (opts.autoFuse && Number(sim.fuseCd || 0) > t) {
+    candidates.push(Number(sim.fuseCd) + 2)
   }
 
-  return Math.min(...candidates.filter((v) => Number.isFinite(v)))
+  if (dpUsedToday(sim, t) < PILL_DAILY && Number(sim.pills?.huiling || 0) > 0) {
+    const eveningTopUpAt = nextCstMidnightSec(t) - 4 * 3600 + 5
+    if (eveningTopUpAt > t) candidates.push(eveningTopUpAt)
+  }
+
+  return Math.min(...candidates.filter((v) => Number.isFinite(v) && v > t))
 }
 
 /**
- * Executes a single preemptible, lock-serialized `b16 云梦仙途` slice (`kind: 'xian-act'`).
- * Zero HTTP requests and zero lock contention when `observedWorld` shows no due `xian*` actions!
+ * Executes a single preemptible, lock-serialized 「大肥鱼修仙记」 (`state.xs`) slice (`kind: 'xian-act'`).
+ * Zero HTTP requests and zero lock contention when `observedWorld` shows no due `xs*` actions!
  */
 export async function runXianCultivationSlice({
   account = 'main',
@@ -1044,6 +968,7 @@ export async function runXianCultivationSlice({
     if (preview.actions.length === 0) {
       return {
         status: 'idle',
+        reason: preview.reason,
         actions: [],
         expectedSpendCoins: 0,
         nextXianWakeSec: computeNextXianWakeSec(observedWorld, estNowSec, opts),
@@ -1052,8 +977,9 @@ export async function runXianCultivationSlice({
     if (dryRun || !journal) {
       return {
         status: 'dry-run-planned',
+        reason: preview.reason,
         actions: preview.actions,
-        expectedSpendCoins: preview.expectedSpendCoins,
+        expectedSpendCoins: 0,
         nextXianWakeSec: preview.followUpSoon
           ? estNowSec + 3
           : computeNextXianWakeSec(observedWorld, estNowSec, opts),
@@ -1074,8 +1000,9 @@ export async function runXianCultivationSlice({
     const preview = planXianActions(w, nowW, opts)
     return {
       status: preview.actions.length > 0 ? 'dry-run-planned' : 'idle',
+      reason: preview.reason,
       actions: preview.actions,
-      expectedSpendCoins: preview.expectedSpendCoins,
+      expectedSpendCoins: 0,
       nextXianWakeSec: preview.followUpSoon
         ? nowW + 3
         : computeNextXianWakeSec(w, nowW, opts),
@@ -1123,6 +1050,7 @@ export async function runXianCultivationSlice({
     if (livePlan.actions.length === 0) {
       return {
         status: 'idle',
+        reason: livePlan.reason,
         actions: [],
         expectedSpendCoins: 0,
         worldAfter: sanitizeWorldSnapshot(liveWorld),
@@ -1141,9 +1069,11 @@ export async function runXianCultivationSlice({
       kind: 'xian-act',
       worldBefore: liveWorld,
       planSummary: {
-        module: 'b16-xian',
+        module: 'xs-xian',
         reason: livePlan.reason,
-        expectedSpendCoins: livePlan.expectedSpendCoins,
+        breakMode: opts.breakMode,
+        autoFuse: opts.autoFuse,
+        expectedSpendCoins: 0,
         actionCount: livePlan.actions.length,
       },
       requestPayload: {
@@ -1170,7 +1100,7 @@ export async function runXianCultivationSlice({
     const postWorld = txOut.worldAfter || sanitizeWorldSnapshot(liveWorld)
     const postNow = Math.floor(Number(postWorld?.now || liveNow))
     const computedWake = computeNextXianWakeSec(postWorld, postNow, opts)
-    const nextXianWakeSec = (txOut.status === 'confirmed' && livePlan.followUpSoon)
+    const nextXianWakeSec = txOut.status === 'confirmed' && livePlan.followUpSoon
       ? Math.min(computedWake, postNow + 3)
       : computedWake
 
@@ -1178,7 +1108,7 @@ export async function runXianCultivationSlice({
       status: txOut.status,
       operation: txOut.operation,
       actions: livePlan.actions,
-      expectedSpendCoins: livePlan.expectedSpendCoins,
+      expectedSpendCoins: 0,
       response: txOut.response,
       worldAfter: postWorld,
       nextXianWakeSec,

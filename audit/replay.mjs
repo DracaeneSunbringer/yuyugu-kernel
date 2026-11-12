@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createRulesAdapter } from '../model/rules-adapter.mjs'
+import { COST as XS_COST, act as xsAct } from '../rules/xs-xian-rules.js'
 
 /**
  * Layer 1 Audit (`audit/replay.mjs`):
@@ -160,8 +161,17 @@ export async function auditTransactionReplay(journal, tx, { fallbackAdapter = nu
 
   if (tx.kind === 'xian-act') {
     const xianActions = Array.isArray(request.actions) ? request.actions : []
+    const isXsName = (name) => /^xs[A-Z]/.test(name) && Object.hasOwn(XS_COST, name[2].toLowerCase() + name.slice(3))
+    const isLegacyXianName = (name) => name.startsWith('xian')
+    const hasXs = xianActions.some((act) => isXsName(String(act?.a || '')))
+    const hasLegacy = xianActions.some((act) => isLegacyXianName(String(act?.a || '')))
     const nonXian = xianActions
-      .map((act, index) => (!String(act?.a || '').startsWith('xian') ? { index, action: act, msg: 'non-xian-action' } : null))
+      .map((act, index) => {
+        const name = String(act?.a || '')
+        if (hasXs && hasLegacy) return { index, action: act, msg: 'mixed-xs-and-legacy-xian-actions' }
+        if (!isXsName(name) && !isLegacyXianName(name)) return { index, action: act, msg: 'non-xian-action' }
+        return null
+      })
       .filter(Boolean)
     if (nonXian.length > 0) {
       return {
@@ -192,6 +202,20 @@ export async function auditTransactionReplay(journal, tx, { fallbackAdapter = nu
         reason: 'confirmed-xian-tx-missing-both-response-and-state-after',
       }
     }
+    const outRows = Array.isArray(srvBody?.out) ? srvBody.out : []
+    const failedServerIndices = outRows
+      .map((o, index) => (o && o.ok === false ? { index, action: xianActions[index], msg: o.msg || 'server-rejected' } : null))
+      .filter(Boolean)
+    if (failedServerIndices.length > 0) {
+      return {
+        operation: tx.operation,
+        kind: 'xian-act',
+        status: 'illegal-action-in-batch',
+        identifiable: true,
+        rejectedSimIndices: failedServerIndices,
+        serverDrifts: [],
+      }
+    }
     const xianDrifts = []
     if (stateAfter) {
       const evalXianSec = Number(stateAfter.now ?? stateBefore.now ?? 0)
@@ -199,10 +223,11 @@ export async function auditTransactionReplay(journal, tx, { fallbackAdapter = nu
       if (Number(stateAfter.state?.en) !== Number(refreshedBefore.state?.en)) {
         xianDrifts.push({ field: 'xian.en', expected: refreshedBefore.state?.en, server: stateAfter.state?.en })
       }
-      const outRows = Array.isArray(srvBody?.out) ? srvBody.out : []
-      const totalSpend = Number.isFinite(srvBody?.spend)
-        ? Number(srvBody.spend)
-        : outRows.reduce((s, r) => s + (r?.ok ? Number(r.spend || 0) : 0), 0)
+      const totalSpend = hasXs
+        ? 0
+        : (Number.isFinite(srvBody?.spend)
+            ? Number(srvBody.spend)
+            : outRows.reduce((s, r) => s + (r?.ok ? Number(r.spend || 0) : 0), 0))
       const expectedCoins = Number(stateBefore.coins || 0) - totalSpend
       if (Number(stateAfter.coins) !== expectedCoins) {
         xianDrifts.push({ field: 'xian.coins', expected: expectedCoins, server: stateAfter.coins })
@@ -211,6 +236,44 @@ export async function auditTransactionReplay(journal, tx, { fallbackAdapter = nu
       const srvInv = JSON.stringify(adapter.availableInvSnapshot(stateAfter.state))
       if (expInv !== srvInv) {
         xianDrifts.push({ field: 'xian.availableInv', expected: JSON.parse(expInv), server: JSON.parse(srvInv) })
+      }
+
+      const hasStochasticXs = xianActions.some((a) => ['xsBreak', 'xsFuse', 'xsRoot'].includes(String(a?.a || '')))
+      const execSec = Number(srvBody?.now ?? stateAfter.now ?? stateBefore.now ?? 0)
+      if (
+        hasXs &&
+        !hasStochasticXs &&
+        stateBefore.state?.xs?.v &&
+        stateAfter.state?.xs?.v &&
+        Number(stateAfter.now) === execSec
+      ) {
+        const simXs = structuredClone(stateBefore.state.xs)
+        const rejectedXsIndices = []
+        xianActions.forEach((wireAct, index) => {
+          const short = wireAct.a[2].toLowerCase() + wireAct.a.slice(3)
+          const internal = { a: short }
+          if (wireAct.i != null) internal.i = wireAct.i
+          if (wireAct.herb != null) internal.herb = wireAct.herb
+          if (wireAct.n != null) internal.n = wireAct.n
+          if (wireAct.el != null) internal.el = wireAct.el
+          const r = xsAct(simXs, internal, execSec)
+          if (!r?.ok) rejectedXsIndices.push({ index, action: wireAct, msg: r?.msg || 'xs-sim-failed' })
+        })
+        if (rejectedXsIndices.length > 0) {
+          return {
+            operation: tx.operation,
+            kind: 'xian-act',
+            status: 'illegal-action-in-batch',
+            identifiable: true,
+            rejectedSimIndices: rejectedXsIndices,
+            serverDrifts: [],
+          }
+        }
+        for (const k of ['log', 'stone', 'en', 'lv', 'xp']) {
+          if (Number(stateAfter.state.xs[k]) !== Number(simXs[k])) {
+            xianDrifts.push({ field: `xs.${k}`, expected: simXs[k], server: stateAfter.state.xs[k] })
+          }
+        }
       }
     }
     return {

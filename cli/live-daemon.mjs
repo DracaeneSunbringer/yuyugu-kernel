@@ -365,7 +365,7 @@ export async function runLiveAccountTick({
       runtimeState.lastHuancaiCheckAtSec = httpClient.estimatedServerNowSec()
     }
 
-    // C.5: Optional b16 Xian Cultivation Slice (`--enable-xian`, default OFF; zero island stamina, strict D-coin/material firewall)
+    // C.5: Optional xs Xian Cultivation Slice (`--enable-xian`, default OFF; 100% isolated from main-island D-coins/stamina)
     if (normalizedXian.enabled && !snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())) {
       const xianOut = await runXianCultivationSlice({
         account,
@@ -375,13 +375,7 @@ export async function runLiveAccountTick({
         lockRootDir,
         observedWorld: lastInLockWorld || controllerOut.world || null,
         shouldAbortFn: () => Boolean(snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())),
-        xianOptions: {
-          ...normalizedXian,
-          cashReserveFloor: Math.max(
-            normalizedXian.cashReserveFloor,
-            Number(effectiveConstraints.cashReserveFloor ?? 10)
-          ),
-        },
+        xianOptions: normalizedXian,
         dryRun,
       })
       backgroundReport.xian = xianOut
@@ -541,13 +535,14 @@ if (isDirectMain) {
     const noUpdateCheck = hasFlag('--no-update-check')
     const updateWebhookUrl = getArg('--update-webhook', process.env.MEME_UPDATE_WEBHOOK_URL || '')
     const enableXian = hasFlag('--enable-xian') || process.env.MEME_ENABLE_XIAN === '1'
-    const xianDailyStone = Math.max(
-      0,
-      Math.floor(Number(getArg('--xian-daily-stone', process.env.MEME_XIAN_DAILY_STONE || '0')) || 0)
-    )
+    const xianBreakMode = getArg('--xian-break-mode', process.env.MEME_XIAN_BREAK_MODE || 'smart')
+    const xianAutoFuse = hasFlag('--xian-auto-fuse') || process.env.MEME_XIAN_AUTO_FUSE === '1'
+    const xianFuseTarget = getArg('--xian-fuse-target', process.env.MEME_XIAN_FUSE_TARGET || 'auto')
     const xianOptions = normalizeXianOptions({
       enabled: enableXian,
-      dailyStoneQuota: xianDailyStone,
+      breakMode: xianBreakMode,
+      autoFuse: xianAutoFuse,
+      fuseTarget: xianFuseTarget,
     })
 
     const updateNotifier = new UpdateNotifier({
@@ -683,7 +678,7 @@ if (isDirectMain) {
       fs.writeFileSync(pidFilePath, `${process.pid}\n`, 'utf8')
     }
     const xianBootTag = xianOptions.enabled
-      ? (xianOptions.dailyStoneQuota > 0 ? `on(stone<=${xianOptions.dailyStoneQuota})` : 'on(free)')
+      ? `on(break=${xianOptions.breakMode},fuse=${xianOptions.autoFuse ? xianOptions.fuseTarget : 'off'})`
       : 'off'
     console.log(`[${new Date().toISOString()}] [LIVE:${account}] kernel=v${updateNotifier.localVersion} xian=${xianBootTag} started pid=${process.pid}`)
     updateNotifier.maybeCheckInBackground()
@@ -743,9 +738,14 @@ if (isDirectMain) {
             diagParts.push(`rev=${res.controllerOut.expectedRev}->${res.controllerOut.actualRev}`)
           }
           const diagTag = diagParts.length > 0 ? ` ${diagParts.join(' ')}` : ''
-          const xianTickTag = res.backgroundReport?.xian?.status === 'confirmed'
-            ? ` xian=act(${res.backgroundReport.xian.actions?.length || 0})`
-            : ''
+          const xianRes = res.backgroundReport?.xian
+          const xianTickTag = xianRes?.status === 'confirmed'
+            ? ` xian=act(${xianRes.actions?.length || 0})`
+            : xianRes?.reason === 'prologue-manual-standby'
+              ? ' xian=standby(prologue)'
+              : xianRes?.reason === 'manual-fight-in-progress'
+                ? ' xian=yield(fight)'
+                : ''
           console.log(
             `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${diagTag}${xianTickTag}${updateNotifier.inlineTag()}`
           )
