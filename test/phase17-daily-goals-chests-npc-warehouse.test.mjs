@@ -93,6 +93,13 @@ test('Phase 17.1: Daily goal all-clear bonus (k=4) claims standalone, in-batch w
       }
       if (init.method === 'POST' && p === '/api/pet/world/act') {
         const body = JSON.parse(init.body)
+        if (Number(body.rev) !== Number(serverWorld.rev)) {
+          return {
+            status: 409,
+            headers: new Map(),
+            text: async () => JSON.stringify({ error: '小岛状态已变化', code: 'world_conflict', rev: serverWorld.rev, state: serverWorld.state }),
+          }
+        }
         const sim = adapter.simulateBatch(serverWorld, body.actions, { t: baseT, prices: serverWorld.prices })
         sim.afterWorld.rev = (serverWorld.rev || 0) + 1
         serverWorld = sim.afterWorld
@@ -405,6 +412,13 @@ test('Phase 17.3: 52D Toy Stall beats 15x15 Hard Gomoku deterministically, compl
       }
       if (init.method === 'POST' && p === '/api/pet/world/act') {
         const body = JSON.parse(init.body)
+        if (Number(body.rev) !== Number(serverWorld.rev)) {
+          return {
+            status: 409,
+            headers: new Map(),
+            text: async () => JSON.stringify({ error: '小岛状态已变化', code: 'world_conflict', rev: serverWorld.rev, state: serverWorld.state }),
+          }
+        }
         const nowS = Math.floor(simMs / 1000)
         const sim = adapter.simulateBatch(serverWorld, body.actions, {
           t: nowS,

@@ -864,7 +864,9 @@ if (isDirectMain) {
           const npcRes = res.backgroundReport?.npc
           const npcTickTag = npcRes?.status === 'confirmed'
             ? ` npc=act(${npcRes.actions?.length || 0})`
-            : ''
+            : (npcRes?.status === 'rejected' || npcRes?.status === 'unknown' || npcRes?.status === 'blocked-pending-unknown')
+              ? ` npc=${npcRes.status}`
+              : ''
           console.log(
             `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${diagTag}${xianTickTag}${npcTickTag}${updateNotifier.inlineTag()}`
           )

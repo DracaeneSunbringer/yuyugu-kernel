@@ -514,12 +514,23 @@ export async function runNpcToyStallSlice({
       kind: 'npc-act',
       worldBefore: liveWorld,
       requestPayload: { actions },
-      sendFn: ({ operation }) => httpClient.postJson('/api/pet/world/act', { actions, operation }),
+      sendFn: async ({ operation }) => {
+        const r = await httpClient.postJson('/api/pet/world/act', {
+          rev: liveWorld.rev,
+          operation,
+          actions,
+        })
+        return { ok: r.ok, status: r.status, networkError: r.networkError, body: r.body }
+      },
       fetchAfterWorldFn: async () => sanitizeWorldSnapshot(await httpClient.getJson('/api/pet/world')),
     })
 
     const worldAfter = txRes.worldAfter || null
     const refWorld = worldAfter || liveWorld
+    const baseNextWakeSec = computeNextNpcWakeSec(adapter, refWorld, refWorld.now, npcOptions)
+    const nextNpcWakeSec = txRes.status === 'confirmed'
+      ? baseNextWakeSec
+      : Math.max(baseNextWakeSec, Number(refWorld.now || estNowSec) + 15)
     return {
       status: txRes.status,
       actions,
@@ -527,7 +538,7 @@ export async function runNpcToyStallSlice({
       worldAfter,
       usedToday: Number(adapter.advanceTimeOnly(refWorld, refWorld.now).state?.cnt?.npc || used),
       dailyCap,
-      nextNpcWakeSec: computeNextNpcWakeSec(adapter, refWorld, refWorld.now, npcOptions),
+      nextNpcWakeSec,
     }
   })
 }
