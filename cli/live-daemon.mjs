@@ -575,11 +575,21 @@ if (isDirectMain) {
     const xianBreakMode = getArg('--xian-break-mode', process.env.MEME_XIAN_BREAK_MODE || 'smart')
     const xianAutoFuse = hasFlag('--xian-auto-fuse') || process.env.MEME_XIAN_AUTO_FUSE === '1'
     const xianFuseTarget = getArg('--xian-fuse-target', process.env.MEME_XIAN_FUSE_TARGET || 'auto')
+    const xianAutoAll = hasFlag('--xian-opt3') || hasFlag('--xian-auto-all') || process.env.MEME_XIAN_AUTO_ALL === '1'
+    const xianAutoEvents = hasFlag('--xian-auto-events') || process.env.MEME_XIAN_AUTO_EVENTS === '1'
+    const xianAutoSocial = hasFlag('--xian-auto-social') || process.env.MEME_XIAN_AUTO_SOCIAL === '1'
+    const xianAutoDuel = hasFlag('--xian-auto-duel') || process.env.MEME_XIAN_AUTO_DUEL === '1'
+    const xianAutoRealm = hasFlag('--xian-auto-realm') || process.env.MEME_XIAN_AUTO_REALM === '1'
     const xianOptions = normalizeXianOptions({
       enabled: enableXian,
       breakMode: xianBreakMode,
       autoFuse: xianAutoFuse,
       fuseTarget: xianFuseTarget,
+      autoAll: xianAutoAll,
+      autoEvents: xianAutoEvents,
+      autoSocial: xianAutoSocial,
+      autoDuel: xianAutoDuel,
+      autoRealm: xianAutoRealm,
     })
 
     const updateNotifier = new UpdateNotifier({
@@ -714,8 +724,14 @@ if (isDirectMain) {
       fs.mkdirSync(dataRootDir, { recursive: true })
       fs.writeFileSync(pidFilePath, `${process.pid}\n`, 'utf8')
     }
+    const xianOpt3Tags = [
+      xianOptions.autoEvents ? 'ev' : '',
+      xianOptions.autoSocial ? 'soc' : '',
+      xianOptions.autoDuel ? 'duel' : '',
+      xianOptions.autoRealm ? 'rlm' : '',
+    ].filter(Boolean)
     const xianBootTag = xianOptions.enabled
-      ? `on(break=${xianOptions.breakMode},fuse=${xianOptions.autoFuse ? xianOptions.fuseTarget : 'off'})`
+      ? `on(break=${xianOptions.breakMode},fuse=${xianOptions.autoFuse ? xianOptions.fuseTarget : 'off'}${xianOpt3Tags.length ? `,opt3=${xianOpt3Tags.join('+')}` : ''})`
       : 'off'
     console.log(`[${new Date().toISOString()}] [LIVE:${account}] kernel=v${updateNotifier.localVersion} xian=${xianBootTag} started pid=${process.pid}`)
     updateNotifier.maybeCheckInBackground()
@@ -782,7 +798,9 @@ if (isDirectMain) {
               ? ' xian=standby(prologue)'
               : xianRes?.reason === 'manual-fight-in-progress'
                 ? ' xian=yield(fight)'
-                : ''
+                : xianRes?.reason === 'manual-realm-in-progress'
+                  ? ' xian=yield(realm)'
+                  : ''
           console.log(
             `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${diagTag}${xianTickTag}${updateNotifier.inlineTag()}`
           )

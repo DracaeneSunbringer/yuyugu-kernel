@@ -238,7 +238,7 @@ export async function auditTransactionReplay(journal, tx, { fallbackAdapter = nu
         xianDrifts.push({ field: 'xian.availableInv', expected: JSON.parse(expInv), server: JSON.parse(srvInv) })
       }
 
-      const hasStochasticXs = xianActions.some((a) => ['xsBreak', 'xsFuse', 'xsRoot'].includes(String(a?.a || '')))
+      const hasStochasticXs = xianActions.some((a) => ['xsBreak', 'xsFuse', 'xsRoot', 'xsTasks', 'xsEvroll'].includes(String(a?.a || '')))
       const execSec = Number(srvBody?.now ?? stateAfter.now ?? stateBefore.now ?? 0)
       if (
         hasXs &&

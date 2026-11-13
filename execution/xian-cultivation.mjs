@@ -1,32 +1,60 @@
 import { sanitizeWorldSnapshot } from '../model/observations.mjs'
 import { executeTransaction, reconcileUnknownWithFreshWorld, withAccountLock } from './reconcile.mjs'
 import {
+  AREAS,
   BREW_MAX,
   BREW_MIN,
   CAN_MAX,
+  CHAPTERS,
   COST,
   EN_MAX,
   EN_REGEN,
+  EVENTS,
+  EV_DAILY,
+  EV_GAP,
+  FIGHT_COST,
+  FIGHT_DAILY,
   FUSIONS,
   HERBS,
   LV_NEED,
   MED_MAX,
   MED_MIN,
+  NEW_NPCS,
+  NPC_FIGHT,
+  OLD_NPCS,
   PILL_DAILY,
   PILLS,
   PLOTS,
+  PREF,
   REALMS,
+  RLM_DAILY,
+  RLM_EN,
+  RLM_MUL,
   ROOT_GROW,
+  SHOP,
   STORY_END,
+  TASK_KINDS,
   TECH_PRICE,
   TECHS,
   act as xsAct,
   canMax,
   cvNeed,
   fuseKey,
+  hseed,
+  meFighter,
+  medBonus,
+  mobFighter,
+  mySlots,
+  npcFighter,
   plotView,
+  rlmMap,
+  rlmNext,
   rootMult,
+  sim as simulateCombat,
+  skillsOf,
   tick as xsTick,
+  xsLuck,
+  xsMind,
 } from '../rules/xs-xian-rules.js'
 
 /**
@@ -58,6 +86,35 @@ const PURE_CASH_HERBS = new Set(
 const VARIANT_TECH_PRIORITY = ['poison', 'ice', 'wind', 'fire', 'wood', 'metal', 'earth', 'water', 'thunder', 'lava']
 const EQUIP_TECH_PRIORITY_SUB_LV5 = ['poison', 'fire', 'wind', 'ice', 'wood', 'metal', 'earth', 'water', 'thunder', 'lava']
 const EQUIP_TECH_PRIORITY_LV5 = ['ice', 'poison', 'wind', 'fire', 'metal', 'wood', 'earth', 'water', 'thunder', 'lava']
+
+function rankChapterNpcPriority(npcId) {
+  const chList = CHAPTERS[npcId] || []
+  let priority = 0
+  for (const ch of chList) {
+    for (const opt of ch.opt || []) {
+      if (opt.rel === 2) priority += 1200
+      else if (opt.rel === 1) priority += 1000
+      else if (opt.rel === 3) priority += 500
+      if (opt.pill?.peiyuan) priority += 200 * opt.pill.peiyuan
+      if (opt.pill?.huiling) priority += 40 * opt.pill.huiling
+      if (opt.seed) priority += 80
+      if (opt.mind && opt.mind > 0) priority += opt.mind * 2
+      if (opt.luck && opt.luck > 0) priority += opt.luck * 2
+    }
+  }
+  return priority
+}
+
+const SOCIAL_GIFT_PRIORITY_NPCS = Object.keys(CHAPTERS).sort(
+  (a, b) => rankChapterNpcPriority(b) - rankChapterNpcPriority(a)
+)
+const TALK_PRIORITY_NPCS = Array.from(new Set([
+  ...SOCIAL_GIFT_PRIORITY_NPCS,
+  ...OLD_NPCS,
+  ...Object.keys(NEW_NPCS),
+]))
+const AREA_PRIORITY_DESC = Object.keys(AREAS).sort((a, b) => AREAS[b].need - AREAS[a].need)
+const REALM_BEAM_WIDTH = 14
 
 function selectPreferredEquippedTech(x) {
   if (!Array.isArray(x?.techs) || x.techs.length === 0) return null
@@ -110,11 +167,16 @@ export function normalizeXianOptions(raw = {}) {
   const fuseTargetRaw = String(raw?.fuseTarget || 'auto').trim().toLowerCase()
   const fuseTarget = VALID_XIAN_FUSE_TARGETS.has(fuseTargetRaw) ? fuseTargetRaw : 'auto'
   const maxActionsRaw = Number(raw?.maxActionsPerBatch ?? MAX_XS_BATCH)
+  const autoAll = Boolean(raw?.autoAll || raw?.opt3)
   return {
     enabled: Boolean(raw?.enabled),
     breakMode,
     autoFuse: Boolean(raw?.autoFuse),
     fuseTarget,
+    autoEvents: autoAll || Boolean(raw?.autoEvents),
+    autoSocial: autoAll || Boolean(raw?.autoSocial),
+    autoDuel: autoAll || Boolean(raw?.autoDuel),
+    autoRealm: autoAll || Boolean(raw?.autoRealm),
     maxActionsPerBatch: Number.isFinite(maxActionsRaw)
       ? Math.max(1, Math.min(MAX_XS_BATCH, Math.floor(maxActionsRaw)))
       : MAX_XS_BATCH,
@@ -138,11 +200,29 @@ export function assertSafeXianBatch(actions, _world = null, rawOptions = {}) {
     if (!parsed) {
       throw new Error(`Illegal non-xs action in xian batch: ${name}`)
     }
+    if (name === 'xsPeek' || name === 'xsRout') {
+      throw new Error(`Unsafe manual xian action in automated batch: ${name}`)
+    }
     if (name === 'xsFuse' && !opts.autoFuse) {
       throw new Error('xsFuse is forbidden when autoFuse is disabled')
     }
     if (name === 'xsBreak' && opts.breakMode === 'manual') {
       throw new Error('xsBreak is forbidden when breakMode is manual')
+    }
+    if ((name === 'xsEvroll' || name === 'xsEvpick') && !opts.autoEvents) {
+      throw new Error(`${name} is forbidden when autoEvents is disabled`)
+    }
+    if ((name === 'xsGift' || name === 'xsChap') && !opts.autoSocial) {
+      throw new Error(`${name} is forbidden when autoSocial is disabled`)
+    }
+    if (name === 'xsAb' && !opts.autoDuel) {
+      throw new Error('xsAb is forbidden when autoDuel is disabled')
+    }
+    if ((name === 'xsRin' || name === 'xsRgo' || name === 'xsRbuy') && !opts.autoRealm) {
+      throw new Error(`${name} is forbidden when autoRealm is disabled`)
+    }
+    if (name === 'xsSlots' && !opts.autoDuel && !opts.autoRealm) {
+      throw new Error('xsSlots is forbidden when autoDuel and autoRealm are both disabled')
     }
   }
 }
@@ -288,6 +368,47 @@ function computeDesiredPeiyuanStock(x, nowSec, opts) {
   return breakNeed * retryMultiplier + fuseReserve
 }
 
+function getPendingSectHerbNeeds(x, nowSec) {
+  const needs = {}
+  const d = xsDay(nowSec)
+  if (x.tk?.d !== d || !Array.isArray(x.tk.list)) return needs
+  for (const row of x.tk.list) {
+    if (!Array.isArray(row) || row[1]) continue
+    const def = TASK_KINDS[row[0]]
+    if (def && def[0] === 'herb' && def[1]) {
+      needs[def[1]] = (needs[def[1]] || 0) + Number(def[2] || 0)
+    }
+  }
+  return needs
+}
+
+function getSocialHerbNeeds(x, nowSec, opts) {
+  const reserve = {}
+  if (!opts?.autoSocial) return reserve
+  const d = xsDay(nowSec)
+  const lv = Number(x.lv || 1)
+  const heldRemaining = {}
+  for (const [h, qty] of Object.entries(x.bag || {})) {
+    heldRemaining[h] = Number(qty || 0)
+  }
+  for (const id of SOCIAL_GIFT_PRIORITY_NPCS) {
+    const chList = CHAPTERS[id]
+    if (!chList) continue
+    const v = x.npc?.[id] || [0, 0, 0, 0]
+    if (v[2] >= chList.length || v[0] >= 300 || v[3] === d) continue
+    const favPrefs = PREF[id]?.[0] || []
+    for (const herbId of favPrefs) {
+      if (PILLS[herbId] || !HERBS[herbId] || HERBS[herbId].lv > lv) continue
+      if (Number(heldRemaining[herbId] || 0) >= 1) {
+        heldRemaining[herbId] -= 1
+        reserve[herbId] = (reserve[herbId] || 0) + 1
+        break
+      }
+    }
+  }
+  return reserve
+}
+
 function computeAlchemyHerbTargets(x, nowSec, opts) {
   const usedDp = dpUsedToday(x, nowSec)
   const targetHuilingPills = (PILL_DAILY - usedDp) + PILL_DAILY
@@ -301,19 +422,39 @@ function computeAlchemyHerbTargets(x, nowSec, opts) {
     ? Math.min(2, Math.max(0, Math.ceil((desiredPeiyuan - havePeiyuan) / 3)))
     : 0
 
+  const sectNeeds = getPendingSectHerbNeeds(x, nowSec)
+  const socialNeeds = getSocialHerbNeeds(x, nowSec, opts)
+
+  const needHerbs = {
+    lingcao: huilingBatches * 3 + peiyuanBatches * 2 + (sectNeeds.lingcao || 0),
+    jingu: huilingBatches * 1 + (sectNeeds.jingu || 0),
+    linglan: peiyuanBatches * 1 + (sectNeeds.linglan || 0),
+  }
+  for (const [h, n] of Object.entries(sectNeeds)) {
+    if (!Object.hasOwn(needHerbs, h)) needHerbs[h] = n
+  }
+
+  const alchemyAndSectReserve = {
+    lingcao: Math.max(6, huilingBatches * 3 + peiyuanBatches * 2) + (sectNeeds.lingcao || 0),
+    jingu: Math.max(2, huilingBatches * 1) + (sectNeeds.jingu || 0),
+    linglan: (canGrowLinglan ? Math.max(2, peiyuanBatches * 1) : 0) + (sectNeeds.linglan || 0),
+  }
+  for (const [h, n] of Object.entries(sectNeeds)) {
+    if (!Object.hasOwn(alchemyAndSectReserve, h)) alchemyAndSectReserve[h] = n
+  }
+
+  const bagReserve = { ...alchemyAndSectReserve }
+  for (const [h, n] of Object.entries(socialNeeds)) {
+    bagReserve[h] = (bagReserve[h] || 0) + n
+  }
+
   return {
     huilingBatches,
     peiyuanBatches,
-    needHerbs: {
-      lingcao: huilingBatches * 3 + peiyuanBatches * 2,
-      jingu: huilingBatches * 1,
-      linglan: peiyuanBatches * 1,
-    },
-    bagReserve: {
-      lingcao: Math.max(6, huilingBatches * 3 + peiyuanBatches * 2),
-      jingu: Math.max(2, huilingBatches * 1),
-      linglan: canGrowLinglan ? Math.max(2, peiyuanBatches * 1) : 0,
-    },
+    sectNeeds,
+    needHerbs,
+    alchemyAndSectReserve,
+    bagReserve,
   }
 }
 
@@ -330,6 +471,11 @@ function chooseCropForEmptyPlot(x, nowSec, opts) {
   if (projected('jingu') < needHerbs.jingu && canUse('jingu')) return 'jingu'
   if (projected('lingcao') < needHerbs.lingcao && canUse('lingcao')) return 'lingcao'
   if ((x.lv || 1) >= 2 && projected('linglan') < needHerbs.linglan && canUse('linglan')) return 'linglan'
+  for (const [herbId] of HERB_ENTRIES_DESC) {
+    if (Number(needHerbs[herbId] || 0) > 0 && projected(herbId) < needHerbs[herbId] && canUse(herbId)) {
+      return herbId
+    }
+  }
 
   // Pick highest unlocked herb; if temporarily short on stones for top herb, wait for in-ground harvest
   // unless field is sparse (`< 3` growing) or `xs.en` is near cap (`>= 85`).
@@ -347,11 +493,11 @@ function chooseCropForEmptyPlot(x, nowSec, opts) {
 
 function findSellableHerb(x, nowSec, opts) {
   const { bagReserve } = computeAlchemyHerbTargets(x, nowSec, opts)
-  // Sell pure cash herbs (`leizhu`, `chizhi`, `binglian`) first, then surplus alchemy herbs above reserve
+  // Sell pure cash herbs (`leizhu`, `chizhi`, `binglian` when unreserved) first, then surplus alchemy herbs above reserve
   for (const [herbId] of HERB_ENTRIES_DESC) {
     const qty = Number(x.bag?.[herbId] || 0)
     if (qty <= 0) continue
-    const keep = PURE_CASH_HERBS.has(herbId) ? 0 : Number(bagReserve[herbId] || 0)
+    const keep = Number(bagReserve[herbId] || 0)
     if (qty > keep) {
       return { herb: herbId, sellableQty: qty - keep }
     }
@@ -447,7 +593,7 @@ function projectMeditationAfterRise(x, nowSec) {
   if (!x.med) return null
   const d = Math.min(Math.max(0, nowSec - Number(x.med.t || nowSec)), MED_MAX)
   if (d < MED_MIN) return { d, gainCv: 0, s: x.cv.s, xp: x.cv.xp }
-  const gainCv = Math.floor((d / 60) * 10 * rootMult(x) * (x.tech === 'ice' ? 1.2 : 1))
+  const gainCv = Math.floor((d / 60) * 10 * rootMult(x) * (x.tech === 'ice' ? 1.2 : 1) * medBonus(x))
   let s = Number(x.cv?.s || 1)
   let xp = Number(x.cv?.xp || 0) + gainCv
   const r = Number(x.cv?.r || 0)
@@ -456,6 +602,484 @@ function projectMeditationAfterRise(x, nowSec) {
     s++
   }
   return { d, gainCv, s, xp }
+}
+
+function findNextDailyTalkNpc(x, nowSec) {
+  const d = xsDay(nowSec)
+  const chatted = x.ch?.d === d && Array.isArray(x.ch.ids) ? x.ch.ids : []
+  if (chatted.length >= 3) return null
+  const chattedSet = new Set(chatted)
+  const candidates = TALK_PRIORITY_NPCS.filter((id) => !chattedSet.has(id))
+  if (candidates.length === 0) return null
+  const chapterPriority = candidates.find((id) => {
+    const chList = CHAPTERS[id]
+    if (!chList) return false
+    const v = x.npc?.[id] || [0, 0, 0, 0]
+    return v[2] < chList.length && v[0] < 300
+  })
+  if (chapterPriority) return chapterPriority
+  return candidates.find((id) => Number(x.npc?.[id]?.[0] || 0) < 1000) || candidates[0]
+}
+
+function findTurnInableSectTaskIndex(x, nowSec, opts) {
+  const d = xsDay(nowSec)
+  if (x.tk?.d !== d || !Array.isArray(x.tk.list)) return -1
+  const remDailyHuiling = Math.max(0, PILL_DAILY - dpUsedToday(x, nowSec))
+  const haveHuiling = Number(x.pills?.huiling || 0)
+  const urgentHuilingIngredients = !x.brew && haveHuiling < remDailyHuiling && hasBrewIngredients(x, 'huiling')
+    ? PILLS.huiling.need
+    : null
+  const curR = Number(x.cv?.r || 0)
+  const allowBreak = shouldAllowBreakPolicy(x, opts)
+  const breakNeed = curR < REALMS.length - 1 ? curR + 1 : 0
+  const retryMult = Number(x.cv?.s || 1) >= 8 && allowBreak ? 2 : 1
+  const fuseReserve = opts?.autoFuse && curR >= 1 && selectOptimalFusionPair(x.roots, opts.fuseTarget) ? 2 : 0
+  const peiyuanReserve = Math.max(
+    breakNeed * retryMult + fuseReserve,
+    computeHeldPeiyuanFloorWhileSubLv5(x, nowSec, opts)
+  )
+
+  for (let i = 0; i < x.tk.list.length; i++) {
+    const row = x.tk.list[i]
+    if (!Array.isArray(row) || row[1]) continue
+    const def = TASK_KINDS[row[0]]
+    if (!def) continue
+    const [kind, key, n] = def
+    if (kind === 'win') {
+      if (x.tw?.d === d && Number(x.tw.n || 0) >= n) return i
+    } else if (kind === 'herb') {
+      const keepUrgent = urgentHuilingIngredients ? Number(urgentHuilingIngredients[key] || 0) : 0
+      if (Number(x.bag?.[key] || 0) >= n + keepUrgent) return i
+    } else if (kind === 'pill') {
+      if (key === 'huiling' && haveHuiling - n >= remDailyHuiling) return i
+      if (key === 'peiyuan' && Number(x.pills?.peiyuan || 0) - n >= peiyuanReserve) return i
+    }
+  }
+  return -1
+}
+
+function scoreSocialOrEventOutcome(x, nowSec, eff, who, cost = null, opts = {}) {
+  if (!eff) return -1e6
+  const r = Number(x.cv?.r || 0)
+  const sc = 1 + 0.5 * r
+  let score = 0
+
+  if (cost) {
+    if (Number(cost.pill?.peiyuan || 0) > 0) return -1e6
+    if (Number(cost.pill?.huiling || 0) > 0) {
+      const needH = Number(cost.pill.huiling)
+      const remDailyH = Math.max(0, PILL_DAILY - dpUsedToday(x, nowSec))
+      if (Number(x.pills?.huiling || 0) - needH < remDailyH + 1) return -1e6
+      score -= needH * 100
+    }
+    if (Number(cost.stone || 0) > 0) {
+      if (Number(x.stone || 0) < Number(cost.stone) + 120) return -1e6
+      score -= Number(cost.stone) * 0.5
+    }
+    if (cost.herb) {
+      const { alchemyAndSectReserve } = computeAlchemyHerbTargets(x, nowSec, opts)
+      for (const [h, n] of Object.entries(cost.herb)) {
+        const have = Number(x.bag?.[h] || 0)
+        if (have < n) return -1e6
+        score -= (HERBS[h]?.sell || 5) * n * 0.6
+        if (have - n < Number(alchemyAndSectReserve[h] || 0)) score -= 80 * n
+      }
+    }
+  }
+
+  if (eff.rel) {
+    const entries = Object.entries(x.npc || {})
+    if (eff.rel === 1 || eff.rel === 2) {
+      const existingDiff = entries.some(([id, v]) => id !== who && v[1] === eff.rel)
+      score += existingDiff ? -5000 : eff.rel === 2 ? 12000 : 10000
+    } else if (eff.rel === 3) {
+      const hasSworn = entries.some(([, v]) => v[1] === 3)
+      score += hasSworn ? 0 : 800
+    }
+  }
+
+  if (eff.mind) {
+    const curMind = xsMind(x)
+    if (eff.mind > 0) {
+      const effGain = Math.max(0, Math.min(100, curMind + eff.mind) - curMind)
+      score += effGain * 24 + 1
+    } else {
+      score += eff.mind * 40
+    }
+  }
+
+  if (eff.luck) {
+    const curLuck = xsLuck(x)
+    const nextLuck = Math.max(-50, Math.min(50, curLuck + eff.luck))
+    const delta = nextLuck - curLuck
+    score += delta * (delta > 0 ? 18 : 25)
+  }
+
+  if (eff.en) {
+    const curEn = Number(x.en || 0)
+    if (eff.en > 0) {
+      score += Math.max(0, Math.min(EN_MAX, curEn + eff.en) - curEn) * 10
+    } else {
+      if (curEn < -eff.en + 15) return -1e6
+      score += eff.en * 18
+    }
+  }
+
+  if (eff.fav && who) {
+    const v = x.npc?.[who] || [0, 0, 0, 0]
+    if (v[0] + eff.fav <= -100 && !v[1]) return -5000
+    const chIncomplete = CHAPTERS[who] && v[2] < CHAPTERS[who].length && v[0] < 300
+    score += eff.fav * (chIncomplete ? (eff.fav < 0 ? 2 : 1.5) : 0.25)
+  }
+
+  if (eff.favOf) {
+    for (const [id, n] of Object.entries(eff.favOf)) {
+      const v = x.npc?.[id] || [0, 0, 0, 0]
+      if (v[0] + n <= -100 && !v[1]) return -5000
+      if (n < 0) {
+        const needsWaterCh1 = CHAPTERS[id] && v[2] < CHAPTERS[id].length && v[0] < 310
+        score += n * (needsWaterCh1 ? 8 : v[0] < 0 ? 3 : 1)
+      } else {
+        const weight = CHAPTERS[id] && v[2] < CHAPTERS[id].length && v[0] < 300 ? 1 : 0.3
+        score += n * weight
+      }
+    }
+  }
+
+  for (const [k, n] of Object.entries(eff.pill || {})) {
+    score += n * (k === 'peiyuan' ? 260 : 100)
+  }
+  for (const [h, n] of Object.entries(eff.herb || {})) {
+    score += n * (HERBS[h]?.sell || 5) * 0.6
+  }
+  for (const [h, n] of Object.entries(eff.seed || {})) {
+    score += n * (HERBS[h]?.seed || 10) * 1.2
+  }
+  if (eff.stone) score += sc * eff.stone * 0.5
+  if (eff.cv) score += sc * eff.cv * 0.35
+  if (eff.rep) score += eff.rep * (eff.rep > 0 ? 1.5 : 3)
+  if (eff.tm && x.tech) score += eff.tm * 20
+  return score
+}
+
+function findNextSocialAction(x, nowSec, opts) {
+  if (!opts?.autoSocial) return null
+  const r = Number(x.cv?.r || 0)
+  for (const id of SOCIAL_GIFT_PRIORITY_NPCS) {
+    const chList = CHAPTERS[id]
+    if (!chList) continue
+    const v = x.npc?.[id] || [0, 0, 0, 0]
+    const n = Number(v[2] || 0)
+    const ch = chList[n]
+    if (!ch || v[0] < (ch.need?.fav || 0) || r < (ch.need?.r || 0)) continue
+    let bestIdx = -1
+    let bestScore = -1e5
+    for (let i = 0; i < ch.opt.length; i++) {
+      const s = scoreSocialOrEventOutcome(x, nowSec, ch.opt[i], id, null, opts)
+      if (s > bestScore) {
+        bestScore = s
+        bestIdx = i
+      }
+    }
+    if (bestIdx >= 0 && bestScore > -1000) {
+      return { a: 'chap', el: id, n, i: bestIdx }
+    }
+  }
+
+  const d = xsDay(nowSec)
+  const lv = Number(x.lv || 1)
+  const { alchemyAndSectReserve } = computeAlchemyHerbTargets(x, nowSec, opts)
+  for (const id of SOCIAL_GIFT_PRIORITY_NPCS) {
+    const chList = CHAPTERS[id]
+    if (!chList) continue
+    const v = x.npc?.[id] || [0, 0, 0, 0]
+    if (v[2] >= chList.length || v[0] >= 300 || v[3] === d) continue
+    const favs = PREF[id]?.[0] || []
+    for (const h of favs) {
+      if (PILLS[h] || !HERBS[h] || HERBS[h].lv > lv) continue
+      if (Number(x.bag?.[h] || 0) > Number(alchemyAndSectReserve[h] || 0)) {
+        return { a: 'gift', el: id, herb: h }
+      }
+    }
+  }
+  return null
+}
+
+function findNextEventAction(x, nowSec, opts) {
+  if (!opts?.autoEvents) return null
+  const d = xsDay(nowSec)
+  const cur = x.ev?.d === d ? x.ev.cur : null
+  if (cur && nowSec - Number(cur.t || 0) <= 1800) {
+    const E = EVENTS.find((e) => e.id === cur.id)
+    if (!E) return null
+    let bestIdx = -1
+    let bestScore = 0
+    for (let i = 0; i < E.opt.length; i++) {
+      const o = E.opt[i]
+      if (o.need?.r && Number(x.cv?.r || 0) < o.need.r) continue
+      let roll = (cur.r ?? 0.5) - xsLuck(x) / 400
+      let k = 0
+      for (; k < o.rolls.length - 1; k++) {
+        roll -= o.rolls[k][0]
+        if (roll < 0) break
+      }
+      const s = scoreSocialOrEventOutcome(x, nowSec, o.rolls[k][1], E.who, o.cost || null, opts)
+      if (s > bestScore) {
+        bestScore = s
+        bestIdx = i
+      }
+    }
+    if (bestIdx >= 0) return { kind: 'evpick', act: { a: 'evpick', i: bestIdx } }
+    return null
+  }
+  const evUsed = x.ev?.d === d ? Number(x.ev.n || 0) : 0
+  const evLast = x.ev?.d === d ? Number(x.ev.last || 0) : 0
+  if (evUsed < EV_DAILY && nowSec - evLast >= EV_GAP) {
+    return { kind: 'evroll', act: { a: 'evroll' } }
+  }
+  return null
+}
+
+function buildCandidateSlotSets(x) {
+  const ok = skillsOf(x)
+  const okSet = new Set(ok)
+  const cur = mySlots(x)
+  const sets = []
+  const seen = new Set()
+  const addSet = (arr) => {
+    if (!Array.isArray(arr) || arr.length !== 4) return
+    const uniq = Array.from(new Set(arr))
+    if (uniq.length !== 4 || !uniq.every((id) => okSet.has(id))) return
+    const key = uniq.join(',')
+    if (!seen.has(key)) {
+      seen.add(key)
+      sets.push(uniq)
+    }
+  }
+  if (cur) addSet(cur)
+
+  const nuke1Order = ['wind1', 'thunder1', 'metal1', 'ice1', 'poison1', 'lava1', 'fire1', 'water1', 'wood1', 'earth1']
+    .filter((id) => okSet.has(id))
+  const own1 = x.tech && okSet.has(`${x.tech}1`) ? `${x.tech}1` : nuke1Order[0]
+  const top1 = nuke1Order[0]
+  const alt1 = nuke1Order.find((id) => id !== top1)
+  const ccOrFast = ['wood2', 'thunder2', 'wind2', 'poison2', 'metal2', 'ice2', 'lava2', 'fire2', 'bolt']
+    .filter((id) => okSet.has(id))
+  const hasWater2 = okSet.has('water2')
+  const hasEarth2 = okSet.has('earth2')
+
+  const templates = [
+    [own1, 'wood2', 'water2', 'thunder2'],
+    [own1, 'wood2', 'wind2', 'water2'],
+    [top1, 'wood2', 'thunder2', 'wind2'],
+    [top1, 'water2', 'earth2', 'wood2'],
+    [top1, 'water2', 'guard', ccOrFast[0]],
+    [top1, ccOrFast[0], ccOrFast[1], 'water2'],
+    [top1, alt1, 'water2', 'wood2'],
+    [top1, alt1, 'thunder2', 'wind2'],
+    [top1, 'poison2', 'wood2', 'water2'],
+    [top1, 'metal2', 'wind2', 'bolt'],
+    [own1, `${x.tech}2`, 'water2', 'guard'],
+    [own1, `${x.tech}2`, 'bolt', 'guard'],
+  ]
+  for (const tpl of templates) {
+    const clean = tpl.filter(Boolean)
+    if (clean.length === 4) {
+      addSet(clean)
+    } else if (clean.length >= 2) {
+      const filled = [...clean]
+      for (const fill of [...ccOrFast, ...(hasWater2 ? ['water2'] : []), ...(hasEarth2 ? ['earth2'] : []), 'bolt', 'guard']) {
+        if (!filled.includes(fill) && okSet.has(fill)) filled.push(fill)
+        if (filled.length === 4) break
+      }
+      addSet(filled)
+    }
+  }
+  return sets.slice(0, 14)
+}
+
+function solveRealmBeam(simWithRlm, nowSec) {
+  const startZ = simWithRlm?.rlm
+  if (!startZ) return null
+  const map = rlmMap(startZ.sd)
+  const remainingSteps = (2 - startZ.L) * 4 + (3 - startZ.R)
+  if (remainingSteps <= 0) return null
+
+  let beam = [{ state: structuredClone(simWithRlm), path: [], spentStone: 0, lootScore: 0 }]
+  const completed = []
+
+  for (let step = 0; step < remainingSteps && beam.length > 0; step++) {
+    const expanded = []
+    for (const entry of beam) {
+      const z = entry.state.rlm
+      if (!z) continue
+      const curNode = z.R >= 0 ? map[z.L]?.[z.R]?.find((n) => n.c === z.c) : null
+      const variants = [entry]
+      const boughtKey = `${z.L}.${z.R}.0`
+      if (
+        curNode?.k === 'shop' &&
+        !(z.bought || []).includes(boughtKey) &&
+        z.hp < z.mx * 0.8 &&
+        entry.state.stone >= SHOP[0].st + 40
+      ) {
+        const healedState = structuredClone(entry.state)
+        const buyAct = { a: 'rbuy', i: 0 }
+        if (xsAct(healedState, buyAct, nowSec)?.ok) {
+          variants.push({
+            state: healedState,
+            path: [...entry.path, buyAct],
+            spentStone: entry.spentStone + SHOP[0].st,
+            lootScore: entry.lootScore,
+          })
+        }
+      }
+
+      for (const v of variants) {
+        const nextNodes = rlmNext(map, v.state.rlm)
+        for (const node of nextNodes) {
+          const ns = structuredClone(v.state)
+          const goAct = { a: 'rgo', i: node.c }
+          const res = xsAct(ns, goAct, nowSec)
+          if (!res?.ok) continue
+          if (res.end === 'win') {
+            completed.push({
+              state: ns,
+              path: [...v.path, goAct],
+              spentStone: v.spentStone,
+              score: (res.hp?.[0] ?? ns.cv?.xp ?? 0) + 10000 - v.spentStone * 4,
+            })
+            continue
+          }
+          if (res.end === 'lose' || !ns.rlm) continue
+          const lt = ns.rlm.lt || {}
+          const matCnt = Object.values(lt.m || {}).reduce((s, n) => s + Number(n || 0), 0)
+          const pillCnt = Object.values(lt.p || {}).reduce((s, n) => s + Number(n || 0), 0)
+          const herbCnt = Object.values(lt.h || {}).reduce((s, n) => s + Number(n || 0), 0)
+          const lootScore = Number(lt.st || 0) * 0.5 + pillCnt * 40 + matCnt * 12 + herbCnt * 8
+          const hpFrac = ns.rlm.mx > 0 ? ns.rlm.hp / ns.rlm.mx : 0
+          const score = hpFrac * 1000 + lootScore - v.spentStone * 4
+          expanded.push({ state: ns, path: [...v.path, goAct], spentStone: v.spentStone, lootScore, score, hpFrac })
+        }
+      }
+    }
+    if (expanded.length === 0) break
+    const bestByLoc = new Map()
+    for (const item of expanded) {
+      const z = item.state.rlm
+      const key = `${z.L}:${z.R}:${z.c}:${item.spentStone}`
+      const prev = bestByLoc.get(key)
+      if (!prev || item.score > prev.score) bestByLoc.set(key, item)
+    }
+    beam = [...bestByLoc.values()].sort((a, b) => b.score - a.score).slice(0, REALM_BEAM_WIDTH)
+  }
+
+  if (completed.length === 0) return null
+  completed.sort((a, b) => b.score - a.score)
+  return completed[0]
+}
+
+function sameSlotSet(a, b) {
+  return Array.isArray(a) && Array.isArray(b) && a.length === 4 && b.length === 4 && a.every((v, idx) => v === b[idx])
+}
+
+function tryEmitAutoRealm(sim, nowSec, opts, actions, emit) {
+  if (!opts?.autoRealm || !sim.tech) return
+  if (actions.length >= opts.maxActionsPerBatch) return
+
+  if (sim.rlm) {
+    const slotSets = buildCandidateSlotSets(sim)
+    const curSlots = mySlots(sim)
+    for (const slots of slotSets) {
+      const needSlots = !sameSlotSet(slots, curSlots)
+      if (needSlots && actions.length + 2 > opts.maxActionsPerBatch) continue
+      const probe = structuredClone(sim)
+      if (needSlots && !xsAct(probe, { a: 'slots', herb: slots.join(',') }, nowSec)?.ok) continue
+      const sol = solveRealmBeam(probe, nowSec)
+      if (!sol) continue
+      if (needSlots && !emit({ a: 'slots', herb: slots.join(',') })) return
+      for (const act of sol.path) {
+        if (!emit(act)) break
+      }
+      return
+    }
+    return
+  }
+
+  const d = xsDay(nowSec)
+  const rdUsed = sim.rd?.d === d ? Number(sim.rd.n || 0) : 0
+  if (rdUsed >= RLM_DAILY || Number(sim.en || 0) < RLM_EN) return
+  const r = Number(sim.cv?.r || 0)
+  const unlockedAreas = AREA_PRIORITY_DESC.filter((a) => r >= AREAS[a].need)
+  const areasToTry = [
+    ...unlockedAreas.filter((a) => !sim.rc?.[a]),
+    ...unlockedAreas.filter((a) => sim.rc?.[a]),
+  ]
+  const curSlots = mySlots(sim)
+  const slotSets = buildCandidateSlotSets(sim)
+
+  for (const areaId of areasToTry) {
+    for (const slots of slotSets) {
+      const needSlots = !sameSlotSet(slots, curSlots)
+      if (needSlots && actions.length + 2 > opts.maxActionsPerBatch) continue
+      const probe = structuredClone(sim)
+      if (needSlots && !xsAct(probe, { a: 'slots', herb: slots.join(',') }, nowSec)?.ok) continue
+      if (!xsAct(probe, { a: 'rin', herb: areaId }, nowSec)?.ok) continue
+      const sol = solveRealmBeam(probe, nowSec)
+      if (!sol) continue
+      if (needSlots && !emit({ a: 'slots', herb: slots.join(',') })) return
+      if (!emit({ a: 'rin', herb: areaId })) return
+      for (const act of sol.path) {
+        if (!emit(act)) break
+      }
+      return
+    }
+  }
+}
+
+function tryEmitAutoDuel(sim, nowSec, opts, actions, emit) {
+  if (!opts?.autoDuel || !sim.tech) return
+  const d = xsDay(nowSec)
+  const dfUsed = sim.df?.d === d ? Number(sim.df.n || 0) : 0
+  if (dfUsed >= FIGHT_DAILY || Number(sim.en || 0) < FIGHT_COST) return
+  if (actions.length >= opts.maxActionsPerBatch) return
+
+  const hasPendingWinTask =
+    sim.tk?.d === d &&
+    Array.isArray(sim.tk.list) &&
+    sim.tk.list.some((row) => Array.isArray(row) && !row[1] && TASK_KINDS[row[0]]?.[0] === 'win') &&
+    !(sim.tw?.d === d && Number(sim.tw.n || 0) >= 1)
+
+  const wonToday = new Set(sim.dd?.d === d && Array.isArray(sim.dd.w) ? sim.dd.w : [])
+  const npcEntries = Object.entries(NPC_FIGHT).sort((a, b) => a[1][1] - b[1][1])
+  const targets = [
+    ...npcEntries.filter(([id]) => !wonToday.has(id)).map(([id]) => id),
+    ...(hasPendingWinTask ? npcEntries.filter(([id]) => wonToday.has(id)).map(([id]) => id) : []),
+  ]
+  if (targets.length === 0) return
+
+  const curSlots = mySlots(sim)
+  const slotSets = buildCandidateSlotSets(sim)
+  const nextDfN = dfUsed + 1
+
+  for (const npcId of targets) {
+    const op = npcFighter(npcId)
+    if (!op) continue
+    const sd = hseed(d, npcId, nextDfN, sim.stone, sim.cv?.xp || 0)
+    for (const slots of slotSets) {
+      const needSlots = !sameSlotSet(slots, curSlots)
+      if (needSlots && actions.length + 2 > opts.maxActionsPerBatch) continue
+      const probe = structuredClone(sim)
+      if (needSlots) probe.sl = slots.slice()
+      const me = meFighter(probe)
+      if (!me?.sl) continue
+      const res = simulateCombat(me, op, sd)
+      if (res.w === 1) {
+        if (needSlots && !emit({ a: 'slots', herb: slots.join(',') })) return
+        emit({ a: 'ab', el: npcId })
+        return
+      }
+    }
+  }
 }
 
 /**
@@ -490,12 +1114,23 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     }
   }
 
+  if (!opts.autoRealm && rawXs.rlm && t - Number(rawXs.rlm.t || 0) < 6 * 3600) {
+    return {
+      enabled: true,
+      actions: [],
+      expectedSpendCoins: 0,
+      followUpSoon: false,
+      reason: 'manual-realm-in-progress',
+    }
+  }
+
   const sim = structuredClone(rawXs)
   xsTick(sim, t)
 
   const actions = []
   let truncatedByBatchCap = false
   let emittedStochastic = false
+  let handledMedInBreak = false
 
   const emit = (internalAct) => {
     if (actions.length >= opts.maxActionsPerBatch) {
@@ -540,6 +1175,17 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
         if (emit({ a: 'sit' })) continue
       } else if (t - Number(sim.med.t || 0) >= MED_MAX && !isHoldingMedShieldForBreak()) {
         if (emit({ a: 'rise' })) continue
+      }
+      if (sim.sp !== xsDay(t)) {
+        if (emit({ a: 'stipend' })) continue
+      }
+      const readyTaskIdx = findTurnInableSectTaskIndex(sim, t, opts)
+      if (readyTaskIdx >= 0) {
+        if (emit({ a: 'task', n: readyTaskIdx })) continue
+      }
+      const talkNpcId = findNextDailyTalkNpc(sim, t)
+      if (talkNpcId) {
+        if (emit({ a: 'talk', el: talkNpcId })) continue
       }
 
       // Water an existing dry growing plot if doing so keeps `>= COST.harvest` energy for the mature plot
@@ -856,6 +1502,84 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     emit({ a: 'equip', el: preferredTech })
   }
 
+  // 10b. Option 2 (Default ON): 0-en Sect & Mind dailies (`xsStipend`, claim safe `xsTask`, `xsTalk` <= 3/d, refresh `xsTasks`)
+  const todayDay = xsDay(t)
+  const hadTodayTasksInitially = sim.tk?.d === todayDay
+  if (sim.sp !== todayDay && actions.length < opts.maxActionsPerBatch) {
+    emit({ a: 'stipend' })
+  }
+  if (hadTodayTasksInitially) {
+    while (actions.length < opts.maxActionsPerBatch) {
+      const taskIdx = findTurnInableSectTaskIndex(sim, t, opts)
+      if (taskIdx < 0) break
+      if (!emit({ a: 'task', n: taskIdx })) break
+    }
+  }
+  while (actions.length < opts.maxActionsPerBatch) {
+    const npcId = findNextDailyTalkNpc(sim, t)
+    if (!npcId) break
+    if (!emit({ a: 'talk', el: npcId })) break
+  }
+
+  // 10c. Option 3 (Opt-in Gated): Social Chapters & Surplus Herb Gifts (`--xian-auto-social`)
+  if (opts.autoSocial) {
+    while (actions.length < opts.maxActionsPerBatch) {
+      const socialAct = findNextSocialAction(sim, t, opts)
+      if (!socialAct) break
+      if (!emit(socialAct)) break
+    }
+  }
+
+  // 10d. Option 3 (Opt-in Gated): Daily Fortune Events (`--xian-auto-events`)
+  if (opts.autoEvents && actions.length < opts.maxActionsPerBatch) {
+    const evAct = findNextEventAction(sim, t, opts)
+    if (evAct?.kind === 'evpick') {
+      emit(evAct.act)
+    } else if (evAct?.kind === 'evroll') {
+      if (emit(evAct.act)) emittedStochastic = true
+    }
+  }
+
+  // 10e. Option 3 (Opt-in Gated): Auto Realm Clearing & Deterministic Duels (`--xian-auto-realm`, `--xian-auto-duel`)
+  if (opts.autoRealm && actions.length < opts.maxActionsPerBatch) {
+    const realmOpenOrSurplus = Boolean(sim.rlm) ||
+      ((computeSurplusEnergy(sim, t) >= RLM_EN + 6 || sim.en >= 75) &&
+        sim.en - RLM_EN >= minReservedEnForRipeOrBrew())
+    if (realmOpenOrSurplus) {
+      tryEmitAutoRealm(sim, t, opts, actions, emit)
+    }
+  }
+
+  if (opts.autoDuel && actions.length < opts.maxActionsPerBatch) {
+    const hasPendingWinTask =
+      hadTodayTasksInitially &&
+      Array.isArray(sim.tk?.list) &&
+      sim.tk.list.some((row) => Array.isArray(row) && !row[1] && TASK_KINDS[row[0]]?.[0] === 'win') &&
+      !(sim.tw?.d === todayDay && Number(sim.tw.n || 0) >= 1)
+    const canDuelByEnergy =
+      sim.en - FIGHT_COST >= minReservedEnForRipeOrBrew() &&
+      (hasPendingWinTask
+        ? (computeSurplusEnergy(sim, t) >= FIGHT_COST || sim.en >= FIGHT_COST + 12)
+        : (computeSurplusEnergy(sim, t) >= FIGHT_COST + 16 && sim.en >= 45))
+    if (canDuelByEnergy) {
+      tryEmitAutoDuel(sim, t, opts, actions, emit)
+      if (hadTodayTasksInitially) {
+        while (actions.length < opts.maxActionsPerBatch) {
+          const taskIdx = findTurnInableSectTaskIndex(sim, t, opts)
+          if (taskIdx < 0) break
+          if (!emit({ a: 'task', n: taskIdx })) break
+        }
+      }
+    }
+  }
+
+  // Refresh today's sect tasks AFTER deterministic task claims (uses `rand()` -> triggers `followUpSoon`!)
+  if (sim.tk?.d !== todayDay && actions.length < opts.maxActionsPerBatch) {
+    if (emit({ a: 'tasks' })) {
+      emittedStochastic = true
+    }
+  }
+
   // 11. Tail Stochastic & Meditation Section (`xsBreak` shield -> `xsRise` -> `xsSit` / `xsFuse`)
   const allowBreak = shouldAllowBreakPolicy(sim, opts)
   const curR = Number(sim.cv?.r || 0)
@@ -872,6 +1596,7 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     // Case A: `cv.xp` is ALREADY full! Execute `xsBreak` BEFORE `xsRise` to shield in-flight `sim.med`!
     if (emit({ a: 'break' })) {
       emittedStochastic = true
+      handledMedInBreak = true
       if (sim.med && t - Number(sim.med.t || 0) >= MED_MIN + 5 && actions.length + 1 < opts.maxActionsPerBatch) {
         if (emit({ a: 'rise' })) emit({ a: 'sit' })
       } else if (!sim.med && actions.length < opts.maxActionsPerBatch) {
@@ -890,13 +1615,14 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     if (proj && proj.s >= 9 && proj.xp >= cvNeed(curR, 9)) {
       if (emit({ a: 'rise' }) && emit({ a: 'break' })) {
         emittedStochastic = true
+        handledMedInBreak = true
         if (actions.length < opts.maxActionsPerBatch) emit({ a: 'sit' })
       }
     }
   }
 
   // Normal 30-minute meditation cycle (continues even at `s=9` when break is deferred to build `>=1.43x` failure cushion!)
-  if (!emittedStochastic) {
+  if (!handledMedInBreak) {
     if (sim.med && t - Number(sim.med.t || 0) >= MED_MAX && actions.length + 1 <= opts.maxActionsPerBatch) {
       if (emit({ a: 'rise' }) && actions.length < opts.maxActionsPerBatch) {
         emit({ a: 'sit' })
@@ -933,7 +1659,7 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
   assertSafeXianBatch(actions, world, opts)
 
   // If cauldron was just started (`t - brew.t < BREW_READY_SEC`), don't force 3s followUp; wake at `brew.t + 19` instead!
-  const followUpSoon = Boolean(truncatedByBatchCap || emittedStochastic)
+  const followUpSoon = Boolean(truncatedByBatchCap || emittedStochastic || actions.length >= opts.maxActionsPerBatch)
   return {
     enabled: true,
     actions,
@@ -953,6 +1679,9 @@ export function computeNextXianWakeSec(world, nowSec = Number(world?.now || 0), 
   }
   if (rawXs.fight && t - Number(rawXs.fight.t || 0) < 1800) {
     return Math.min(t + 60, Number(rawXs.fight.t) + 1802)
+  }
+  if (!opts.autoRealm && rawXs.rlm && t - Number(rawXs.rlm.t || 0) < 6 * 3600) {
+    return Math.min(t + 120, Number(rawXs.rlm.t) + 6 * 3600 + 2)
   }
 
   // If actions are already executable right now, wake promptly (`t + 3s` > `GAP = 2.2s`).
@@ -1009,7 +1738,7 @@ export function computeNextXianWakeSec(world, nowSec = Number(world?.now || 0), 
       const curS = Number(sim.cv?.s || 1)
       for (let s = curS; s <= 9; s++) remXp += cvNeed(curR, s)
       remXp -= Number(sim.cv?.xp || 0)
-      const ratePerSec = (10 * rootMult(sim) * (sim.tech === 'ice' ? 1.2 : 1)) / 60
+      const ratePerSec = (10 * rootMult(sim) * (sim.tech === 'ice' ? 1.2 : 1) * medBonus(sim)) / 60
       if (remXp > 0 && ratePerSec > 0) {
         const secNeeded = Math.max(MED_MIN + 5, Math.ceil((remXp + 1) / ratePerSec))
         if (secNeeded < MED_MAX) {
@@ -1022,6 +1751,16 @@ export function computeNextXianWakeSec(world, nowSec = Number(world?.now || 0), 
 
   if (opts.autoFuse && Number(sim.fuseCd || 0) > t) {
     candidates.push(Number(sim.fuseCd) + 2)
+  }
+
+  if (opts.autoEvents) {
+    const d = xsDay(t)
+    const evUsed = sim.ev?.d === d ? Number(sim.ev.n || 0) : 0
+    const evLast = sim.ev?.d === d ? Number(sim.ev.last || 0) : 0
+    if (evUsed < EV_DAILY && evLast > 0) {
+      const nextEvAt = evLast + EV_GAP + 1
+      if (nextEvAt > t) candidates.push(nextEvAt)
+    }
   }
 
   if (dpUsedToday(sim, t) < PILL_DAILY && Number(sim.pills?.huiling || 0) > 0) {
