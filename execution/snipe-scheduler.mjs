@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import {
   computeStaticFarmStateDigest,
+  getManualArcadeStandbyInfo,
   normalizeUserConstraints,
 } from '../model/observations.mjs'
 import {
@@ -1189,6 +1190,7 @@ export class SnipeScheduler {
     userConstraints = {},
     stageWindowSec = null,
     postUnlockOffsetMs = 25,
+    arcadeStandbyOptions = {},
   }) {
     if (!this.isStealEnabled()) return { status: 'disabled-for-account' }
 
@@ -1259,6 +1261,21 @@ export class SnipeScheduler {
         reconcileUnknownWithFreshWorld(journal, adapter, liveWorld, {
           onReconciledVisitFn: (info) => this.recordReconciledVisit(info),
         })
+      }
+
+      const arcadeInfo = getManualArcadeStandbyInfo(
+        liveWorld,
+        httpClient?.estimatedServerNowSec?.() ?? liveWorld?.now,
+        arcadeStandbyOptions
+      )
+      if (arcadeInfo.active) {
+        return {
+          status: 'standby-manual-arcade',
+          targetId,
+          arcadeStandby: arcadeInfo,
+          world: liveWorld,
+          nextWakeSec: Math.min(Number(liveWorld.now || 0) + 5, arcadeInfo.resumeAtSec),
+        }
       }
 
       // Check steal quota occupation

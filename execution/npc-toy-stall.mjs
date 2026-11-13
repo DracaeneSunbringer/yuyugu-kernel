@@ -1,4 +1,4 @@
-import { sanitizeWorldSnapshot } from '../model/observations.mjs'
+import { getManualArcadeStandbyInfo, sanitizeWorldSnapshot } from '../model/observations.mjs'
 import { executeTransaction, reconcileUnknownWithFreshWorld, withAccountLock } from './reconcile.mjs'
 
 const DIRS = [[1, 0], [0, 1], [1, 1], [1, -1]]
@@ -366,6 +366,10 @@ export function computeNextNpcWakeSec(adapter, world, nowSec, npcOptions = { ena
   const npcG = w.state?.npcG
   const hasUnfinishedRealGame = Boolean(npcG && !npcG.p)
   if (hasUnfinishedRealGame || used < dailyCap) {
+    const arcadeInfo = getManualArcadeStandbyInfo(w, nowFloor, npcOptions?.arcadeStandbyOptions)
+    if (arcadeInfo.active) {
+      return Math.min(nowFloor + 5, arcadeInfo.resumeAtSec)
+    }
     return nowFloor + 2
   }
   if (typeof adapter.nextNaturalDayBoundary === 'function') {
@@ -426,6 +430,18 @@ export async function runNpcToyStallSlice({
     return { status: 'preempted-by-snipe', stage: 'before-lock' }
   }
 
+  const obsArcade = !dryRun
+    ? getManualArcadeStandbyInfo(observedWorld, estNowSec, npcOptions?.arcadeStandbyOptions)
+    : null
+  if (obsArcade?.active) {
+    return {
+      status: 'standby-manual-arcade',
+      stage: 'before-lock',
+      arcadeStandby: obsArcade,
+      nextNpcWakeSec: Math.min(estNowSec + 5, obsArcade.resumeAtSec),
+    }
+  }
+
   return withAccountLock(lockRootDir, account, async () => {
     if (typeof shouldAbortFn === 'function' && shouldAbortFn()) {
       return { status: 'preempted-by-snipe', stage: 'in-lock' }
@@ -448,6 +464,20 @@ export async function runNpcToyStallSlice({
           status: 'blocked-pending-unknown',
           remainingNonVisitUnknown: recOut.remainingNonVisitUnknown,
         }
+      }
+    }
+
+    const liveArcade = !dryRun
+      ? getManualArcadeStandbyInfo(liveWorld, httpClient.estimatedServerNowSec?.() ?? liveWorld.now, npcOptions?.arcadeStandbyOptions)
+      : null
+    if (liveArcade?.active) {
+      const refNow = Math.floor(Number(httpClient.estimatedServerNowSec?.() ?? liveWorld.now ?? 0))
+      return {
+        status: 'standby-manual-arcade',
+        stage: 'in-lock',
+        arcadeStandby: liveArcade,
+        worldAfter: liveWorld,
+        nextNpcWakeSec: Math.min(refNow + 5, liveArcade.resumeAtSec),
       }
     }
 

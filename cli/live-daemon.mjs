@@ -5,6 +5,7 @@ import { loadRulesAdapterFromFile } from '../model/rules-adapter.mjs'
 import {
   buildObservationEnvelope,
   computeStaticFarmStateDigest,
+  getManualArcadeStandbyInfo,
 } from '../model/observations.mjs'
 import { ContentAddressedJournal } from '../audit/journal.mjs'
 import { AsyncPlanManager } from '../execution/async-planner.mjs'
@@ -61,6 +62,7 @@ export async function runLiveAccountTick({
   maxTickSolveMs = 45000,
   xianOptions = {},
   npcOptions = { enabled: false },
+  arcadeStandbyOptions = {},
   dryRun = false,
 }) {
   const normalizedXian = normalizeXianOptions(xianOptions)
@@ -92,7 +94,19 @@ export async function runLiveAccountTick({
       userConstraints: baseUserConstraints,
       stageWindowSec: stageTriggerSec,
       postUnlockOffsetMs: 25,
+      arcadeStandbyOptions,
     })
+    if (stagedOut?.status === 'standby-manual-arcade') {
+      const nowArcSec = httpClient.estimatedServerNowSec()
+      const standbyInfo = stagedOut.arcadeStandby || getManualArcadeStandbyInfo(stagedOut.world, nowArcSec, arcadeStandbyOptions)
+      return {
+        phase: 'arcade-standby',
+        account,
+        arcadeStandby: standbyInfo,
+        stagedOut,
+        nextWakeSec: Number(stagedOut.nextWakeSec || Math.min(nowArcSec + 5, standbyInfo.resumeAtSec || (nowArcSec + 5))),
+      }
+    }
     return {
       phase: 'staged-snipe',
       account,
@@ -225,6 +239,7 @@ export async function runLiveAccountTick({
     snipeScheduler,
     rulesPath: effectiveRulesPath,
     deadlineAtMs: effectiveDeadlineAtMs,
+    arcadeStandbyOptions,
     shouldPreemptFn: () => {
       if (dryRun || !snipeScheduler?.isStealEnabled()) return null
       const curNext = snipeScheduler.nextExactUnlockInfo(httpClient.estimatedServerNowSec())
@@ -284,6 +299,23 @@ export async function runLiveAccountTick({
     }
   }
 
+  if (!dryRun && controllerOut?.status === 'standby-manual-arcade') {
+    const nowArcSec = httpClient.estimatedServerNowSec()
+    const standbyInfo = controllerOut.arcadeStandby || getManualArcadeStandbyInfo(
+      lastInLockWorld || controllerOut.world,
+      nowArcSec,
+      arcadeStandbyOptions
+    )
+    return {
+      phase: 'arcade-standby',
+      account,
+      controllerOut,
+      staminaReservation: stamRes,
+      arcadeStandby: standbyInfo,
+      nextWakeSec: Number(controllerOut.nextWakeSec || Math.min(nowArcSec + 5, standbyInfo.resumeAtSec || (nowArcSec + 5))),
+    }
+  }
+
   // If an exact snipe reached its physical staging lead right as controller finished, run staged snipe in the same tick
   const urgentAfterSolve = await runUrgentStagedSnipeIfImminent(
     controllerOut?.status === 'deferred-by-deadline' ? initialSnipeStageTriggerSec : 0
@@ -324,7 +356,7 @@ export async function runLiveAccountTick({
           adapter,
           lastInLockWorld || controllerOut.txResult?.worldAfter || controllerOut.world,
           nowAfterTxSec,
-          npcOptions
+          { ...npcOptions, arcadeStandbyOptions }
         )
         if (Number.isFinite(npcWakeAfterTx)) {
           confirmedWakeSec = Math.min(confirmedWakeSec, Math.max(nowAfterTxSec + 2, npcWakeAfterTx))
@@ -434,15 +466,29 @@ export async function runLiveAccountTick({
     }
 
     // C.5: Optional xs Xian Cultivation Slice (`--enable-xian`, default OFF; 100% isolated from main-island D-coins/stamina)
-    if (normalizedXian.enabled && !snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())) {
+    const isArcadeStandbyNow = (w = lastInLockWorld || controllerOut.world) =>
+      !dryRun && getManualArcadeStandbyInfo(w, httpClient.estimatedServerNowSec(), arcadeStandbyOptions).active
+
+    if (normalizedXian.enabled && !snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec()) && !isArcadeStandbyNow()) {
+      const xianHttpClient = Object.create(httpClient)
+      xianHttpClient.getJson = async (url, ...rest) => {
+        const data = await httpClient.getJson(url, ...rest)
+        if (url === '/api/pet/world' && data?.state) {
+          lastInLockWorld = data
+        }
+        return data
+      }
       const xianOut = await runXianCultivationSlice({
         account,
         adapter,
-        httpClient,
+        httpClient: xianHttpClient,
         journal,
         lockRootDir,
         observedWorld: lastInLockWorld || controllerOut.world || null,
-        shouldAbortFn: () => Boolean(snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())),
+        shouldAbortFn: () => Boolean(
+          snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec()) ||
+          isArcadeStandbyNow()
+        ),
         xianOptions: normalizedXian,
         dryRun,
       })
@@ -450,10 +496,30 @@ export async function runLiveAccountTick({
       if (xianOut?.status === 'confirmed' && xianOut.worldAfter) {
         lastInLockWorld = xianOut.worldAfter
       }
+      if (isArcadeStandbyNow()) {
+        const nowArcSec = httpClient.estimatedServerNowSec()
+        const standbyInfo = getManualArcadeStandbyInfo(lastInLockWorld || controllerOut.world, nowArcSec, arcadeStandbyOptions)
+        backgroundReport.xian = {
+          ...(xianOut || {}),
+          status: 'standby-manual-arcade',
+          reason: 'standby-manual-arcade',
+          arcadeStandby: standbyInfo,
+        }
+        return {
+          phase: 'arcade-standby',
+          account,
+          controllerOut,
+          staminaReservation: stamRes,
+          backgroundReport,
+          arcadeStandby: standbyInfo,
+          nextWakeSec: Math.min(nowArcSec + 5, standbyInfo.resumeAtSec || (nowArcSec + 5)),
+        }
+      }
     }
 
     // C.5b: Daily 52D Toy Stall Slice (`NPC.daily = 52`, `0` stamina, `0` D-coins, 10x Hard Gomoku `1.5×` + Card batches)
-    if (Boolean(npcOptions?.enabled) && !snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())) {
+    const npcSliceOptions = { ...npcOptions, arcadeStandbyOptions }
+    if (Boolean(npcOptions?.enabled) && !snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec()) && !isArcadeStandbyNow()) {
       const npcOut = await runNpcToyStallSlice({
         account,
         adapter,
@@ -461,18 +527,34 @@ export async function runLiveAccountTick({
         journal,
         lockRootDir,
         observedWorld: lastInLockWorld || controllerOut.world || null,
-        shouldAbortFn: () => Boolean(snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())),
-        npcOptions,
+        shouldAbortFn: () => Boolean(
+          snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec()) ||
+          isArcadeStandbyNow()
+        ),
+        npcOptions: npcSliceOptions,
         dryRun,
       })
       backgroundReport.npc = npcOut
-      if (npcOut?.status === 'confirmed' && npcOut.worldAfter) {
+      if (npcOut?.worldAfter) {
         lastInLockWorld = npcOut.worldAfter
+      }
+      if (!dryRun && (npcOut?.status === 'standby-manual-arcade' || isArcadeStandbyNow())) {
+        const nowArcSec = httpClient.estimatedServerNowSec()
+        const standbyInfo = npcOut?.arcadeStandby || getManualArcadeStandbyInfo(lastInLockWorld || controllerOut.world, nowArcSec, arcadeStandbyOptions)
+        return {
+          phase: 'arcade-standby',
+          account,
+          controllerOut,
+          staminaReservation: stamRes,
+          backgroundReport,
+          arcadeStandby: standbyInfo,
+          nextWakeSec: Number(npcOut?.nextNpcWakeSec || Math.min(nowArcSec + 5, standbyInfo.resumeAtSec || (nowArcSec + 5))),
+        }
       }
     }
 
     // C.6: Incremental Neighbor Discovery Slice (`main` only, `<= 2` pages, `<= 4` probes)
-    if (lastInLockWorld && snipeScheduler?.isStealEnabled() && !snipeScheduler.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())) {
+    if (lastInLockWorld && snipeScheduler?.isStealEnabled() && !snipeScheduler.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec()) && !isArcadeStandbyNow()) {
       backgroundReport.discovery = await snipeScheduler.runIncrementalDiscoverySlice(adapter, httpClient, lastInLockWorld, {
         maxPages: 2,
         maxProbes: 4,
@@ -505,7 +587,7 @@ export async function runLiveAccountTick({
   if (Boolean(npcOptions?.enabled) && !snipeScheduler?.shouldBlockBackgroundWork(nowEndSec)) {
     const npcWake = Number.isFinite(backgroundReport.npc?.nextNpcWakeSec)
       ? backgroundReport.npc.nextNpcWakeSec
-      : computeNextNpcWakeSec(adapter, lastInLockWorld || controllerOut.world, nowEndSec, npcOptions)
+      : computeNextNpcWakeSec(adapter, lastInLockWorld || controllerOut.world, nowEndSec, { ...npcOptions, arcadeStandbyOptions })
     if (Number.isFinite(npcWake)) {
       nextWakeSec = Math.min(nextWakeSec, Math.max(nowEndSec + 2, npcWake))
     }
@@ -638,6 +720,12 @@ if (isDirectMain) {
     const xianAutoDuel = hasFlag('--xian-auto-duel') || process.env.MEME_XIAN_AUTO_DUEL === '1'
     const xianAutoRealm = hasFlag('--xian-auto-realm') || process.env.MEME_XIAN_AUTO_REALM === '1'
     const npcOptions = { enabled: !hasFlag('--disable-npc') }
+    const arcadeStandbyEnabled = !hasFlag('--disable-arcade-standby') && process.env.MEME_DISABLE_ARCADE_STANDBY !== '1'
+    const arcadeStandbyTtlRaw = Number(getArg('--arcade-standby-ttl', process.env.MEME_ARCADE_STANDBY_TTL || '180'))
+    const arcadeStandbyOptions = {
+      enabled: arcadeStandbyEnabled,
+      ttlSec: Number.isFinite(arcadeStandbyTtlRaw) && arcadeStandbyTtlRaw >= 10 ? arcadeStandbyTtlRaw : 180,
+    }
     const xianOptions = normalizeXianOptions({
       enabled: enableXian,
       breakMode: xianBreakMode,
@@ -757,6 +845,7 @@ if (isDirectMain) {
         maxTickSolveMs,
         xianOptions,
         npcOptions,
+        arcadeStandbyOptions,
         dryRun,
       })
       await asyncPlanner.close()
@@ -817,6 +906,7 @@ if (isDirectMain) {
             maxTickSolveMs,
             xianOptions,
             npcOptions,
+            arcadeStandbyOptions,
             dryRun,
           })
           const nowSec = httpClient.estimatedServerNowSec()
@@ -867,8 +957,12 @@ if (isDirectMain) {
             : (npcRes?.status === 'rejected' || npcRes?.status === 'unknown' || npcRes?.status === 'blocked-pending-unknown')
               ? ` npc=${npcRes.status}`
               : ''
+          const arcRes = res.arcadeStandby
+          const arcTickTag = (res.phase === 'arcade-standby' || arcRes?.active)
+            ? ` arc=yield(${arcRes?.game || 'unknown'},rem=${arcRes?.remainingSec ?? '?'}s)`
+            : ''
           console.log(
-            `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${diagTag}${xianTickTag}${npcTickTag}${updateNotifier.inlineTag()}`
+            `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${diagTag}${xianTickTag}${npcTickTag}${arcTickTag}${updateNotifier.inlineTag()}`
           )
         } catch (err) {
           console.error(`[${new Date().toISOString()}] [LIVE:${account}:ERROR] ${err?.stack || err}`)

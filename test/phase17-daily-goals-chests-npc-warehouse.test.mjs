@@ -7,8 +7,10 @@ import { fileURLToPath } from 'node:url'
 import { loadRulesAdapterFromFile } from '../model/rules-adapter.mjs'
 import { buildObjectiveConfig } from '../model/objective.mjs'
 import {
+  DEFAULT_MANUAL_ARCADE_TTL_SEC,
   buildObservationEnvelope,
   computeStaticFarmStateDigest,
+  getManualArcadeStandbyInfo,
   isFarmDomainPassiveCompatible,
 } from '../model/observations.mjs'
 import { collectClaimableGoalActions, solveUnifiedPlan } from '../planner/solve.mjs'
@@ -582,4 +584,202 @@ test('Phase 17.4: B26 warehouse rework parity — availableInv excludes b12.vaul
     prices: wCapTest.prices,
   })
   assert.equal(simLv2.result.out[0]?.ok, true, 'Lv2 increases per-slot cap to 600')
+})
+
+test('Phase 17.5: Manual arcade standby (state.arc.cur) isolates PlanCache and yields all writes until arcEnd or 180s TTL', async () => {
+  const adapter = await loadRulesAdapterFromFile(RULES_PATH)
+  const R = adapter.R
+  const t0 = Math.floor(Date.UTC(2026, 10, 13, 6, 0, 0) / 1000)
+  const wBase = adapter.cloneWorld({
+    now: t0,
+    clockStart: t0 - 86400,
+    rev: 100,
+    coins: 0,
+    prices: makePrices(adapter, t0),
+    state: {
+      ...R.newWorld(t0),
+      en: 0,
+      enT: t0,
+      enDay: R.isleDay(t0),
+      day: R.worldDay(t0),
+      inv: {},
+      plots: [],
+      barn: [],
+      traps: [],
+      b12: { v: 1, lv: 0, xp: 0, rep: 0, ord: null, vault: {}, auto: 0, ordDone: 0, ordDay: '' },
+      b26: { v: 1, lv: 1, order: {}, alert: {}, sold: [] },
+      cnt: { npc: 52, gomokuPaid: 10, goal0: 1, goal1: 1, goal2: 1, goal3: 1, goal4: 1 },
+      arc: { day: R.worldDay(t0), cnt: {}, best: {}, db: {}, cur: null },
+      xs: { st: 'qi1', lv: 1, exp: 0, mp: 50, maxMp: 50, hp: 100, maxHp: 100, qi: 10, bag: {}, eq: {}, realm: null, cd: 0 },
+    },
+  })
+
+  // 1) Standby TTL helpers
+  assert.equal(DEFAULT_MANUAL_ARCADE_TTL_SEC, 180)
+  const wDuringArc = adapter.cloneWorld(wBase)
+  wDuringArc.rev = 101
+  wDuringArc.state.arc = {
+    day: R.worldDay(t0),
+    cnt: { bounce: 1 },
+    best: {},
+    db: {},
+    cur: { g: 'bounce', seed: 987654, t: t0 - 25 },
+  }
+  wDuringArc.state.b9Rank = { bounce: 120 }
+
+  const activeInfo = getManualArcadeStandbyInfo(wDuringArc, t0)
+  assert.equal(activeInfo.active, true)
+  assert.equal(activeInfo.game, 'bounce')
+  assert.equal(activeInfo.elapsedSec, 25)
+  assert.equal(activeInfo.remainingSec, 155)
+  assert.equal(activeInfo.resumeAtSec, t0 - 25 + 180)
+
+  const escExpiredInfo = getManualArcadeStandbyInfo(wDuringArc, t0 - 25 + 180)
+  assert.equal(escExpiredInfo.active, false)
+  assert.equal(escExpiredInfo.remainingSec, 0)
+
+  const disabledInfo = getManualArcadeStandbyInfo(wDuringArc, t0, { enabled: false })
+  assert.equal(disabledInfo.active, false)
+
+  // 2) Static farm digest & PlanCache invariance across state.arc / state.b9Rank mutations
+  assert.equal(computeStaticFarmStateDigest(wDuringArc), computeStaticFarmStateDigest(wBase))
+  assert.equal(isFarmDomainPassiveCompatible(adapter, wBase, wDuringArc), true)
+  const wFarmMut = adapter.cloneWorld(wDuringArc)
+  wFarmMut.rev = 102
+  wFarmMut.state.inv.tomato = [3, 0, 0]
+  assert.equal(isFarmDomainPassiveCompatible(adapter, wBase, wFarmMut), false)
+
+  // 3) Live daemon tick standby while arc.cur active -> browser arcEnd succeeds with zero 409 -> immediate resume
+  const tempRoot = makeTempDir('p17-arc-')
+  try {
+    let serverNow = t0
+    let serverWorld = adapter.cloneWorld(wDuringArc)
+    serverWorld.state.cnt.npc = 0
+    serverWorld.state.cnt.gomokuPaid = 0
+    const postPaths = []
+
+    const makeMockHttpClient = () => ({
+      stats: { getCount: 0, postCount: 0 },
+      nowMsFn: () => serverNow * 1000,
+      estimatedServerNowSec: () => serverNow,
+      estimatedServerNowMs: () => serverNow * 1000,
+      sleepMsFn: async () => {},
+      async getJson(url) {
+        this.stats.getCount++
+        if (url === '/api/pet/world') return adapter.cloneWorld(serverWorld)
+        if (url === '/api/pet/battle/gear') return { ok: true, items: [], equipped: {}, points: 0 }
+        return { ok: true }
+      },
+      async postJson(url, body) {
+        this.stats.postCount++
+        postPaths.push({ url, rev: body?.rev })
+        if (url === '/api/pet/world/act' && Number(body?.rev) !== Number(serverWorld.rev)) {
+          return { ok: false, status: 409, networkError: false, body: { error: 'world_conflict' } }
+        }
+        serverWorld.rev += 1
+        return { ok: true, status: 200, networkError: false, body: { ok: true, world: adapter.cloneWorld(serverWorld) } }
+      },
+    })
+
+    const http1 = makeMockHttpClient()
+    const journal1 = new ContentAddressedJournal({ rootDir: path.join(tempRoot, 'j1') })
+    const runtime1 = { lastPetCareAtSec: t0, lastBattlePrepAtSec: t0, lastHuancaiCheckAtSec: t0, arenaRemaining: 0 }
+    const tick1 = await runLiveAccountTick({
+      account: 'main',
+      adapter,
+      httpClient: http1,
+      journal: journal1,
+      snipeScheduler: null,
+      lockRootDir: path.join(tempRoot, 'locks1'),
+      profileStorePath: path.join(tempRoot, 'profiles1.json'),
+      runtimeState: runtime1,
+      xianOptions: { enabled: true },
+      npcOptions: { enabled: true },
+    })
+    assert.equal(tick1.phase, 'arcade-standby')
+    assert.equal(tick1.arcadeStandby.active, true)
+    assert.equal(tick1.arcadeStandby.game, 'bounce')
+    assert.ok(tick1.nextWakeSec <= t0 + 5)
+    assert.equal(postPaths.length, 0, 'daemon must emit ZERO POSTs while manual arcade session is active')
+
+    // Browser sends arcEnd with captured pre-end rev (101) -> no 409!
+    assert.equal(serverWorld.rev, 101)
+    serverWorld.state.arc.cur = null
+    serverWorld.state.b9Rank = { bounce: 450 }
+    serverWorld.rev = 102
+    serverNow += 6
+
+    const tick2 = await runLiveAccountTick({
+      account: 'main',
+      adapter,
+      httpClient: http1,
+      journal: journal1,
+      snipeScheduler: null,
+      lockRootDir: path.join(tempRoot, 'locks1'),
+      profileStorePath: path.join(tempRoot, 'profiles1.json'),
+      runtimeState: runtime1,
+      xianOptions: { enabled: false },
+      npcOptions: { enabled: true },
+    })
+    assert.notEqual(tick2.phase, 'arcade-standby', 'clearing arc.cur resumes daemon immediately without waiting 180s')
+    assert.ok(postPaths.some((p) => p.url === '/api/pet/world/act'), 'resumed tick executes normal pending work (NPC/farm)')
+
+    // 4) Mid-Phase-C xian abort when arcStart occurs after Phase B finishes
+    let getSeq = 0
+    const postPathsMid = []
+    serverWorld = adapter.cloneWorld(wBase)
+    serverWorld.now = serverNow
+    serverWorld.state.enT = serverNow
+    serverWorld.state.cnt.npc = 0
+    serverWorld.state.cnt.gomokuPaid = 0
+
+    const http2 = {
+      stats: { getCount: 0, postCount: 0 },
+      nowMsFn: () => serverNow * 1000,
+      estimatedServerNowSec: () => serverNow,
+      estimatedServerNowMs: () => serverNow * 1000,
+      sleepMsFn: async () => {},
+      async getJson(url) {
+        this.stats.getCount++
+        if (url === '/api/pet/world') {
+          getSeq++
+          const wSnap = adapter.cloneWorld(serverWorld)
+          if (getSeq >= 2) {
+            wSnap.state.arc = {
+              day: R.worldDay(serverNow),
+              cnt: { bowl: 1 },
+              best: {},
+              db: {},
+              cur: { g: 'bowl', seed: 555, t: serverNow },
+            }
+            wSnap.rev = serverWorld.rev + 1
+          }
+          return wSnap
+        }
+        return { ok: true }
+      },
+      async postJson(url, body) {
+        this.stats.postCount++
+        postPathsMid.push({ url, rev: body?.rev })
+        return { ok: false, status: 409, networkError: false, body: { error: 'unexpected_post_during_arcade' } }
+      },
+    }
+    const tickMid = await runLiveAccountTick({
+      account: 'main',
+      adapter,
+      httpClient: http2,
+      journal: new ContentAddressedJournal({ rootDir: path.join(tempRoot, 'j2') }),
+      snipeScheduler: null,
+      lockRootDir: path.join(tempRoot, 'locks2'),
+      profileStorePath: path.join(tempRoot, 'profiles2.json'),
+      runtimeState: { lastPetCareAtSec: serverNow, lastBattlePrepAtSec: serverNow, lastHuancaiCheckAtSec: serverNow, arenaRemaining: 0 },
+      xianOptions: { enabled: true },
+      npcOptions: { enabled: true },
+    })
+    assert.equal(tickMid.phase, 'arcade-standby')
+    assert.equal(tickMid.arcadeStandby.game, 'bowl')
+    assert.equal(postPathsMid.length, 0, 'mid-Phase-C arcStart aborts xian and skips npc with ZERO POSTs')
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
 })

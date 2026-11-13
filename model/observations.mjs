@@ -157,7 +157,7 @@ export function computeConstraintsHash(constraints) {
   return crypto.createHash('sha256').update(JSON.stringify(constraints), 'utf8').digest('hex')
 }
 
-const NON_STATIC_FARM_STATE_KEYS = new Set(['xs', 'npcG', 'log', 'en', 'enT', 'enDay'])
+const NON_STATIC_FARM_STATE_KEYS = new Set(['xs', 'npcG', 'arc', 'b9Rank', 'log', 'en', 'enT', 'enDay'])
 const NON_FARM_CNT_KEYS = new Set(['npc', 'npcWin', 'gomokuPaid'])
 
 function canonicalizeForDigest(val) {
@@ -258,7 +258,13 @@ export function isFarmDomainPassiveCompatible(adapter, baseWorld, liveWorld, {
       })
       const baseNpc = JSON.stringify(canonicalizeForDigest(extractNpcMeta(baseWorld)))
       const liveNpc = JSON.stringify(canonicalizeForDigest(extractNpcMeta(liveWorld)))
-      if (baseXs === liveXs && baseNpc === liveNpc) return false
+      const extractArcMeta = (w) => ({
+        arc: w?.state?.arc ?? null,
+        b9Rank: w?.state?.b9Rank ?? null,
+      })
+      const baseArc = JSON.stringify(canonicalizeForDigest(extractArcMeta(baseWorld)))
+      const liveArc = JSON.stringify(canonicalizeForDigest(extractArcMeta(liveWorld)))
+      if (baseXs === liveXs && baseNpc === liveNpc && baseArc === liveArc) return false
     }
   }
 
@@ -280,6 +286,60 @@ export function isFarmDomainPassiveCompatible(adapter, baseWorld, liveWorld, {
     return false
   }
   return true
+}
+
+export const DEFAULT_MANUAL_ARCADE_TTL_SEC = 180
+
+/**
+ * Checks whether the player has an active in-progress manual arcade session
+ * (`state.arc.cur = { g, seed, t }`) in `🎪 游乐馆` (`bounce` / `pool` / `bowl`).
+ *
+ * Because `/isle-arcade.js` submits `{ a: 'arcEnd', g, shots }` using the stale `world.rev`
+ * captured before/at `arcStart` without auto-retrying HTTP `409 world_conflict`, any background
+ * write during gameplay discards the manual run. Yielding until `arcEnd` clears `arc.cur`
+ * (or until `startedAtSec + ttlSec` if exited via Esc) avoids interfering with user play.
+ */
+export function getManualArcadeStandbyInfo(world, nowSec = null, options = {}) {
+  const ttlSec = Math.max(10, Number(options?.ttlSec ?? DEFAULT_MANUAL_ARCADE_TTL_SEC) || DEFAULT_MANUAL_ARCADE_TTL_SEC)
+  if (options?.enabled === false || !world?.state) {
+    return {
+      active: false,
+      game: null,
+      startedAtSec: 0,
+      elapsedSec: 0,
+      remainingSec: 0,
+      resumeAtSec: 0,
+      ttlSec,
+    }
+  }
+  const cur = world.state?.arc?.cur
+  const startedAtSec = Math.floor(Number(cur?.t || 0))
+  if (!cur || typeof cur !== 'object' || startedAtSec <= 0) {
+    return {
+      active: false,
+      game: null,
+      startedAtSec: 0,
+      elapsedSec: 0,
+      remainingSec: 0,
+      resumeAtSec: 0,
+      ttlSec,
+    }
+  }
+  const refNowSec = Math.floor(Number(nowSec ?? world.now ?? startedAtSec) || startedAtSec)
+  const elapsedSec = Math.max(0, refNowSec - startedAtSec)
+  const resumeAtSec = startedAtSec + ttlSec
+  const remainingSec = Math.max(0, resumeAtSec - refNowSec)
+  const active = refNowSec < resumeAtSec
+  const game = typeof cur.g === 'string' && cur.g ? cur.g : 'unknown'
+  return {
+    active,
+    game,
+    startedAtSec,
+    elapsedSec,
+    remainingSec,
+    resumeAtSec,
+    ttlSec,
+  }
 }
 
 /**

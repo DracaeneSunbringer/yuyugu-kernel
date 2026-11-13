@@ -6,6 +6,7 @@ import { loadRulesAdapterFromFile } from '../model/rules-adapter.mjs'
 import {
   buildObservationEnvelope,
   computeStaticFarmStateDigest,
+  getManualArcadeStandbyInfo,
   isFarmDomainPassiveCompatible,
 } from '../model/observations.mjs'
 import { buildObjectiveConfig } from '../model/objective.mjs'
@@ -79,6 +80,7 @@ export async function runControllerStep({
   deadlineAtMs = Infinity,
   shouldPreemptFn = null,
   maxCachedPlanDriftSec = Infinity,
+  arcadeStandbyOptions = {},
   nowMsFn = Date.now,
   dryRun = false,
 }) {
@@ -103,6 +105,18 @@ export async function runControllerStep({
     pw.state.en = Math.max(0, Number(pw.state?.en || 0) - Number(reconcileSummary.inFlightVisitEnergyReserved || 0))
     pw.coins = Math.max(0, Number(pw.coins || 0) - Number(reconcileSummary.inFlightVisitFineReserved || 0))
     return pw
+  }
+
+  const checkArcadeStandby = (w) => {
+    const info = getManualArcadeStandbyInfo(w, w?.now ?? null, arcadeStandbyOptions)
+    if (!info.active) return null
+    return {
+      status: 'standby-manual-arcade',
+      account,
+      world: w,
+      arcadeStandby: info,
+      nextWakeSec: Math.min(Number(w?.now || 0) + 5, info.resumeAtSec),
+    }
   }
 
   const commitCompiledPlan = async ({
@@ -432,6 +446,11 @@ export async function runControllerStep({
       adapter.syncClock(rawWorld.clockStart)
     }
 
+    const preSolveArcade = !dryRun ? checkArcadeStandby(rawWorld) : null
+    if (preSolveArcade) {
+      return preSolveArcade
+    }
+
     const planningWorld = applyUnknownReservations(rawWorld, preReconcile)
     const curIsleIdx = adapter.R.isleIndex(rawWorld.now)
     const stealUsedOrReserved = journal ? journal.countOccupiedBudget('steal', curIsleIdx) : 0
@@ -553,6 +572,11 @@ export async function runControllerStep({
         }
       }
 
+      const inLockArcade = !dryRun ? checkArcadeStandby(inLockWorld) : null
+      if (inLockArcade) {
+        return inLockArcade
+      }
+
       let reusedAcrossNonFarmRev = false
       if (Number(inLockWorld.rev) !== Number(rawWorld.rev)) {
         const bucket0 = plan.trunkBuckets?.[0]
@@ -634,6 +658,11 @@ export async function runControllerStep({
         }
       }
       planningWorld = applyUnknownReservations(rawWorld, reconcileSummary)
+    }
+
+    const syncArcade = !dryRun ? checkArcadeStandby(rawWorld) : null
+    if (syncArcade) {
+      return syncArcade
     }
 
     const curIsleIdx = adapter.R.isleIndex(rawWorld.now)
