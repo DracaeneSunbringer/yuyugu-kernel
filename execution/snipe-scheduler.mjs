@@ -77,18 +77,56 @@ export class SnipeScheduler {
     if (!rs || typeof rs !== 'object') {
       return this.activeRaidSchedule
     }
+    const nowRefSec = Number(world?.now ?? plan?.serverNow ?? rs?.createdAtSec ?? 0)
+    const incomingRaids = Array.isArray(rs.committedRaids) ? rs.committedRaids : []
+    if (rs.truncatedByDeadline && incomingRaids.length === 0 && this.activeRaidSchedule) {
+      const keptRaids = (this.activeRaidSchedule.committedRaids || []).filter(
+        (r) => Number(r?.unlockAtSec || 0) > nowRefSec - 2
+      )
+      const committedByTargetId = new Map()
+      const committedWavesByTargetId = new Map()
+      for (const cr of keptRaids) {
+        const tid = Number(cr?.targetId)
+        if (!Number.isFinite(tid)) continue
+        const list = committedWavesByTargetId.get(tid) || []
+        list.push(cr)
+        committedWavesByTargetId.set(tid, list)
+      }
+      for (const [tid, list] of committedWavesByTargetId.entries()) {
+        list.sort((a, b) => Number(a.unlockAtSec || 0) - Number(b.unlockAtSec || 0))
+        committedByTargetId.set(tid, list[0])
+      }
+      this.activeRaidSchedule = {
+        ...this.activeRaidSchedule,
+        committedByTargetId,
+        committedWavesByTargetId,
+        committedRaids: keptRaids,
+        needsRefresh: true,
+        refreshReason: 'previous-solve-truncated-by-deadline',
+      }
+      return this.activeRaidSchedule
+    }
+
     const evaluatedTargetSet = new Set((rs.evaluatedTargetIds || []).map(Number).filter(Number.isFinite))
     const committedByTargetId = new Map()
-    for (const cr of rs.committedRaids || []) {
+    const committedWavesByTargetId = new Map()
+    for (const cr of incomingRaids) {
       const tid = Number(cr?.targetId)
       if (Number.isFinite(tid)) {
-        committedByTargetId.set(tid, cr)
-        const key = String(tid)
-        if (this.data?.targets?.[key] && !cr.isImmediate) {
-          this.data.targets[key].plannedPrepActs = cr.plannedPrepActs || []
-          if (cr.numGearChanges != null) {
-            this.data.targets[key].numGearChanges = Number(cr.numGearChanges || 0)
-          }
+        const list = committedWavesByTargetId.get(tid) || []
+        list.push(cr)
+        committedWavesByTargetId.set(tid, list)
+      }
+    }
+    for (const [tid, list] of committedWavesByTargetId.entries()) {
+      list.sort((a, b) => Number(a.unlockAtSec || 0) - Number(b.unlockAtSec || 0))
+      const firstCr = list[0]
+      committedByTargetId.set(tid, firstCr)
+      const key = String(tid)
+      if (this.data?.targets?.[key] && !firstCr.isImmediate) {
+        this.data.targets[key].plannedPrepActs = firstCr.plannedPrepActs || []
+        if (firstCr.numGearChanges != null) {
+          this.data.targets[key].numGearChanges = Number(firstCr.numGearChanges || 0)
         }
       }
     }
@@ -98,7 +136,8 @@ export class SnipeScheduler {
       sourceFarmDigest: rs.sourceFarmDigest || (world ? computeStaticFarmStateDigest(world) : null),
       evaluatedTargetSet,
       committedByTargetId,
-      committedRaids: [...(rs.committedRaids || [])],
+      committedWavesByTargetId,
+      committedRaids: [...incomingRaids],
       needsRefresh: false,
       refreshReason: null,
     }
@@ -116,13 +155,14 @@ export class SnipeScheduler {
   _makeEvaluatorCacheKey(adapter, visitorWorld, constraints) {
     const now = Number(visitorWorld?.now || 0)
     const staticDigest = computeStaticFarmStateDigest(visitorWorld)
+    const prices = visitorWorld?.prices || {}
+    const priceSig = Object.keys(prices).sort().map((k) => `${k}:${prices[k]}`).join(',')
     return [
       adapter?.rulesHash || '',
       staticDigest,
       adapter?.R?.isleIndex ? adapter.R.isleIndex(now) : 0,
       adapter?.R?.worldDay ? adapter.R.worldDay(now) : '',
-      Math.floor(Number(visitorWorld?.state?.en || 0)),
-      Math.floor(Number(visitorWorld?.coins || 0)),
+      priceSig,
       Boolean(constraints?.allowThiefBuffPurchase ?? true),
       Number(constraints?.cashReserveFloor ?? 10),
     ].join('|')
@@ -175,7 +215,7 @@ export class SnipeScheduler {
   }
 
   computePhysicalPrepLeadSec(entry, adapter = null, httpClient = null) {
-    const rttSec = Math.max(0.4, Math.min(2.0, Number(httpClient?.lastRttMs || 600) / 1000))
+    const rttSec = Math.max(0.5, Math.min(2.0, Number(httpClient?.lastRttMs || 750) / 1000))
     const needPrepAct = (entry?.plannedPrepActs?.length || 0) > 0
     const gearSwaps = entry?.numGearChanges != null
       ? Math.max(0, Number(entry.numGearChanges || 0))
@@ -190,9 +230,13 @@ export class SnipeScheduler {
     const remVisitCdSec = (!needPrepAct && gearSwaps === 0)
       ? Math.max(0, Number(httpClient?.getRemainingBucketCooldownMs?.('POST', `/api/pet/world/visit/${entry?.id || 0}`) || 0) / 1000)
       : 0
-    const actPrepSec = needPrepAct ? (remActCdSec + minGapSec + 2 * rttSec) : 0
-    const gearPrepSec = gearSwaps > 0 ? (remEquipCdSec + gearSwaps * 1.3 + 2 * rttSec) : (entry?.guard ? rttSec : 0)
-    return actPrepSec + gearPrepSec + remVisitCdSec + rttSec + 0.5
+    const worldCheckSec = rttSec + 0.35
+    const actPrepSec = needPrepAct ? (remActCdSec + minGapSec + rttSec + 0.5) : 0
+    const perSwapSec = Math.max(1.25, rttSec + 0.35)
+    const gearPrepSec = gearSwaps > 0
+      ? (remEquipCdSec + rttSec + gearSwaps * perSwapSec + 0.6)
+      : (entry?.guard ? (rttSec + 0.5) : 0.2)
+    return worldCheckSec + actPrepSec + gearPrepSec + remVisitCdSec + 1.0
   }
 
   isStealEnabled() {
@@ -418,6 +462,24 @@ export class SnipeScheduler {
       }
     }
 
+    const buildBeliefSummary = (belief) => belief
+      ? {
+          targetId: idNum,
+          targetName: owner.name || String(idNum),
+          totalSpots: Number(belief.totalSpots || 0),
+          spotCounts: { ...(belief.spotCounts || {}) },
+          hasGuard: Boolean(belief.hasGuard),
+          ownerAlertId: belief.ownerAlertId || null,
+          winInterval: Array.isArray(belief.winInterval) ? [...belief.winInterval] : [1, 1],
+          lossInterval: Array.isArray(belief.lossInterval) ? [...belief.lossInterval] : [0, 0],
+          sampleCount: Number(belief.sampleCount || 0),
+          estimationSource: belief.estimationSource || (!belief.hasGuard ? 'no-guard-deterministic' : 'unobserved-wide-prior'),
+          tacticalDecision: belief.tacticalDecision || null,
+          optimalLoadout: belief.optimalLoadout || null,
+          numGearChanges: Number(belief.numGearChanges || 0),
+        }
+      : null
+
     const allUnlocks = [...futurePlots, ...futurePens].sort((a, b) => a.unlockAt - b.unlockAt)
     let upcomingEligible = false
     let expectedUnlockAt = null
@@ -429,23 +491,53 @@ export class SnipeScheduler {
     let chosenWaveBundle = readyEligible ? rawBundleNow : null
     let projectedScore = readyEligible ? nowEval.decisionScore : 0
     let projectedEnergyCost = readyEligible ? nowEval.neededEn : 0
+    const upcomingWaves = []
+    const waveBundlesByUnlock = new Map()
 
-    // Evaluate each distinct chronological unlock timestamp strictly at `u.unlockAt <= candT`
-    // (zero artificial `coalesceUnlockWindowSec` delay: snipes immediately at the earliest profitable unlock!)
+    // Enumerate up to `min(ownerLeft, 3)` chronological non-overlapping waves (`u.unlockAt <= candT`)
+    // for staggered neighbor batches (zero artificial delay inside any wave; Wave w+1 starts >= 15s after Wave w).
     if (ownerCanBeStolen && evaluator && allUnlocks.length > 0) {
       const candidateTimes = [...new Set(allUnlocks.map((u) => u.unlockAt))]
+      const maxWavesForOwner = Math.min(3, Math.max(1, Number.isFinite(ownerLeft) ? ownerLeft : 1))
+      const claimedPlotSet = new Set()
+      const claimedPenSet = new Set()
+      if (readyEligible) {
+        ;(visitData.isle?.plots || []).forEach((p, idx) => {
+          if (p?.steal) claimedPlotSet.add(idx)
+        })
+        ;(visitData.isle?.barn || []).forEach((p, idx) => {
+          if (p?.steal) claimedPenSet.add(idx)
+        })
+      }
+      let lastWaveUnlockAt = -Infinity
+
       for (const candT of candidateTimes) {
-        const plotSet = new Set(futurePlots.filter((u) => u.unlockAt <= candT).map((u) => u.idx))
-        const penSet = new Set(futurePens.filter((u) => u.unlockAt <= candT).map((u) => u.idx))
-        const waveItems = allUnlocks.filter((u) => u.unlockAt <= candT)
+        if (upcomingWaves.length >= maxWavesForOwner) break
+        if (upcomingWaves.length > 0 && candT < lastWaveUnlockAt + 15) continue
+
+        const plotSet = new Set(
+          futurePlots.filter((u) => u.unlockAt <= candT && !claimedPlotSet.has(u.idx)).map((u) => u.idx)
+        )
+        const penSet = new Set(
+          futurePens.filter((u) => u.unlockAt <= candT && !claimedPenSet.has(u.idx)).map((u) => u.idx)
+        )
+        const waveItems = allUnlocks.filter(
+          (u) => u.unlockAt <= candT && (u.matureAt !== undefined ? plotSet.has(u.idx) : penSet.has(u.idx))
+        )
         const waveExact = waveItems.length > 0 && waveItems.every((u) => u.exact)
 
-        const simPlots = (visitData.isle?.plots || []).map((p, idx) =>
-          (p && !p.steal && plotSet.has(idx)) ? { ...p, stage: 3, steal: true, stolen: 0 } : p
-        )
-        const simBarn = (visitData.isle?.barn || []).map((p, idx) =>
-          (p && !p.steal && penSet.has(idx)) ? { ...p, steal: true, stolen: 0 } : p
-        )
+        const simPlots = (visitData.isle?.plots || []).map((p, idx) => {
+          if (!p) return p
+          if (claimedPlotSet.has(idx)) return { ...p, steal: false }
+          if (!p.steal && plotSet.has(idx)) return { ...p, stage: 3, steal: true, stolen: 0 }
+          return p
+        })
+        const simBarn = (visitData.isle?.barn || []).map((p, idx) => {
+          if (!p) return p
+          if (claimedPenSet.has(idx)) return { ...p, steal: false }
+          if (!p.steal && penSet.has(idx)) return { ...p, steal: true, stolen: 0 }
+          return p
+        })
         const simBundle = {
           id: idNum,
           owner,
@@ -458,19 +550,43 @@ export class SnipeScheduler {
           waveEval.belief?.totalSpots >= this.minStealSpots &&
           waveEval.decisionScore > 0
         ) {
-          upcomingEligible = true
-          expectedUnlockAt = candT
-          exactUnlockKnown = waveExact
-          upcomingSpots = waveEval.belief.totalSpots
-          upcomingWaveBelief = waveEval.belief
-          upcomingWaveBundle = simBundle
-          if (!readyEligible) {
-            chosenEval = waveEval
-            chosenWaveBundle = simBundle
-            projectedScore = waveEval.decisionScore
-            projectedEnergyCost = waveEval.neededEn
+          const wSummary = buildBeliefSummary(waveEval.belief)
+          const waveRec = {
+            waveIndex: upcomingWaves.length,
+            unlockAt: candT,
+            exactUnlockKnown: waveExact,
+            upcomingSpots: waveEval.belief.totalSpots,
+            projectedScore: Math.round(waveEval.decisionScore),
+            projectedEnergyCost: waveEval.neededEn,
+            plannedPrepActs: waveEval.prepActs || [],
+            plannedBuffActs: waveEval.buffActs || [],
+            plannedStaminaPrepActs: waveEval.staminaPrepActs || [],
+            optimalLoadout: waveEval.optimalLoadout || posterior?.optimalLoadout || null,
+            numGearChanges: waveEval.numGearChanges ?? posterior?.numGearChanges ?? 0,
+            tacticalDecision: waveEval.tacticalDecision || posterior?.decision || null,
+            upcomingBeliefSummary: wSummary,
           }
-          break
+          upcomingWaves.push(waveRec)
+          waveBundlesByUnlock.set(candT, simBundle)
+          if (upcomingWaves.length === 1) {
+            upcomingEligible = true
+            expectedUnlockAt = candT
+            exactUnlockKnown = waveExact
+            upcomingSpots = waveEval.belief.totalSpots
+            upcomingWaveBelief = waveEval.belief
+            upcomingWaveBundle = simBundle
+            if (!readyEligible) {
+              chosenEval = waveEval
+              chosenWaveBundle = simBundle
+              projectedScore = waveEval.decisionScore
+              projectedEnergyCost = waveEval.neededEn
+            }
+          }
+          for (const idx of plotSet) claimedPlotSet.add(idx)
+          for (const idx of penSet) claimedPenSet.add(idx)
+          ;(visitData.isle?.plots || []).forEach((p, idx) => { if (p?.steal) claimedPlotSet.add(idx) })
+          ;(visitData.isle?.barn || []).forEach((p, idx) => { if (p?.steal) claimedPenSet.add(idx) })
+          lastWaveUnlockAt = candT
         }
       }
     }
@@ -503,23 +619,7 @@ export class SnipeScheduler {
       nextProbeAt = Math.max(nowSec + 120, allUnlocks[0].unlockAt)
     }
 
-    const upcomingBeliefSummary = upcomingWaveBelief
-      ? {
-          targetId: idNum,
-          targetName: owner.name || String(idNum),
-          totalSpots: Number(upcomingWaveBelief.totalSpots || 0),
-          spotCounts: { ...(upcomingWaveBelief.spotCounts || {}) },
-          hasGuard: Boolean(upcomingWaveBelief.hasGuard),
-          ownerAlertId: upcomingWaveBelief.ownerAlertId || null,
-          winInterval: Array.isArray(upcomingWaveBelief.winInterval) ? [...upcomingWaveBelief.winInterval] : [1, 1],
-          lossInterval: Array.isArray(upcomingWaveBelief.lossInterval) ? [...upcomingWaveBelief.lossInterval] : [0, 0],
-          sampleCount: Number(upcomingWaveBelief.sampleCount || 0),
-          estimationSource: upcomingWaveBelief.estimationSource || (!upcomingWaveBelief.hasGuard ? 'no-guard-deterministic' : 'unobserved-wide-prior'),
-          tacticalDecision: upcomingWaveBelief.tacticalDecision || null,
-          optimalLoadout: upcomingWaveBelief.optimalLoadout || null,
-          numGearChanges: Number(upcomingWaveBelief.numGearChanges || 0),
-        }
-      : null
+    const upcomingBeliefSummary = upcomingWaves[0]?.upcomingBeliefSummary || buildBeliefSummary(upcomingWaveBelief)
 
     const entry = {
       id: idNum,
@@ -527,12 +627,14 @@ export class SnipeScheduler {
       level: Number(owner.level || 1),
       guard: Boolean(owner.guard),
       newbie: Boolean(owner.newbie),
+      ownerLeft,
       readyEligible,
       stealableCount: stealableNow,
       upcomingEligible,
       upcomingSpots,
       expectedUnlockAt,
       exactUnlockKnown,
+      upcomingWaves,
       earliestMatureAt,
       nextProbeAt,
       blockedUntil,
@@ -562,6 +664,7 @@ export class SnipeScheduler {
       bundle: { id: idNum, owner, isle: visitData.isle, state: visitData.state, posterior },
       waveBundle: chosenWaveBundle,
       upcomingWaveBundle,
+      waveBundlesByUnlock,
       tacticalDecision: chosenEval?.tacticalDecision || posterior?.decision || null,
       gearData: effGearCtx.gearData || null,
       observedPanels: effGearCtx.observedPanels || null,
@@ -593,11 +696,72 @@ export class SnipeScheduler {
     return entry
   }
 
+  _advanceEntryToNextWave(entry, idNum, nowSec, { decOwnerLeft = false, completedUnlockAt = null } = {}) {
+    if (!entry) return false
+    if (decOwnerLeft && Number.isFinite(Number(entry.ownerLeft))) {
+      entry.ownerLeft = Math.max(0, Number(entry.ownerLeft) - 1)
+    }
+    const minNextUnlock = Math.max(nowSec + 6, completedUnlockAt != null ? Number(completedUnlockAt) + 10 : nowSec + 6)
+    const remWaves = (entry.upcomingWaves || []).filter((w) => Number(w?.unlockAt || 0) >= minNextUnlock)
+    entry.upcomingWaves = remWaves
+    if ((entry.ownerLeft == null || Number(entry.ownerLeft) > 0) && remWaves.length > 0) {
+      const nxt = remWaves[0]
+      entry.upcomingEligible = true
+      entry.expectedUnlockAt = Number(nxt.unlockAt)
+      entry.exactUnlockKnown = Boolean(nxt.exactUnlockKnown)
+      entry.upcomingSpots = Number(nxt.upcomingSpots || 0)
+      entry.projectedScore = Number(nxt.projectedScore || entry.projectedScore || 0)
+      entry.projectedEnergyCost = Number(nxt.projectedEnergyCost || entry.projectedEnergyCost || 6)
+      entry.plannedPrepActs = nxt.plannedPrepActs || []
+      entry.plannedBuffActs = nxt.plannedBuffActs || []
+      entry.plannedStaminaPrepActs = nxt.plannedStaminaPrepActs || []
+      entry.optimalLoadout = nxt.optimalLoadout || entry.optimalLoadout || null
+      entry.numGearChanges = nxt.numGearChanges ?? entry.numGearChanges ?? 0
+      entry.upcomingBeliefSummary = nxt.upcomingBeliefSummary || entry.upcomingBeliefSummary || null
+      entry.nextProbeAt = Math.max(nowSec + 10, Number(nxt.unlockAt) - 40)
+      const cached = this._liveVisitBundles.get(idNum)
+      if (cached) {
+        const nextWaveBundle = cached.waveBundlesByUnlock?.get(Number(nxt.unlockAt)) || null
+        cached.upcomingWaveBundle = nextWaveBundle
+        cached.waveBundle = nextWaveBundle || cached.waveBundle
+        cached.tacticalDecision = nxt.tacticalDecision || cached.tacticalDecision || null
+      }
+      if (this.activeRaidSchedule?.committedWavesByTargetId?.has(idNum)) {
+        const curList = (this.activeRaidSchedule.committedWavesByTargetId.get(idNum) || []).filter(
+          (r) => Number(r?.unlockAtSec || 0) >= minNextUnlock
+        )
+        if (curList.length > 0) {
+          this.activeRaidSchedule.committedWavesByTargetId.set(idNum, curList)
+          this.activeRaidSchedule.committedByTargetId.set(idNum, curList[0])
+        } else {
+          this.activeRaidSchedule.committedWavesByTargetId.delete(idNum)
+          this.activeRaidSchedule.committedByTargetId.delete(idNum)
+        }
+        this.activeRaidSchedule.committedRaids = (this.activeRaidSchedule.committedRaids || []).filter(
+          (r) => Number(r?.targetId) !== idNum || Number(r?.unlockAtSec || 0) >= minNextUnlock
+        )
+      }
+      return true
+    }
+    entry.upcomingEligible = false
+    entry.expectedUnlockAt = null
+    entry.exactUnlockKnown = false
+    entry.upcomingSpots = 0
+    if (this.activeRaidSchedule?.committedByTargetId?.has(idNum)) {
+      this.activeRaidSchedule.committedByTargetId.delete(idNum)
+      this.activeRaidSchedule.committedWavesByTargetId?.delete(idNum)
+      this.activeRaidSchedule.committedRaids = (this.activeRaidSchedule.committedRaids || []).filter(
+        (r) => Number(r?.targetId) !== idNum
+      )
+    }
+    return false
+  }
+
   /**
    * Immediately updates schedule & opponent profile store from a `POST /api/pet/world/visit/:id` receipt
    * (called inside `executeTransaction.onReceiptFn` BEFORE `fetchAfterWorldFn`!).
    */
-  recordSnipeReceipt(adapter, targetId, rawResp, nowSec, { visitorWorld = null } = {}) {
+  recordSnipeReceipt(adapter, targetId, rawResp, nowSec, { visitorWorld = null, sentAtServerMs = null } = {}) {
     if (!this.isStealEnabled()) return null
     const idNum = Number(targetId)
     const key = String(idNum)
@@ -623,39 +787,53 @@ export class SnipeScheduler {
     if (respRejected) {
       const status = rawResp?.httpStatus ?? rawResp?.status
       const errMsg = String(body?.error || body?.msg || '')
+      const prevExpectedUnlock = entry.expectedUnlockAt
+      const sentBeforeOrAtBoundary = prevExpectedUnlock != null && (
+        sentAtServerMs != null
+          ? sentAtServerMs < prevExpectedUnlock * 1000 + 250
+          : (body?.now != null ? Number(body.now) <= prevExpectedUnlock : nowSec <= prevExpectedUnlock)
+      )
       if (/上限|今天偷过|新手/.test(errMsg)) {
         entry.blockedUntil = adapter.nextNaturalDayBoundary(nowSec)
         entry.blockedReason = 'server-owner-or-daily-cap'
         entry.readyEligible = false
         entry.upcomingEligible = false
+        entry.upcomingWaves = []
       } else if (
         status === 409 &&
-        entry.expectedUnlockAt != null &&
-        Math.abs(nowSec - entry.expectedUnlockAt) <= 2 &&
+        prevExpectedUnlock != null &&
+        sentBeforeOrAtBoundary &&
+        Math.abs(nowSec - prevExpectedUnlock) <= 2 &&
         Number(entry.earlyRetryCount || 0) === 0
       ) {
-        // 1-second server clock boundary jitter: retry once `+1s` later instead of dropping the batch!
+        // True pre/on-boundary clock truncation jitter: retry once `+1s` later instead of dropping the batch!
         entry.earlyRetryCount = 1
-        entry.expectedUnlockAt = nowSec + 1
+        entry.expectedUnlockAt = Math.max(nowSec + 1, prevExpectedUnlock + 1)
         entry.readyEligible = false
       } else {
         entry.readyEligible = false
         entry.stealableCount = 0
         entry.cooldownUntil = nowSec + 90
-        if (entry.expectedUnlockAt != null && entry.expectedUnlockAt <= nowSec + 2) {
-          entry.upcomingEligible = false
-          entry.expectedUnlockAt = null
-          entry.exactUnlockKnown = false
+        if (prevExpectedUnlock != null && prevExpectedUnlock <= nowSec + 2) {
+          this._advanceEntryToNextWave(entry, idNum, nowSec, {
+            decOwnerLeft: false,
+            completedUnlockAt: prevExpectedUnlock,
+          })
         }
-        entry.nextProbeAt = Math.max(Number(entry.nextProbeAt || 0), nowSec + 90)
+        if (!entry.upcomingEligible) {
+          entry.nextProbeAt = Math.max(Number(entry.nextProbeAt || 0), nowSec + 90)
+        }
       }
       entry.updatedAt = nowSec
       this.data.targets[key] = entry
-      this._liveVisitBundles.delete(idNum)
-      if (this.activeRaidSchedule?.committedByTargetId?.has(idNum) && entry.expectedUnlockAt == null) {
-        this.activeRaidSchedule.committedByTargetId.delete(idNum)
-        this.activeRaidSchedule.needsRefresh = true
-        this.activeRaidSchedule.refreshReason = `committed-target-rejected:${idNum}`
+      if (!entry.upcomingEligible) {
+        this._liveVisitBundles.delete(idNum)
+        if (this.activeRaidSchedule?.committedByTargetId?.has(idNum)) {
+          this.activeRaidSchedule.committedByTargetId.delete(idNum)
+          this.activeRaidSchedule.committedWavesByTargetId?.delete(idNum)
+          this.activeRaidSchedule.needsRefresh = true
+          this.activeRaidSchedule.refreshReason = `committed-target-rejected:${idNum}`
+        }
       }
       this.save(nowSec)
       return entry
@@ -684,20 +862,19 @@ export class SnipeScheduler {
         })
       }
     } else if (outcome === 'win') {
+      const completedUnlock = entry.expectedUnlockAt
       entry.lossCount = 0
       entry.lastLossAtSec = 0
       entry.needsGuardLogSync = false
       entry.readyEligible = false
       entry.stealableCount = 0
-      if (entry.expectedUnlockAt != null && entry.expectedUnlockAt <= nowSec + 15) {
-        entry.upcomingEligible = false
-        entry.expectedUnlockAt = null
-        entry.exactUnlockKnown = false
-      }
-      entry.nextProbeAt = nowSec + 300
-      this._liveVisitBundles.delete(idNum)
-      if (this.activeRaidSchedule?.committedByTargetId?.has(idNum)) {
-        this.activeRaidSchedule.committedByTargetId.delete(idNum)
+      const hasMoreWaves = this._advanceEntryToNextWave(entry, idNum, nowSec, {
+        decOwnerLeft: true,
+        completedUnlockAt: completedUnlock != null && completedUnlock <= nowSec + 15 ? completedUnlock : nowSec,
+      })
+      if (!hasMoreWaves) {
+        entry.nextProbeAt = nowSec + 300
+        this._liveVisitBundles.delete(idNum)
       }
     } else {
       // Draw: spots remain on island, brief 4s cooldown before re-evaluating
@@ -899,37 +1076,54 @@ export class SnipeScheduler {
    */
   collectUpcomingTargetsForController(adapter, visitorWorld, {
     horizonSec = 3600,
-    maxUpcomingTargets = 6,
+    maxUpcomingTargets = 10,
   } = {}) {
     if (!this.isStealEnabled() || !visitorWorld) return []
     const nowSec = Number(visitorWorld.now || 0)
     const candidates = []
     for (const e of Object.values(this.data.targets || {})) {
       if (!e || this.isTargetBlocked(e, nowSec)) continue
-      if (e.readyEligible && !(Number(e.upcomingSpots || 0) > Number(e.stealableCount || 0))) continue
-      if (!e.upcomingEligible || e.expectedUnlockAt == null) continue
-      const unlockAtSec = Math.floor(Number(e.expectedUnlockAt))
-      const lead = unlockAtSec - nowSec
-      if (!(lead > 0 && lead <= horizonSec)) continue
-      if (Number(e.upcomingSpots || 0) < this.minStealSpots) continue
-
+      const waves = Array.isArray(e.upcomingWaves) && e.upcomingWaves.length > 0
+        ? e.upcomingWaves
+        : (e.upcomingEligible && e.expectedUnlockAt != null
+            ? [{
+                waveIndex: 0,
+                unlockAt: e.expectedUnlockAt,
+                exactUnlockKnown: e.exactUnlockKnown,
+                upcomingSpots: e.upcomingSpots,
+                projectedScore: e.projectedScore,
+                upcomingBeliefSummary: e.upcomingBeliefSummary,
+              }]
+            : [])
       const cached = this._liveVisitBundles.get(e.id)
-      const waveBundle = cached?.upcomingWaveBundle || cached?.waveBundle || null
-      const beliefSummary = e.upcomingBeliefSummary || null
-      if (!waveBundle && !beliefSummary) continue
+      for (const w of waves) {
+        if (w.waveIndex === 0 && e.readyEligible && !(Number(w.upcomingSpots || 0) > Number(e.stealableCount || 0))) {
+          continue
+        }
+        const unlockAtSec = Math.floor(Number(w.unlockAt || 0))
+        const lead = unlockAtSec - nowSec
+        if (!(lead > 0 && lead <= horizonSec)) continue
+        if (Number(w.upcomingSpots || 0) < this.minStealSpots) continue
+        const waveBundle = cached?.waveBundlesByUnlock?.get(unlockAtSec)
+          || (w.waveIndex === 0 ? (cached?.upcomingWaveBundle || cached?.waveBundle || null) : null)
+        const beliefSummary = w.upcomingBeliefSummary || e.upcomingBeliefSummary || null
+        if (!waveBundle && !beliefSummary) continue
 
-      candidates.push({
-        id: e.id,
-        targetId: e.id,
-        name: e.name || String(e.id),
-        unlockAtSec,
-        expectedUnlockAt: unlockAtSec,
-        exactUnlockKnown: Boolean(e.exactUnlockKnown),
-        upcomingSpots: Number(e.upcomingSpots || 0),
-        projectedScore: Number(e.projectedScore || 0),
-        waveBundle,
-        upcomingBeliefSummary: beliefSummary,
-      })
+        candidates.push({
+          id: e.id,
+          targetId: e.id,
+          name: e.name || String(e.id),
+          waveIndex: Number(w.waveIndex || 0),
+          ownerLeft: Number(e.ownerLeft ?? 1),
+          unlockAtSec,
+          expectedUnlockAt: unlockAtSec,
+          exactUnlockKnown: Boolean(w.exactUnlockKnown),
+          upcomingSpots: Number(w.upcomingSpots || 0),
+          projectedScore: Number(w.projectedScore || e.projectedScore || 0),
+          waveBundle,
+          upcomingBeliefSummary: beliefSummary,
+        })
+      }
     }
 
     return candidates
@@ -1279,10 +1473,15 @@ export class SnipeScheduler {
         liveWorld = prepTx.worldAfter || await fetchWorldFn()
       }
 
-      // Wait down to physical gear-swap lead (`gearSwaps * 1.3 + 2 * rtt + 0.5`) before acquiring gear lock!
-      const rttSec = Math.max(0.4, Math.min(2.0, Number(httpClient?.lastRttMs || 600) / 1000))
+      // Wait down to physical gear-swap lead (`remEquipCd + rtt + gearSwaps * perSwap + 1.1`) so `GET /battle/gear`,
+      // equip cooldowns, and durable journal reservation all finish BEFORE `T_unlock`!
+      const rttSec = Math.max(0.5, Math.min(2.0, Number(httpClient?.lastRttMs || 750) / 1000))
       const gearSwaps = precomputedDecision?.switchedSlots?.length ?? Number(entry.numGearChanges || (rawEntry.guard ? 2 : 0))
-      const gearLeadSec = (gearSwaps > 0 ? (gearSwaps * 1.3 + 2 * rttSec) : rttSec) + 0.5
+      const remEquipCdSec = gearSwaps > 0
+        ? Math.max(0, Number(httpClient?.getRemainingBucketCooldownMs?.('POST', '/api/pet/battle/equip') || 0) / 1000)
+        : 0
+      const perSwapSec = Math.max(1.25, rttSec + 0.35)
+      const gearLeadSec = (gearSwaps > 0 ? (remEquipCdSec + rttSec + gearSwaps * perSwapSec) : rttSec) + 1.1
       const preGearWaitMs = (unlockAt - gearLeadSec) * 1000 - httpClient.estimatedServerNowMs()
       if (preGearWaitMs > 0) {
         await httpClient.sleepMsFn(preGearWaitMs)
@@ -1291,6 +1490,7 @@ export class SnipeScheduler {
       // 3) Pre-equip cached tactical loadout inside `.battle-gear.<account>.lock` (`0` duplicate simulation!),
       //    sleep inside `waitBeforeSendFn` to `T_unlock + postUnlockOffsetMs`, and fire `POST /visit/:id`!
       const gearLockDir = this.gearLockRoot || lockRootDir
+      let visitSentServerMs = null
       const tacRes = await executeWithTacticalLoadout({
         accountKey: this.accountKey,
         lockRoot: gearLockDir,
@@ -1327,6 +1527,7 @@ export class SnipeScheduler {
               await httpClient.sleepUntilServerSec(unlockAt, postUnlockOffsetMs)
             },
             sendFn: async ({ operation }) => {
+              visitSentServerMs = httpClient.estimatedServerNowMs()
               const r = await httpClient.postJson(`/api/pet/world/visit/${targetId}`, {
                 operation,
                 kind: 'all',
@@ -1342,6 +1543,7 @@ export class SnipeScheduler {
             onReceiptFn: ({ rawResp }) => {
               this.recordSnipeReceipt(adapter, targetId, rawResp, Math.max(unlockAt, httpClient.estimatedServerNowSec()), {
                 visitorWorld: liveWorld,
+                sentAtServerMs: visitSentServerMs,
               })
             },
             fetchAfterWorldFn: fetchWorldFn,

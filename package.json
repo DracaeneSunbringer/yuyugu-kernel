@@ -1,6 +1,6 @@
 {
   "name": "yuyugu-unified-kernel",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "license": "MIT",
   "type": "module",
   "repository": "https://github.com/DracaeneSunbringer/yuyugu-kernel",
@@ -8,7 +8,7 @@
   "releaseNotes": {
     "date": "2026-11-13",
     "severity": "normal",
-    "summary": "统一出击执行契约与修仙状态域隔离（v1.4.3）：打通主规划器到 SnipeScheduler 的 committedRaids/evaluatedTargetIds 可执行契约与新发现重规划唤醒；合并当前可偷与即将解锁目标联合时域；消除随机守卫出击分数现金折算（fracCash），严格按离散结果分支评估；对齐独立反事实审计守卫平局/罚款/先验口径；解耦 xian（state.xs）对 world.rev 的主岛重算污染并保持提交层权威 rev 强校验",
+    "summary": "多波次偷菜时域统一、日记账增量尾索引与离散口粮连续性修复（v1.4.4）：统一多波次 upcomingWaves 调度与资源时序、修复解锁因果预留窗口与零偏移连续夹紧、引入日志字节尾偏移增量索引并消除热路径隐式 O(N) 扫描",
     "upgradeCommand": "git pull"
   },
   "engines": {

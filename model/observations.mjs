@@ -623,6 +623,7 @@ export function buildUpcomingVisitBelief(adapter, visitorWorld, upcomingTarget) 
     targetName: base.targetName || upcomingTarget.targetName || upcomingTarget.name || String(resolvedId ?? ''),
     unlockAtSec,
     exactUnlockKnown,
+    ...(upcomingTarget.ownerLeft != null ? { ownerLeft: Number(upcomingTarget.ownerLeft) } : {}),
   }
 }
 

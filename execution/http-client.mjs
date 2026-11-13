@@ -208,11 +208,14 @@ export class KernelHttpClient {
       }
     }
     this._lastClockSampleAtMs = respEndMs
-    // Never artificially bias above `0` when NTP-aligned (`0 in [offsetLoMs, offsetHiMs]`), and when skewed,
-    // use conservative lower bound `offsetLoMs` so `sleepUntilServerSec(unlockAt, +35ms)` NEVER fires early!
-    this.serverClockOffsetMs = (this._offsetLoMs <= 0 && 0 <= this._offsetHiMs)
-      ? 0
-      : this._offsetLoMs
+    // Continuous zero-offset clamping: when `0 in [offsetLoMs, offsetHiMs]` OR the nearest endpoint
+    // is within 120ms of zero (jitter tolerance), clamp to `0`; otherwise use nearest endpoint to 0.
+    if (this._offsetLoMs <= 0 && 0 <= this._offsetHiMs) {
+      this.serverClockOffsetMs = 0
+    } else {
+      const nearestToZero = 0 < this._offsetLoMs ? this._offsetLoMs : this._offsetHiMs
+      this.serverClockOffsetMs = Math.abs(nearestToZero) <= 120 ? 0 : nearestToZero
+    }
   }
 
   estimatedServerNowMs() {

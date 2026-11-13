@@ -14,6 +14,140 @@ export class ContentAddressedJournal {
     this.logPath = path.join(this.accountDir, 'events.jsonl')
     fs.mkdirSync(this.blobsDir, { recursive: true })
     fs.mkdirSync(this.rulesDir, { recursive: true })
+    this._resetIndex()
+  }
+
+  _resetIndex() {
+    this._idxByteOffset = 0
+    this._idxTxMap = new Map()
+    this._idxWaitDecisions = []
+    this._idxCorruptLines = 0
+    this._idxTotalLines = 0
+    this._idxStatusCounts = { confirmed: 0, rejected: 0, unknownOrSubmitted: 0 }
+    this._idxSalesByIsle = new Map()
+    this._idxSalesCountedOps = new Set()
+    this._idxPendingSaleOps = new Set()
+    this._idxSalesClockStart = undefined
+  }
+
+  _statusBucket(status) {
+    if (status === 'confirmed') return 'confirmed'
+    if (status === 'rejected') return 'rejected'
+    if (status === 'unknown' || status === 'submitted') return 'unknownOrSubmitted'
+    return null
+  }
+
+  _applyParsedEventToIndex(ev) {
+    if (!ev || typeof ev !== 'object') return
+    if (ev.recordType === 'wait-decision') {
+      this._idxWaitDecisions.push(ev)
+      return
+    }
+    if (!ev.operation) return
+    let prev = this._idxTxMap.get(ev.operation)
+    const oldBucket = prev ? this._statusBucket(prev.status) : null
+    if (!prev) {
+      prev = {
+        operation: ev.operation,
+        decisionId: ev.decisionId || null,
+        account: ev.account || this.account,
+        kind: ev.kind || 'act',
+        status: 'planned',
+        possibleIsleIndices: [],
+        history: [],
+      }
+    }
+    prev.history.push(ev)
+    if (ev.status) prev.status = ev.status
+    if (ev.decisionId) prev.decisionId = ev.decisionId
+    if (ev.kind) prev.kind = ev.kind
+    if (ev.rulesHash) prev.rulesHash = ev.rulesHash
+    if (ev.objectiveHash) prev.objectiveHash = ev.objectiveHash
+    if (ev.constraintsHash) prev.constraintsHash = ev.constraintsHash
+    if (ev.serverNow != null) prev.serverNow = ev.serverNow
+    if (ev.revBefore != null) prev.revBefore = ev.revBefore
+    if (ev.revAfter != null) prev.revAfter = ev.revAfter
+    if (ev.stateBeforeRef) prev.stateBeforeRef = ev.stateBeforeRef
+    if (ev.stateAfterRef !== undefined) prev.stateAfterRef = ev.stateAfterRef
+    if (ev.planRef) prev.planRef = ev.planRef
+    if (ev.envelopeRef) prev.envelopeRef = ev.envelopeRef
+    if (ev.objectiveCfgRef) prev.objectiveCfgRef = ev.objectiveCfgRef
+    if (ev.requestRef) prev.requestRef = ev.requestRef
+    if (ev.responseRef) prev.responseRef = ev.responseRef
+    if (ev.reconcileOutcome) prev.reconcileOutcome = ev.reconcileOutcome
+    if (ev.inferredVisitOutcome) prev.inferredVisitOutcome = ev.inferredVisitOutcome
+    if (ev.inferredCoinDelta != null) prev.inferredCoinDelta = ev.inferredCoinDelta
+    if (ev.budgetKind) prev.budgetKind = ev.budgetKind
+    if (Array.isArray(ev.possibleIsleIndices)) {
+      if (ev.status === 'confirmed' || ev.status === 'rejected') {
+        prev.possibleIsleIndices = [...new Set(ev.possibleIsleIndices)].sort((a, b) => a - b)
+      } else {
+        const merged = new Set([...(prev.possibleIsleIndices || []), ...ev.possibleIsleIndices])
+        prev.possibleIsleIndices = [...merged].sort((a, b) => a - b)
+      }
+    }
+    const newBucket = this._statusBucket(prev.status)
+    if (newBucket !== oldBucket) {
+      if (oldBucket) this._idxStatusCounts[oldBucket] -= 1
+      if (newBucket) this._idxStatusCounts[newBucket] += 1
+    }
+    this._idxTxMap.set(ev.operation, prev)
+    if (
+      prev.kind === 'act' &&
+      prev.status === 'confirmed' &&
+      prev.requestRef &&
+      !this._idxSalesCountedOps.has(ev.operation)
+    ) {
+      this._idxPendingSaleOps.add(ev.operation)
+    }
+  }
+
+  _syncIndexFromDisk() {
+    if (!fs.existsSync(this.logPath)) {
+      if (this._idxByteOffset > 0 || this._idxTotalLines > 0) this._resetIndex()
+      return
+    }
+    const st = fs.statSync(this.logPath)
+    if (st.size < this._idxByteOffset) {
+      this._resetIndex()
+    }
+    if (st.size === this._idxByteOffset) return
+
+    const len = st.size - this._idxByteOffset
+    const buf = Buffer.allocUnsafe(len)
+    const fd = fs.openSync(this.logPath, 'r')
+    let bytesRead = 0
+    try {
+      while (bytesRead < len) {
+        const n = fs.readSync(fd, buf, bytesRead, len - bytesRead, this._idxByteOffset + bytesRead)
+        if (n <= 0) break
+        bytesRead += n
+      }
+    } finally {
+      fs.closeSync(fd)
+    }
+    if (bytesRead <= 0) return
+
+    const view = bytesRead === len ? buf : buf.subarray(0, bytesRead)
+    const lastNlIdx = view.lastIndexOf(0x0a)
+    if (lastNlIdx < 0) {
+      // Wait for complete newline-terminated line in case of concurrent writer
+      return
+    }
+    const completeChunk = view.subarray(0, lastNlIdx + 1)
+    this._idxByteOffset += lastNlIdx + 1
+
+    const lines = completeChunk.toString('utf8').split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim()
+      if (!trimmed.length) continue
+      this._idxTotalLines++
+      try {
+        this._applyParsedEventToIndex(JSON.parse(trimmed))
+      } catch {
+        this._idxCorruptLines++
+      }
+    }
   }
 
   writeBlob(obj) {
@@ -84,73 +218,23 @@ export class ContentAddressedJournal {
   }
 
   /**
-   * Reconstructs exact latest transaction state per operation UUID:
+   * Reconstructs exact latest transaction state per operation UUID via O(delta) tail indexing:
    * planned -> reserved-and-durable -> submitted -> confirmed | rejected | unknown | aborted-before-send
    */
   reconstructTransactions() {
-    const { events, corruptLines, totalLines } = this.readAllEvents()
-    const txMap = new Map()
-    const waitDecisions = []
-
-    for (const ev of events) {
-      if (ev.recordType === 'wait-decision') {
-        waitDecisions.push(ev)
-        continue
-      }
-      if (!ev.operation) continue
-      const prev = txMap.get(ev.operation) || {
-        operation: ev.operation,
-        decisionId: ev.decisionId || null,
-        account: ev.account || this.account,
-        kind: ev.kind || 'act',
-        status: 'planned',
-        possibleIsleIndices: [],
-        history: [],
-      }
-      prev.history.push(ev)
-      if (ev.status) prev.status = ev.status
-      if (ev.decisionId) prev.decisionId = ev.decisionId
-      if (ev.kind) prev.kind = ev.kind
-      if (ev.rulesHash) prev.rulesHash = ev.rulesHash
-      if (ev.objectiveHash) prev.objectiveHash = ev.objectiveHash
-      if (ev.constraintsHash) prev.constraintsHash = ev.constraintsHash
-      if (ev.serverNow != null) prev.serverNow = ev.serverNow
-      if (ev.revBefore != null) prev.revBefore = ev.revBefore
-      if (ev.revAfter != null) prev.revAfter = ev.revAfter
-      if (ev.stateBeforeRef) prev.stateBeforeRef = ev.stateBeforeRef
-      if (ev.stateAfterRef !== undefined) prev.stateAfterRef = ev.stateAfterRef
-      if (ev.planRef) prev.planRef = ev.planRef
-      if (ev.envelopeRef) prev.envelopeRef = ev.envelopeRef
-      if (ev.objectiveCfgRef) prev.objectiveCfgRef = ev.objectiveCfgRef
-      if (ev.requestRef) prev.requestRef = ev.requestRef
-      if (ev.responseRef) prev.responseRef = ev.responseRef
-      if (ev.reconcileOutcome) prev.reconcileOutcome = ev.reconcileOutcome
-      if (ev.inferredVisitOutcome) prev.inferredVisitOutcome = ev.inferredVisitOutcome
-      if (ev.inferredCoinDelta != null) prev.inferredCoinDelta = ev.inferredCoinDelta
-      if (ev.budgetKind) prev.budgetKind = ev.budgetKind
-      if (Array.isArray(ev.possibleIsleIndices)) {
-        if (ev.status === 'confirmed' || ev.status === 'rejected') {
-          prev.possibleIsleIndices = [...new Set(ev.possibleIsleIndices)].sort((a, b) => a - b)
-        } else {
-          const merged = new Set([...(prev.possibleIsleIndices || []), ...ev.possibleIsleIndices])
-          prev.possibleIsleIndices = [...merged].sort((a, b) => a - b)
-        }
-      }
-      txMap.set(ev.operation, prev)
-    }
-
+    this._syncIndexFromDisk()
     return {
-      transactions: [...txMap.values()],
-      txMap,
-      waitDecisions,
+      transactions: [...this._idxTxMap.values()],
+      txMap: this._idxTxMap,
+      waitDecisions: this._idxWaitDecisions,
       coverage: {
-        totalLines,
-        corruptLines,
-        totalTransactions: txMap.size,
-        waitCount: waitDecisions.length,
-        confirmedCount: [...txMap.values()].filter((t) => t.status === 'confirmed').length,
-        rejectedCount: [...txMap.values()].filter((t) => t.status === 'rejected').length,
-        unknownCount: [...txMap.values()].filter((t) => t.status === 'unknown' || t.status === 'submitted').length,
+        totalLines: this._idxTotalLines,
+        corruptLines: this._idxCorruptLines,
+        totalTransactions: this._idxTxMap.size,
+        waitCount: this._idxWaitDecisions.length,
+        confirmedCount: this._idxStatusCounts.confirmed,
+        rejectedCount: this._idxStatusCounts.rejected,
+        unknownCount: this._idxStatusCounts.unknownOrSubmitted,
       },
     }
   }
@@ -161,9 +245,9 @@ export class ContentAddressedJournal {
    * `possibleIsleIndices` includes `isleIdx` (round2-design-review.md §1).
    */
   countOccupiedBudget(budgetKind, isleIdx) {
-    const { transactions } = this.reconstructTransactions()
+    this._syncIndexFromDisk()
     let used = 0
-    for (const tx of transactions) {
+    for (const tx of this._idxTxMap.values()) {
       if (tx.budgetKind !== budgetKind) continue
       if (tx.status === 'rejected' || tx.status === 'aborted-before-send') continue
       if (
@@ -181,29 +265,52 @@ export class ContentAddressedJournal {
     return used
   }
 
+  _accumulateSalesForTx(tx, adapter) {
+    if (!tx || tx.kind !== 'act' || tx.status !== 'confirmed' || !tx.requestRef) return
+    this._idxSalesCountedOps.add(tx.operation)
+    const req = this.readBlob(tx.requestRef)
+    const resp = tx.responseRef ? this.readBlob(tx.responseRef) : null
+    const actions = req?.actions || []
+    if (!Array.isArray(actions) || actions.length === 0) return
+    const isleIdx = tx.serverNow != null ? adapter.R.isleIndex(tx.serverNow) : (tx.possibleIsleIndices?.[0] ?? null)
+    if (isleIdx == null) return
+    const receiptRows = resp?.body?.out || resp?.out || null
+    actions.forEach((act, idx) => {
+      if (act?.a !== 'sell' || !act.id || !(Number(act.n) > 0)) return
+      if (Array.isArray(receiptRows) && receiptRows[idx] && receiptRows[idx].ok !== true) return
+      const row = this._idxSalesByIsle.get(isleIdx) || {}
+      row[act.id] = (row[act.id] || 0) + Number(act.n)
+      this._idxSalesByIsle.set(isleIdx, row)
+    })
+  }
+
   /**
    * Aggregates confirmed item sales per `isleIndex` from archived transaction requests/receipts
-   * so endogenous next-isle-day market depth impact (`-0.3 * sold / depth`) is tracked accurately.
+   * so endogenous next-isle-day market depth impact (`-0.3 * sold / depth`) can include self + partner sales.
    */
   sumConfirmedSalesByIsleIndex(adapter) {
-    const { transactions } = this.reconstructTransactions()
+    this._syncIndexFromDisk()
+    const curClockStart = adapter?.R?.WORLD?.clockStart ?? null
+    if (this._idxSalesClockStart !== curClockStart) {
+      this._idxSalesClockStart = curClockStart
+      this._idxSalesByIsle = new Map()
+      this._idxSalesCountedOps = new Set()
+      this._idxPendingSaleOps = new Set()
+      for (const tx of this._idxTxMap.values()) {
+        if (tx.kind === 'act' && tx.status === 'confirmed' && tx.requestRef) {
+          this._accumulateSalesForTx(tx, adapter)
+        }
+      }
+    } else if (this._idxPendingSaleOps.size > 0) {
+      for (const op of this._idxPendingSaleOps) {
+        const tx = this._idxTxMap.get(op)
+        if (tx) this._accumulateSalesForTx(tx, adapter)
+      }
+      this._idxPendingSaleOps.clear()
+    }
     const out = new Map()
-    for (const tx of transactions) {
-      if (tx.kind !== 'act' || tx.status !== 'confirmed' || !tx.requestRef) continue
-      const req = this.readBlob(tx.requestRef)
-      const resp = tx.responseRef ? this.readBlob(tx.responseRef) : null
-      const actions = req?.actions || []
-      if (!Array.isArray(actions) || actions.length === 0) continue
-      const isleIdx = tx.serverNow != null ? adapter.R.isleIndex(tx.serverNow) : (tx.possibleIsleIndices?.[0] ?? null)
-      if (isleIdx == null) continue
-      const receiptRows = resp?.body?.out || resp?.out || null
-      actions.forEach((act, idx) => {
-        if (act?.a !== 'sell' || !act.id || !(Number(act.n) > 0)) return
-        if (Array.isArray(receiptRows) && receiptRows[idx] && receiptRows[idx].ok !== true) return
-        const row = out.get(isleIdx) || {}
-        row[act.id] = (row[act.id] || 0) + Number(act.n)
-        out.set(isleIdx, row)
-      })
+    for (const [k, v] of this._idxSalesByIsle.entries()) {
+      out.set(k, { ...v })
     }
     return out
   }

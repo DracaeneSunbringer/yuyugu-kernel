@@ -200,8 +200,9 @@ test('Phase 6.3 (Codex Round-2 P1-3): Joint cash constraint between coffee (1500
   assert.equal(actsFunded.some((a) => a.a === 'bomb'), true)
   assert.ok(planFunded.quality.feasibleIncumbentValue > 45000, `Expected net profit above 45000 D initial coins, got ${planFunded.quality.feasibleIncumbentValue}`)
 
-  // Subcase C: Multi-unit low-star-first `eat` reachability (`2` `q=0` turnips at `+8 en` each = `+16 en`
-  // unlock `2` `6 en` bombs (`12 en` total) from `en = 0`, whereas 1-step lookahead would have eaten `q=2` (`+12 en`)!)
+  // Subcase C: Exact Bounded Discrete Ration DP & multi-unit reachability
+  // (a) With turnip [2, 0, 2], Exact Ration DP eats 1x turnip[q=2] (+12 en exact match for 2 bombs, 810 D),
+  // strictly outperforming 2x turnip[q=0] (+16 en with 4 en wasted, 1080 D) by +270 D.
   const wEat = makeWorld(adapter, t0, {
     coins: 0,
     state: {
@@ -219,9 +220,33 @@ test('Phase 6.3 (Codex Round-2 P1-3): Joint cash constraint between coffee (1500
   })
   const actsEat = planEat.trunkBuckets[0]?.domesticActions || []
   const eatActs = actsEat.filter((a) => a.a === 'eat')
-  assert.equal(eatActs.length, 2, `Expected 2 q=0 turnips eaten to reach 12 en for 2 bombs, got ${JSON.stringify(eatActs)}`)
-  assert.ok(eatActs.every((a) => a.id === 'turnip' && a.q === 0), `Must eat q=0 before q=2, got ${JSON.stringify(eatActs)}`)
+  assert.equal(eatActs.length, 1, `Expected 1 q=2 turnip (+12 en exact match), got ${JSON.stringify(eatActs)}`)
+  assert.equal(eatActs[0]?.id, 'turnip')
+  assert.equal(eatActs[0]?.q, 2)
   assert.equal(actsEat.filter((a) => a.a === 'bomb').length, 2)
+  assert.ok(Number(planEat.quality?.feasibleIncumbentValue) > 38600, `Expected exact DP value > 38600, got ${planEat.quality?.feasibleIncumbentValue}`)
+
+  // (b) Without q=2, multi-unit reachability eats 2x turnip[q=0] (+16 en) to unlock 2 bombs.
+  const wEatQ0 = makeWorld(adapter, t0, {
+    coins: 0,
+    state: {
+      en: 0,
+      enT: t0,
+      tools: { hoe: 1, can: 1, rod: 1, pick: 4, axe: 1 },
+      mine: { depth: 30, max: 30 },
+      inv: { turnip: [2, 0, 0], bomb: [2, 0, 0] },
+    },
+  })
+  const envEatQ0 = buildObservationEnvelope(adapter, { world: wEatQ0, account: 'main' })
+  const planEatQ0 = solveUnifiedPlan(adapter, envEatQ0, buildObjectiveConfig({ horizonSec: 300, terminalSupplyMode: 'zero' }), {
+    scenarios: [{ id: 'det', weight: 1, externalSupplyFactor: 1.0 }],
+    allowedActionTypes: ['eat', 'bomb', 'sell', 'wait'],
+  })
+  const actsEatQ0 = planEatQ0.trunkBuckets[0]?.domesticActions || []
+  const eatActsQ0 = actsEatQ0.filter((a) => a.a === 'eat')
+  assert.equal(eatActsQ0.length, 2, `Expected 2 q=0 turnips eaten to reach 12 en for 2 bombs, got ${JSON.stringify(eatActsQ0)}`)
+  assert.ok(eatActsQ0.every((a) => a.id === 'turnip' && a.q === 0), `Must eat q=0, got ${JSON.stringify(eatActsQ0)}`)
+  assert.equal(actsEatQ0.filter((a) => a.a === 'bomb').length, 2)
 })
 
 test('Phase 6.4 (Codex Round-3 P1): Unified Cargo-Edible stockBuy -> eat -> craft/work & per-copy dual-use split', async () => {
