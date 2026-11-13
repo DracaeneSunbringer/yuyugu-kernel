@@ -55,7 +55,7 @@ export async function buildAuditDecisionReport({
         exPostHindsightGap: null,
       }
     }
-    if (tx.kind === 'xian-act') {
+    if (tx.kind === 'xian-act' || tx.kind === 'npc-act') {
       const defect = ['model-drift', 'illegal-action-in-batch'].includes(replayResult.status)
       return {
         verdict: defect ? 'mechanical-or-conservation-defect' : 'ex-ante-consistent',

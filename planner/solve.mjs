@@ -39,6 +39,32 @@ function cloneInvSnap(snap) {
 }
 
 /**
+ * Collects all unclaimed daily goal actions (`k = 0..3`) plus the all-clear bonus (`k = 4`)
+ * whenever all four daily goals are already claimed or become claimed inside the same batch.
+ */
+export function collectClaimableGoalActions(R, naturalDay, state) {
+  if (!state || typeof R?.dailyGoals !== 'function') return []
+  const goals = R.dailyGoals(naturalDay, state)
+  const goalActs = []
+  const readyOrClaimed = [false, false, false, false]
+  for (let k = 0; k < 4; k++) {
+    const alreadyClaimed = Boolean(state.cnt?.['goal' + k])
+    if (alreadyClaimed) {
+      readyOrClaimed[k] = true
+      continue
+    }
+    if (goals[k] && Number(state.cnt?.[goals[k].id] || 0) >= goals[k].n) {
+      goalActs.push({ a: 'goal', k })
+      readyOrClaimed[k] = true
+    }
+  }
+  if (readyOrClaimed.every(Boolean) && !state.cnt?.goal4) {
+    goalActs.push({ a: 'goal', k: 4 })
+  }
+  return goalActs
+}
+
+/**
  * Dynamically discovers rule utility item IDs from `R` tables/initializers
  * with ZERO hardcoded item name strings anywhere in source code.
  */
@@ -3897,15 +3923,9 @@ function optimizeAndSimulateSequence(adapter, {
       }
     }
 
-    // 7. Claim any completed daily goals (0 stamina)
+    // 7. Claim any completed daily goals (0 stamina), including the `k = 4` all-clear bonus
     if (allowedSet.has('goal') && typeof R.dailyGoals === 'function') {
-      const goals = R.dailyGoals(b.naturalDay, probeWorld.state)
-      const goalActs = []
-      for (let k = 0; k < 4; k++) {
-        if (goals[k] && !probeWorld.state.cnt?.['goal' + k] && (probeWorld.state.cnt?.[goals[k].id] || 0) >= goals[k].n) {
-          goalActs.push({ a: 'goal', k })
-        }
-      }
+      const goalActs = collectClaimableGoalActions(R, b.naturalDay, probeWorld.state)
       if (goalActs.length > 0) {
         const svG = simulateValidBatch(adapter, probeWorld, goalActs, {
           t: b.atSec,
@@ -6788,15 +6808,9 @@ function optimizeAndSimulateSequence(adapter, {
         }
       }
 
-      // 3.5) Claim any newly completed daily goals (`0` stamina) before optimal multi-bucket `sell`
+      // 3.5) Claim any newly completed daily goals (`0` stamina), including `k = 4`, before optimal multi-bucket `sell`
       if (allowedSet.has('goal') && typeof R.dailyGoals === 'function') {
-        const goalsNow = R.dailyGoals(b.naturalDay, execWorld.state)
-        const goalActsNow = []
-        for (let k = 0; k < 4; k++) {
-          if (goalsNow[k] && !execWorld.state.cnt?.['goal' + k] && (execWorld.state.cnt?.[goalsNow[k].id] || 0) >= goalsNow[k].n) {
-            goalActsNow.push({ a: 'goal', k })
-          }
-        }
+        const goalActsNow = collectClaimableGoalActions(R, b.naturalDay, execWorld.state)
         if (goalActsNow.length > 0) pushAndSim(goalActsNow)
       }
 
@@ -6807,6 +6821,12 @@ function optimizeAndSimulateSequence(adapter, {
     //    while protecting any deferred rations reserved for committed future raids!
     if (allowedSet.has('sell') && !(forcedTrunkSellPolicy === 'hold-in-first-bucket' && u === 0 && L > 1)) {
       emitOptimalBucketSells(u, b, dynamicPrices, pushAndSim, activeRaidSchedEntry?.deferredEatReserve || null)
+    }
+
+    // 4.5) Re-check daily goals immediately after `sell` so newly satisfied `sold` targets (80k / 300k) + `goal4` claim in-batch
+    if (allowedSet.has('goal') && typeof R.dailyGoals === 'function') {
+      const postSellGoals = collectClaimableGoalActions(R, b.naturalDay, execWorld.state)
+      if (postSellGoals.length > 0) pushAndSim(postSellGoals)
     }
 
     finalBucketActions[u] = bucketActs

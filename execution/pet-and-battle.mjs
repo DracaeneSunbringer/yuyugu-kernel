@@ -267,6 +267,20 @@ export async function syncPetCareFirst(httpClient, {
 }
 
 /**
+ * Checks whether an account has an unopened daily arena chest on `GET /api/pet/battle/gear`'s `.daily` object.
+ */
+export function isDailyBattleChestReady(daily) {
+  if (!daily || typeof daily !== 'object') return false
+  const opened = Number(daily.chest ?? 0)
+  const max = Number(daily.chestMax ?? 5)
+  if (opened >= max) return false
+  if (daily.ready === true) return true
+  const need = Math.max(1, Number(daily.need ?? 3))
+  const earned = Number(daily.earned ?? Math.min(max, Math.floor(Number(daily.battles ?? 0) / need)))
+  return earned > opened
+}
+
+/**
  * Step 2 of Combat/Pet Causal Pipeline:
  * Syncs battle history + guard log profiles, opens ready daily chests, equips optimal resting defense gear,
  * and allocates free stat points (including newly earned level-up points + multi-pass breakpoint observation)
@@ -322,6 +336,19 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
 
     const st = readAccountGearState(accountKey, lockRoot)
     let gearSnap = await httpClient.getJson('/api/pet/battle/gear')
+
+    // Open all ready daily arena chests via live `gear.daily` + `POST /api/pet/battle/chest` `{}`
+    // BEFORE evaluating & equipping resting defense gear so dropped upgrades equip immediately!
+    const maxDailyChests = Math.max(0, Math.min(10, Number(gearSnap?.daily?.chestMax ?? 5)))
+    for (let step = 0; step < maxDailyChests && isDailyBattleChestReady(gearSnap?.daily); step++) {
+      const prevOpened = Number(gearSnap?.daily?.chest ?? 0)
+      const cr = await httpClient.postJson('/api/pet/battle/chest', {})
+      if (!cr.ok) break
+      const gotItemId = cr.body?.got?.item?.id || null
+      chestsOpened.push(gotItemId ? `daily:${prevOpened + 1}:${gotItemId}` : `daily:${prevOpened + 1}`)
+      gearSnap = cr.body?.catalog ? cr.body : await httpClient.getJson('/api/pet/battle/gear')
+      if (Number(gearSnap?.daily?.chest ?? prevOpened) <= prevOpened) break
+    }
     recordObservedPanel(st, gearSnap)
 
     // First equip optimal resting defense gear ( recovers any prior `dirty` state as well! )
@@ -515,6 +542,11 @@ export async function runSingleArenaBout(httpClient, {
     })
   }
 
+  const usedAfter = boutResp.ok ? usedToday + 1 : usedToday
+  const chestMilestoneReached = Boolean(
+    boutResp.ok && usedToday < 15 && Math.floor(usedAfter / 3) > Math.floor(usedToday / 3)
+  )
+
   return {
     status: boutResp.ok ? 'bout-completed' : 'bout-rejected',
     httpStatus: boutResp.status,
@@ -527,6 +559,7 @@ export async function runSingleArenaBout(httpClient, {
     result: boutResp.body?.result ?? boutResp.body?.battle?.result ?? null,
     coinsEarned: boutResp.body?.coins ?? boutResp.body?.reward?.coins ?? 0,
     newlyOpenedChests,
+    chestMilestoneReached,
     finishedAtMs,
   }
 }

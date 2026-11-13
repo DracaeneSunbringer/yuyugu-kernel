@@ -157,7 +157,8 @@ export function computeConstraintsHash(constraints) {
   return crypto.createHash('sha256').update(JSON.stringify(constraints), 'utf8').digest('hex')
 }
 
-const NON_STATIC_FARM_STATE_KEYS = new Set(['xs', 'en', 'enT', 'enDay'])
+const NON_STATIC_FARM_STATE_KEYS = new Set(['xs', 'npcG', 'log', 'en', 'enT', 'enDay'])
+const NON_FARM_CNT_KEYS = new Set(['npc', 'npcWin', 'gomokuPaid'])
 
 function canonicalizeForDigest(val) {
   if (val === null || typeof val !== 'object') return val
@@ -172,10 +173,23 @@ function canonicalizeForDigest(val) {
   return out
 }
 
+function canonicalizeStateCntForFarmDigest(cntObj) {
+  if (!cntObj || typeof cntObj !== 'object' || Array.isArray(cntObj)) {
+    return canonicalizeForDigest(cntObj)
+  }
+  const out = {}
+  for (const k of Object.keys(cntObj).sort()) {
+    if (!NON_FARM_CNT_KEYS.has(k) && cntObj[k] !== undefined) {
+      out[k] = canonicalizeForDigest(cntObj[k])
+    }
+  }
+  return out
+}
+
 /**
  * Canonical SHA-256 digest of all farm-domain static state fields on `world`,
- * explicitly isolating out B16 cultivation state (`state.xs`) and passive regen clocks (`en`, `enT`, `enDay`),
- * as well as transport-level `world.rev` / `world.now`.
+ * explicitly isolating out B16 cultivation state (`state.xs`), 52D toy-stall meta (`state.npcG`, `cnt.npc*`),
+ * and passive regen clocks (`en`, `enT`, `enDay`), as well as transport-level `world.rev` / `world.now`.
  */
 export function computeStaticFarmStateDigest(world) {
   if (!world || typeof world !== 'object') return 'null'
@@ -184,7 +198,9 @@ export function computeStaticFarmStateDigest(world) {
   for (const k of Object.keys(rawState).sort()) {
     if (NON_STATIC_FARM_STATE_KEYS.has(k)) continue
     if (rawState[k] !== undefined) {
-      farmState[k] = canonicalizeForDigest(rawState[k])
+      farmState[k] = k === 'cnt'
+        ? canonicalizeStateCntForFarmDigest(rawState[k])
+        : canonicalizeForDigest(rawState[k])
     }
   }
   const payload = {
@@ -234,7 +250,15 @@ export function isFarmDomainPassiveCompatible(adapter, baseWorld, liveWorld, {
     if (lRev > bRev) {
       const baseXs = JSON.stringify(canonicalizeForDigest(baseWorld.state?.xs ?? null))
       const liveXs = JSON.stringify(canonicalizeForDigest(liveWorld.state?.xs ?? null))
-      if (baseXs === liveXs) return false
+      const extractNpcMeta = (w) => ({
+        npcG: w?.state?.npcG ?? null,
+        npc: Number(w?.state?.cnt?.npc || 0),
+        npcWin: Number(w?.state?.cnt?.npcWin || 0),
+        gomokuPaid: Number(w?.state?.cnt?.gomokuPaid || 0),
+      })
+      const baseNpc = JSON.stringify(canonicalizeForDigest(extractNpcMeta(baseWorld)))
+      const liveNpc = JSON.stringify(canonicalizeForDigest(extractNpcMeta(liveWorld)))
+      if (baseXs === liveXs && baseNpc === liveNpc) return false
     }
   }
 

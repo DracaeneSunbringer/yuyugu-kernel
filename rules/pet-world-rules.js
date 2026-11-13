@@ -301,7 +301,9 @@ export function goalReward(k, goal, day, t) {
 export const NPC = { daily: 52, jackpot: 0.001, jackpotCoins: 1000000 };
 export const NPC_GAMES = { rps: '剪刀石头布', card: '抽牌比大小', gomoku: '五子棋', box: '盲盒夺宝' };
 export const BOX_SET = [50, 30, 20, 10, 5, 0, -10, -20, -30];
-export const GOMOKU_N = 11;
+export const GOMOKU_N = 15;
+export const GOMOKU_LEVELS = { 1: { name: '简单', mult: 0.8 }, 2: { name: '普通', mult: 1.2 }, 3: { name: '困难', mult: 1.5 } };
+export const GOMOKU_PAID = 10;
 function npcPrize(s, ctx, mult = 1) {
     const r = ctx.rand();
     if (r < NPC.jackpot) return { coins: NPC.jackpotCoins, jackpot: true, got: [] };
@@ -314,52 +316,113 @@ function npcPrize(s, ctx, mult = 1) {
 // b8 五子棋：必胜优先、必败防守、活形与断点威胁评分；固定种子只用于同分选择。
 function rng32(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
 const DIRS = [[1, 0], [0, 1], [1, 1], [1, -1]];
-export function gomokuLine(b, x, y, who) {
+export function gomokuLine(b, x, y, who, N = GOMOKU_N) {
     let best = 0;
-    for (const [dx, dy] of DIRS) { let n = 1; for (const sg of [1, -1]) { let k = 1; while (true) { const X = x + dx * k * sg, Y = y + dy * k * sg; if (X < 0 || Y < 0 || X >= GOMOKU_N || Y >= GOMOKU_N || b[Y * GOMOKU_N + X] !== who) break; n++; k++; } } best = Math.max(best, n); }
+    for (const [dx, dy] of DIRS) { let n = 1; for (const sg of [1, -1]) { let k = 1; while (true) { const X = x + dx * k * sg, Y = y + dy * k * sg; if (X < 0 || Y < 0 || X >= N || Y >= N || b[Y * N + X] !== who) break; n++; k++; } } best = Math.max(best, n); }
     return best;
 }
-export function gomokuAI(b, seed, step) {
-    const N = GOMOKU_N, r = rng32(seed * 31 + step * 7919), cand = [];
-    for (let y=0;y<N;y++) for(let x=0;x<N;x++) {
-        if(b[y*N+x]) continue;
-        let near=false;
-        for(let dy=-2;dy<=2&&!near;dy++) for(let dx=-2;dx<=2;dx++) {const X=x+dx,Y=y+dy;if(X>=0&&Y>=0&&X<N&&Y<N&&b[Y*N+X]) {near=true;break;}}
-        if(near) cand.push([x,y]);
+function gomokuStrength(b, N, x, y, who) {
+    let total = 0, threats = 0;
+    for (const [dx, dy] of DIRS) {
+        let n = 1, open = 0;
+        for (const sg of [-1, 1]) { let k = 1; while (true) { const X = x + dx * k * sg, Y = y + dy * k * sg; if (X < 0 || Y < 0 || X >= N || Y >= N) break; const v = b[Y * N + X]; if (v !== who) { if (!v) open++; break; } n++; k++; } }
+        total += n >= 4 ? (open === 2 ? 50000 : open ? 10000 : 0) : n === 3 ? (open === 2 ? 3500 : open ? 250 : 0) : n === 2 ? (open === 2 ? 180 : open ? 30 : 0) : open * 3;
+        if (n >= 3 && open === 2) threats++;
+        for (let start = -4; start <= 0; start++) { let count = 0, valid = true; for (let k = start; k < start + 5; k++) { const X = x + dx * k, Y = y + dy * k; if (X < 0 || Y < 0 || X >= N || Y >= N) { valid = false; break; } const v = k === 0 ? who : b[Y * N + X]; if (v && v !== who) { valid = false; break; } if (v === who) count++; } if (valid) total += count === 4 ? 2500 : count === 3 ? 100 : count === 2 ? 8 : 0; }
     }
-    if(!cand.length) return [N>>1,N>>1];
-    const win=cand.find(([x,y])=>gomokuLine(b,x,y,2)>=5);if(win)return win;
-    const block=cand.find(([x,y])=>gomokuLine(b,x,y,1)>=5);if(block)return block;
-    const strength=([x,y],who)=>{
-        let total=0,threats=0;
-        for(const [dx,dy] of DIRS){
-            let n=1,open=0;
-            for(const sg of [-1,1]){let k=1;while(true){const X=x+dx*k*sg,Y=y+dy*k*sg;if(X<0||Y<0||X>=N||Y>=N)break;const v=b[Y*N+X];if(v!==who){if(!v)open++;break;}n++;k++;}}
-            total+=n>=4?(open===2?50000:open?10000:0):n===3?(open===2?3500:open?250:0):n===2?(open===2?180:open?30:0):open*3;
-            if(n>=3&&open===2)threats++;
-            // 五格窗口包括断开的四子和三子，不能只比较连续长度。
-            for(let start=-4;start<=0;start++){let count=0,valid=true;for(let k=start;k<start+5;k++){const X=x+dx*k,Y=y+dy*k;if(X<0||Y<0||X>=N||Y>=N){valid=false;break;}const v=k===0?who:b[Y*N+X];if(v&&v!==who){valid=false;break;}if(v===who)count++;}if(valid)total+=count===4?2500:count===3?100:count===2?8:0;}
-        }
-        return total+(threats>=2?12000:0);
-    };
-    let best=-Infinity,choices=[];
-    for(const p of cand){const value=strength(p,2)+strength(p,1)*1.1-(Math.abs(p[0]-5)+Math.abs(p[1]-5))*0.2;if(value>best){best=value;choices=[p];}else if(value===best)choices.push(p);}
-    return choices[Math.floor(r()*choices.length)];
+    return total + (threats >= 2 ? 12000 : 0);
 }
-// 复盘：玩家先手；mv 是玩家的落子序列；返回 'win' / 'lose' / 'bad'
-export function gomokuReplay(seed, mv) {
-    const N = GOMOKU_N, b = new Array(N * N).fill(0);
+function gomokuCands(b, N, r = 2) {
+    const cand = [];
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+        if (b[y * N + x]) continue;
+        let near = false;
+        for (let dy = -r; dy <= r && !near; dy++) for (let dx = -r; dx <= r; dx++) { const X = x + dx, Y = y + dy; if (X >= 0 && Y >= 0 && X < N && Y < N && b[Y * N + X]) { near = true; break; } }
+        if (near) cand.push([x, y]);
+    }
+    return cand;
+}
+function gomokuFives(b, N, who, at = -1) {
+    // at>=0 时只检查经过该点的四条线（距离 4 格内），否则全盘扫描。
+    const out = [], seen = new Set(), test = (i) => { if (b[i] || seen.has(i)) return; seen.add(i); const x = i % N, y = (i - x) / N; if (gomokuLine(b, x, y, who, N) >= 5) out.push(i); };
+    if (at < 0) { for (let i = 0; i < N * N; i++) test(i); return out; }
+    const ax = at % N, ay = (at - ax) / N;
+    for (const [dx, dy] of DIRS) for (let k = -4; k <= 4; k++) { const x = ax + dx * k, y = ay + dy * k; if (k && x >= 0 && y >= 0 && x < N && y < N) test(y * N + x); }
+    return out;
+}
+function gomokuVcfStep(b, N, who, depth, budget) {
+    if (depth <= 0 || budget.n <= 0) return -1;
+    const foe = 3 - who;
+    for (const [x, y] of gomokuCands(b, N, 1)) {
+        if (--budget.n <= 0) return -1;
+        const i = y * N + x; b[i] = who;
+        const f = gomokuFives(b, N, who, i);
+        let ok = false;
+        if (f.length >= 2) ok = true;
+        else if (f.length === 1) { const j = f[0]; b[j] = foe; ok = !gomokuFives(b, N, foe, j).length && gomokuVcfStep(b, N, who, depth - 1, budget) >= 0; b[j] = 0; }
+        b[i] = 0;
+        if (ok) return i;
+    }
+    return -1;
+}
+// 连续冲四搜索（VCF）：who 每一步都下成“再一手就五连”的冲四，逼对手唯一应手，直到双四取胜。
+function gomokuVcf(b, N, who, depth, budget) {
+    if (gomokuFives(b, N, 3 - who).length) return -1;
+    return gomokuVcfStep(b, N, who, depth, budget);
+}
+export function gomokuAI(b, seed, step, d = 2, N = GOMOKU_N) {
+    const r = rng32(seed * 31 + step * 7919), cand = gomokuCands(b, N), c = N >> 1;
+    if (!cand.length) return [c, c];
+    const win = cand.find(([x, y]) => gomokuLine(b, x, y, 2, N) >= 5); if (win) return win;
+    const block = cand.find(([x, y]) => gomokuLine(b, x, y, 1, N) >= 5); if (block) return block;
+    const rows = cand.map((p) => { const a = gomokuStrength(b, N, p[0], p[1], 2), o = gomokuStrength(b, N, p[0], p[1], 1); return { p, a, o, v: a + o * 1.1 - (Math.abs(p[0] - c) + Math.abs(p[1] - c)) * 0.2 }; });
+    const pickBest = (list, key) => { let best = -Infinity, choices = []; for (const x of list) { const v = key(x); if (v > best) { best = v; choices = [x.p]; } else if (v === best) choices.push(x.p); } return choices[Math.floor(r() * choices.length)]; };
+    if (d === 1) {
+        // 简单：活四/冲四一定会堵（不送分），其余在前四名里按权重随机，常常漏掉活三。
+        const urgent = rows.filter((x) => x.o >= 10000 || x.a >= 10000);
+        if (urgent.length && r() < 0.9) return pickBest(urgent, (x) => x.v);
+        const top = rows.slice().sort((x, y) => y.v - x.v || x.p[1] - y.p[1] || x.p[0] - y.p[0]).slice(0, 4), w = [0.4, 0.27, 0.19, 0.14];
+        let roll = r() * w.slice(0, top.length).reduce((s, v) => s + v, 0);
+        for (let i = 0; i < top.length; i++) { roll -= w[i]; if (roll <= 0) return top[i].p; }
+        return top[0].p;
+    }
+    if (d !== 3) return pickBest(rows, (x) => x.v);
+    // 困难：自己的活四直接走；否则取前 6 个候选，估算落子后对手最强的一手（全局威胁只算一次，
+    // 候选周围两格内增量重算），选对手威胁最小、自身收益最大的。
+    const four = rows.find((x) => x.a >= 50000); if (four) return four.p;
+    const mine = gomokuVcf(b, N, 2, 6, { n: 500 }); if (mine >= 0) return [mine % N, (mine - mine % N) / N];
+    if (gomokuVcf(b, N, 1, 6, { n: 350 }) >= 0) {
+        // 对手有连续冲四：在高分候选里找一手能破解的（下完后对手不再有 VCF）。
+        const fix = rows.slice().sort((x, y) => y.v - x.v || x.p[1] - y.p[1] || x.p[0] - y.p[0]).slice(0, 8).find((x) => { const i = x.p[1] * N + x.p[0]; b[i] = 2; const still = gomokuVcf(b, N, 1, 6, { n: 160 }) >= 0; b[i] = 0; return !still; });
+        if (fix) return fix.p;
+    }
+    const top = rows.slice().sort((x, y) => y.v - x.v || x.p[1] - y.p[1] || x.p[0] - y.p[0]).slice(0, 6);
+    const threat = new Map(rows.map((x) => [x.p[1] * N + x.p[0], x.o]));
+    for (const x of top) {
+        const [px, py] = x.p, i = py * N + px; b[i] = 2;
+        let reply = 0;
+        for (const [k, o] of threat) { if (k === i) continue; const qx = k % N, qy = (k - qx) / N; if (Math.abs(qx - px) > 2 || Math.abs(qy - py) > 2) { if (o > reply) reply = o; } }
+        for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) { const qx = px + dx, qy = py + dy; if (qx < 0 || qy < 0 || qx >= N || qy >= N || b[qy * N + qx]) continue; const o = gomokuStrength(b, N, qx, qy, 1); if (o > reply) reply = o; }
+        b[i] = 0; x.h = x.a * 1.15 + x.o - reply * 0.9;
+    }
+    return pickBest(top, (x) => x.h);
+}
+// 复盘：玩家先手；mv 是玩家的落子序列；返回 'win' / 'lose' / 'draw' / 'bad'
+export function gomokuReplay(seed, mv, d = 2, N = GOMOKU_N) {
+    const b = new Array(N * N).fill(0);
     for (let k = 0; k < mv.length; k++) {
         const [x, y] = mv[k] || [];
         if (!(Number.isInteger(x) && Number.isInteger(y) && x >= 0 && y >= 0 && x < N && y < N) || b[y * N + x]) return 'bad';
         b[y * N + x] = 1;
-        if (gomokuLine(b, x, y, 1) >= 5) return k === mv.length - 1 ? 'win' : 'bad';
-        if (b.every(Boolean)) return 'lose';
-        const [ax, ay] = gomokuAI(b, seed, k); b[ay * N + ax] = 2;
-        if (gomokuLine(b, ax, ay, 2) >= 5) return k === mv.length - 1 ? 'lose' : 'bad';
+        if (gomokuLine(b, x, y, 1, N) >= 5) return k === mv.length - 1 ? 'win' : 'bad';
+        if (b.every(Boolean)) return k === mv.length - 1 ? 'draw' : 'bad';
+        const [ax, ay] = gomokuAI(b, seed, k, d, N); b[ay * N + ax] = 2;
+        if (gomokuLine(b, ax, ay, 2, N) >= 5) return k === mv.length - 1 ? 'lose' : 'bad';
+        if (b.every(Boolean)) return k === mv.length - 1 ? 'draw' : 'bad';
     }
     return 'bad';
 }
+
 // ---------- 11-07 b7 鱼彩 ----------
 export const SCRATCH = [{ name: '小鱼刮刮乐', price: 1000 }, { name: '金鲸刮刮乐', price: 10000 }];
 // 倍数 → 概率（期望返还约 74%）
@@ -729,7 +792,7 @@ export function b12BaseApplyActions(s, actions, ctx) {
         else if (a === 'npc') {
             const g = String(act.g), k = String(act.k || 'play'), used = count('npc');
             if (!NPC_GAMES[g]) { fail(a, '没有这个游戏'); continue; }
-            if (used >= NPC.daily && !(k === 'pick' || k === 'end')) { fail(a, '52弟 今天玩累了，明天再来'); continue; }
+            if (used >= NPC.daily && !(k === 'pick' || k === 'end' || (g === 'gomoku' && k === 'start' && [1, 2, 3].includes(Number(act.d))))) { fail(a, '52弟 今天玩累了，明天再来'); continue; }
             const pay = (res, mult = 1) => { const o = { ok: true, a, g, res }; if (res === 'win') { const p = npcPrize(s, ctx, mult); earn += p.coins; for (const [id, n] of p.got) invAdd(s.inv, id, 0, n); o.earn = p.coins || undefined; o.got = p.got.map(([id, n]) => ({ id, q: 0, n })); o.jackpot = p.jackpot || undefined; } if (res !== 'draw') s.cnt.npc = count('npc') + 1; if (res === 'win') s.cnt.npcWin = count('npcWin') + 1; return o; };
             if (g === 'rps') {
                 const m = Math.floor(Number(act.m)); if (!(m >= 0 && m <= 2)) { fail(a, '出什么？'); continue; }
@@ -740,12 +803,14 @@ export function b12BaseApplyActions(s, actions, ctx) {
                 const res = me === np ? 'draw' : me > np ? 'win' : 'lose';
                 const o = pay(res); o.me = me; o.np = np; o.suit = [Math.floor(ctx.rand() * 4), Math.floor(ctx.rand() * 4)]; out.push(o);
             } else if (g === 'gomoku') {
-                if (k === 'start') { s.npcG = { g, seed: 1 + Math.floor(ctx.rand() * 1e9), t: ctx.t }; out.push({ ok: true, a, g, seed: s.npcG.seed }); continue; }
+                if (k === 'start') { const d = [1, 2, 3].includes(Number(act.d)) ? Number(act.d) : 0, practice = !!d && (used >= NPC.daily || count('gomokuPaid') >= GOMOKU_PAID); s.npcG = { g, seed: 1 + Math.floor(ctx.rand() * 1e9), t: ctx.t, ...(d ? { d, n: GOMOKU_N } : {}), ...(practice ? { p: 1 } : {}) }; out.push({ ok: true, a, g, seed: s.npcG.seed, d: d || undefined, practice: practice || undefined }); continue; }
                 if (!s.npcG || s.npcG.g !== g) { fail(a, '先开一局'); continue; }
-                const mv = Array.isArray(act.mv) ? act.mv.slice(0, 70) : [], res = gomokuReplay(s.npcG.seed, mv);
+                const G0 = s.npcG, n = G0.n === GOMOKU_N ? GOMOKU_N : 11, d = G0.d || 2, mv = Array.isArray(act.mv) ? act.mv.slice(0, Math.ceil(n * n / 2)) : [], res = gomokuReplay(G0.seed, mv, d, n);
                 delete s.npcG;
                 if (res === 'bad') { fail(a, '棋局对不上，重新开一局吧'); continue; }
-                out.push(pay(res, 1.5));
+                if (G0.p) { out.push({ ok: true, a, g, res, practice: true }); continue; }
+                if (G0.d && res !== 'draw') s.cnt.gomokuPaid = count('gomokuPaid') + 1;
+                out.push(pay(res, G0.d ? GOMOKU_LEVELS[d].mult : 1.5));
             } else {
                 if (k === 'start') { s.npcG = { g, left: BOX_SET.slice(), me: [], np: [] }; out.push({ ok: true, a, g, box: s.npcG }); continue; }
                 const G = s.npcG; if (!G || G.g !== g) { fail(a, '先开一局'); continue; }
@@ -953,7 +1018,7 @@ export function upgradePrice(s, tool) {
 // 雇佣一次 30 万 D币，之后每轮巡视付 5000 工钱（付不起就歇一轮）。
 // 和亲手玩的差别：钓鱼 / 挖矿每次多耗 2 点体力；收获 / 产物 / 鱼都只有普通品质、不会多收；代卖抽成 20%；没有咖啡；每 4 小时巡视一次。
 // 经济（sim-auto.mjs）：只挂机约为认真玩的一半左右。
-export const AUTO = { every: 4 * 3600, maxBack: 48 * 3600, maxVisits: 12, fee: 0.2, surcharge: 2, budgetMax: 5000000, hire: 150000, wage: 3000 };
+export const AUTO = { every: 2 * 3600, maxBack: 48 * 3600, maxVisits: 24, fee: 0, surcharge: 0, budgetMax: 5000000, hire: 150000, wage: 1500 };
 export const AUTO_DEFAULT = { on: false, crop: 'best', water: true, feed: true, fishPct: 50, keep: 30, sell: true, minPct: 90, budget: 100000, craft: false, bomb: false, goals: true, guard: 0 };
 // 校验前端提交的策略（未知字段丢弃、数值夹到范围内）
 export function autoConfig(raw, prev = AUTO_DEFAULT) {
@@ -986,7 +1051,7 @@ export function b12BaseAutoSettle(s, ctx) {
     const run = (list, t) => {
         for (let k = 0; k < list.length; k += WORLD.maxActions) {
             const part = list.slice(k, k + WORLD.maxActions), day = worldDay(t);
-            const r = applyActions(s, part, { t, day, rand: ctx.rand, prices: pricesFor(isleDay(t)), coins: ctx.coins - spend + earn, auto: true, taxTime:ctx.now });
+            const r = applyActions(s, part, { t, day, rand: ctx.rand, prices: pricesFor(isleDay(t)), coins: ctx.coins - spend + earn, auto: false, butler: true, taxTime:ctx.now });
             spend += r.spend;
             earn += r.earn;
             xp += r.xp;tax+=r.tax||0;
@@ -1081,6 +1146,7 @@ export function b12BaseAutoSettle(s, ctx) {
             work.push({ a: 'mine', f: 99 });
         run(work, t);
         b12ReplenishWarehouse(s);
+        run(b26AutoSell(s,pricesFor(isleDay(t)),isleDay(t)),t);
         // 5. 卖货（只卖作物 / 畜产 / 鱼 / 矿；低于「基础价 × minPct%」的留着等涨价）
         if (a.sell) {
             const pr = pricesFor(isleDay(t)), sells = [];
@@ -1168,6 +1234,7 @@ export function b12Available(s,id,q) {
 function b12WarehouseAction(s,act) {
     const d=b12State(s),id=String(act.id||''),q=act.q,n=act.n;
     if(!b12Own(ITEM_NAME,id) || !Number.isInteger(q) || q<0 || q>2 || !Number.isSafeInteger(n) || n<0 || n>b12Count(s.inv?.[id]?.[q])) return {ok:false,a:'warehouse',msg:'预留数量无效或超过当前库存'};
+    {const err=b26Check(s,d,id,q,n);if(err)return {ok:false,a:'warehouse',msg:err};if(!n&&s.b26?.order)delete s.b26.order[id+':'+q];}
     const values=d.vault[id] || [0,0,0];values[q]=n;
     if(values.some(Boolean))d.vault[id]=values;else delete d.vault[id];
     if(typeof act.keep==='boolean'){
@@ -1224,7 +1291,7 @@ function b12WithAvailableInventory(s,act,run) {
 export function b12ReplenishWarehouse(s) {
     const masked=b12WarehouseMasks.get(s),d=masked?s.b12:b12State(s);
     for(const [id,target]of Object.entries(d.keep))for(let q=0;q<3;q++){
-        const existing=b12Count(d.vault[id]?.[q]),amount=Math.min(Math.max(0,target[q]-existing),b12Available(s,id,q));
+        const existing=b12Count(d.vault[id]?.[q]),amount=Math.min(Math.max(0,target[q]-existing),b12Available(s,id,q),b26Room(s,d,id));
         if(!amount)continue;
         (d.vault[id] ||= [0,0,0])[q]=existing+amount;
         if(masked){(masked.hidden[id] ||= [0,0,0])[q]+=amount;s.inv[id][q]-=amount;}
@@ -1271,7 +1338,214 @@ export function b12Stock(t,prices={}) {
 export function b12StockLeft(s,item,t) {
     return Math.max(0,item.limit-(s.b12?.shop?.d===isleDay(t)?s.b12.shop.n?.[item.id]||0:0));
 }
+//#region arcade 游乐馆
+const ARC_RULES=(()=>{
+// 鱼鱼谷游乐馆 · 规则与物理（纯函数，前端与 Worker 共用）。存档在小岛状态 JSON 的 state.arc，榜单写 state.b9Rank。
+// 确定性：每一击的初速度在出手时量化到 0.001；逐帧只用加减乘除和开方，前端与服务端算出同一结果，服务端分数为准。
+const ARC_VERSION=1;
+const GAMES={
+ bounce:{name:'弹弹乐',daily:10,shots:5,desc:'全屏玩：像站宠一样抓住大肥鱼一甩，整个浏览器窗口就是墙。四边藏着看不见的机关，撞到才现身；屏幕中间的道具框撞碎有惊喜。一甩里反弹越多倍率越高。每局 5 甩。'},
+ pool:{name:'鲸鱼桌球',daily:10,shots:6,desc:'全屏球台：拉开弹弓把大肥鱼射出去，把群友头像球撞进窗口四角和两边的漩涡洞。一杆连进有连击加成，金色头像球 3 倍分；大肥鱼自己掉洞扣 50。每局 6 杆。'},
+ bowl:{name:'鲸鱼保龄',daily:10,shots:10,desc:'全屏球道：把大肥鱼滚向 10 个头像瓶，左右拨动可以加旋转打弧线。共 5 轮，每轮 2 投；全中 30 分（连续全中每次再多 10），补中 20 分。'},
+};
+const DT=1/120;
+const MAX_STEPS=120*9;
+const q3=v=>Math.round(v*1000)/1000;
+function rng(seed){let a=seed>>>0;return()=>{a=(a+0x6d2b79f5)>>>0;let t=Math.imul(a^(a>>>15),1|a);t=(t+Math.imul(t^(t>>>7),61|t))^t;return((t^(t>>>14))>>>0)/4294967296}}
+// ---------------- 场地 ----------------
+const POOL={W:540,H:960,x0:8,x1:532,y0:8,y1:952,R:22,r:17,pockets:[[20,20,32],[520,20,32],[20,940,32],[520,940,32],[10,480,30],[530,480,30]],start:[270,730]};
+const BOWL={W:540,H:960,lane0:125,lane1:415,wall0:93,wall1:447,R:24,r:15,start:[270,852],pinY:182.5,gapX:46,gapY:25.8};
+// 弹弹乐场地 = 玩家屏幕上的游戏区（开局时上报宽高）；大肥鱼按站宠的命中框算身体，物理参数与站宠一致（空气阻力 2.2、碰边回弹 0.6、最高 2400px/s）
+const FLING={drag:2.2,bounce:.6,maxSpeed:2400,deadZone:450,stopSpeed:25};
+const SECRET_PTS=[40,50,30,60,80,40,100,30],BOX={mystery:{hp:1,e:.7},chest:{hp:2,e:.7},bubble:{hp:1,e:.9},ice:{hp:2,e:.6},gift:{hp:1,e:.7},spring:{hp:0,e:1.25}};
+// 为了榜单公平，弹弹乐用固定 1280×720 的场地，前端按屏幕等比铺满（竖屏时转 90°）
+const BOUNCE_DIMS={w:1280,h:720};
+const fishSize=(W,H)=>{const VW=Math.round(Math.max(170,Math.min(300,Math.min(W,H)*.34)));return {VW,hx:VW*.1875,hy:VW*.2227,cy:VW*.3008,r:VW*.19}};
+const POOL_DRAG=Math.exp(-0.55*DT),BOWL_DRAG=Math.exp(-0.12*DT),PIN_DRAG=Math.exp(-2.4*DT),BOUNCE_DRAG=Math.exp(-2.2*DT);
+function body(x,y,r,m,extra){return{x,y,vx:0,vy:0,r,m,on:1,...extra}}
+function setup(g,seed,dims){
+ const R=rng(seed),w={g,seed,shot:0,score:0,log:[],moving:false,events:[]};
+ if(g==='pool'){const P=POOL;w.fish=body(P.start[0],P.start[1],P.R,1.5);w.balls=[];let k=0;
+  for(let row=0;row<4;row++)for(let i=0;i<=row;i++)w.balls.push(body(270+(i-row/2)*35,300-row*30.5,P.r,1,{id:k++}));
+  w.gold=Math.floor(R()*w.balls.length);w.balls[w.gold].gold=1;w.combo=0;w.potted=0}
+ if(g==='bowl'){const B=BOWL;w.fish=body(B.start[0],B.start[1],B.R,2.2);w.streak=0;w.frame=0;w.roll=0;w.frames=[];w.pins=[];
+  for(let row=0;row<4;row++)for(let i=0;i<=row;i++){const x=270+(i-row/2)*B.gapX,y=B.pinY-row*B.gapY;w.pins.push(body(x,y,B.r,.8,{sx:x,sy:y,id:w.pins.length}))}
+  w.spin=0;w.gutter=0}
+ if(g==='bounce'){dims=BOUNCE_DIMS;const W=dims.w,H=dims.h,F=fishSize(W,H);w.W=W;w.H=H;w.F=F;w.fish=body(W/2,H-F.hy-12,F.r,1);w.items=[];w.boxes=[];w.secrets=[];w.R=rng(seed^0x2545f491);
+  // 四边的隐藏机关：每条边按长度分段，平时看不见，撞到现身，再撞升级
+  for(const side of ['T','R','B','L']){const len=side==='T'||side==='B'?W:H,n=Math.max(2,Math.round(len/280));for(let i=0;i<n;i++){const seg=len/n,c=seg*(i+.25+R()*.5),kind=Math.floor(R()*8);w.secrets.push({id:w.secrets.length,side,c:Math.round(c),hl:Math.round(55+R()*35),kind,pts:SECRET_PTS[kind],st:0,last:-1})}}
+  w.corners={};const kinds=Object.keys(BOX),nb=Math.max(4,Math.min(10,Math.round(W*H/110000)));for(let i=0;i<nb;i++)addBox(w,R,kinds[Math.floor(R()*kinds.length)]);
+  w.bounces=0;w.flingPts=0;w.flight=0;w.bonus=0;w.wallT={x:-9,y:-9}}
+ return w;
+}
+function addBox(w,R,kind){const F=w.F,r=34;for(let t=0;t<80;t++){const x=Math.round(r+40+R()*(w.W-2*r-80)),y=Math.round(r+40+R()*(w.H-2*r-80-F.hy));
+  if(Math.hypot(x-w.fish.x,y-w.fish.y)>r+F.hy+50&&w.boxes.every(o=>!o.on||Math.hypot(o.x-x,o.y-y)>o.r+r+30)&&w.items.every(o=>!o.on||Math.hypot(o.x-x,o.y-y)>r+o.r+10)){
+   w.boxes.push({id:w.boxes.length,kind,x,y,r,hp:BOX[kind].hp,on:1,prize:[30,60,90,150][Math.floor(R()*4)],last:-1});return true}}return false}
+// 出手：a 角度（弧度），p 力度 0–1，s 旋转 -1–1（只有保龄用）
+function validShot(s,g){if(!Array.isArray(s)||!s.every(v=>typeof v==='number'&&Number.isFinite(v)))return false;if(g==='bounce')return s.length===4&&Math.abs(s[2])<=2400&&Math.abs(s[3])<=2400;return s.length>=2&&s.length<=3&&s[1]>=0&&s[1]<=1&&Math.abs(s[0])<=7&&(s.length<3||Math.abs(s[2])<=1)}
+function totalShots(w){return w.g==='bowl'?null:GAMES[w.g].shots}
+function over(w){if(w.g==='bowl')return w.frame>=5;if(w.g==='pool'&&w.balls.every(b=>!b.on))return true;return w.shot>=GAMES[w.g].shots}
+function shoot(w,s){
+ if(w.moving||over(w)||!validShot(s,w.g))return false;
+ if(w.g==='bounce'){const F=w.F,f=w.fish;const x=q3(s[0]),y=q3(s[1]);let vx=q3(s[2]),vy=q3(s[3]);const sp=Math.hypot(vx,vy);
+  if(x<F.hx-1||x>w.W-F.hx+1||y<F.hy-1||y>w.H-F.hy+1||sp<FLING.deadZone)return false;if(sp>FLING.maxSpeed){vx=q3(vx*FLING.maxSpeed/sp);vy=q3(vy*FLING.maxSpeed/sp)}
+  f.x=x;f.y=y;f.vx=vx;f.vy=vy;w.bounces=0;w.flingPts=0;w.flight=0;w.bonus=0;w.wallT={x:-9,y:-9};w.corners={};w.moving=true;w.steps=0;w.shot++;w.log.push([x,y,vx,vy]);return true}
+ const a=q3(s[0]),p=q3(s[1]),spin=q3(s[2]||0),f=w.fish;
+ const sp=w.g==='pool'?q3(120+p*1580):w.g==='bowl'?q3(420+p*900):q3(160+p*2440);
+ f.vx=q3(Math.cos(a)*sp);f.vy=q3(Math.sin(a)*sp);
+ if(w.g==='bowl'){if(f.vy>-120)f.vy=-120;w.spin=spin;w.gutter=0}
+ if(w.g==='pool'){w.combo=0}
+ w.moving=true;w.steps=0;w.shot++;w.log.push([a,p,spin]);return true;
+}
+function wallBounce(o,x0,x1,y0,y1,e){let hit=0;
+ if(o.x-o.r<x0){o.x=x0+o.r;o.vx=-o.vx*e;hit=1}else if(o.x+o.r>x1){o.x=x1-o.r;o.vx=-o.vx*e;hit=1}
+ if(o.y-o.r<y0){o.y=y0+o.r;o.vy=-o.vy*e;hit=1}else if(o.y+o.r>y1){o.y=y1-o.r;o.vy=-o.vy*e;hit=1}
+ return hit}
+function collide(a,b,e){const dx=b.x-a.x,dy=b.y-a.y,d2=dx*dx+dy*dy,rr=a.r+b.r;if(d2>=rr*rr||d2===0)return 0;
+ const d=Math.sqrt(d2),nx=dx/d,ny=dy/d,ov=rr-d,im=1/a.m+1/b.m;a.x-=nx*ov*(1/a.m)/im;a.y-=ny*ov*(1/a.m)/im;b.x+=nx*ov*(1/b.m)/im;b.y+=ny*ov*(1/b.m)/im;
+ const rv=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;if(rv>0)return 1;const j=-(1+e)*rv/im;a.vx-=j*nx/a.m;a.vy-=j*ny/a.m;b.vx+=j*nx/b.m;b.vy+=j*ny/b.m;return 1+Math.min(3,-rv/400)}
+function slow(o,k,lin){o.vx*=k;o.vy*=k;const s2=o.vx*o.vx+o.vy*o.vy;if(s2<=lin*lin){o.vx=0;o.vy=0}else if(lin){const s=Math.sqrt(s2),f=(s-lin)/s;o.vx*=f;o.vy*=f}}
+const speed2=o=>o.vx*o.vx+o.vy*o.vy;
+// 走一步；返回本步事件 [{t:'wall'|'hit'|'pot'|'item'|'bump'|'pin'|'gutter', ...}]
+function step(w){
+ if(!w.moving)return [];const ev=[],f=w.fish;w.steps++;
+ if(w.g==='pool'){const P=POOL,all=[f,...w.balls].filter(o=>o.on);
+  for(const o of all){o.x+=o.vx*DT;o.y+=o.vy*DT}
+  for(let i=0;i<all.length;i++)for(let j=i+1;j<all.length;j++){const h=collide(all[i],all[j],.95);if(h)ev.push({t:'hit',x:(all[i].x+all[j].x)/2,y:(all[i].y+all[j].y)/2,k:h})}
+  for(const o of all){let pot=null;for(const [px,py,pr] of P.pockets){const dx=o.x-px,dy=o.y-py;if(dx*dx+dy*dy<pr*pr){pot=[px,py];break}}
+   if(pot){o.on=0;o.vx=0;o.vy=0;o.x=pot[0];o.y=pot[1];
+    if(o===f){w.score-=50;ev.push({t:'pot',fish:1,x:pot[0],y:pot[1],pts:-50})}
+    else{w.combo++;w.potted++;const pts=(o.gold?300:100)*w.combo;w.score+=pts;ev.push({t:'pot',id:o.id,gold:o.gold||0,combo:w.combo,x:pot[0],y:pot[1],pts})}continue}
+   if(wallBounce(o,P.x0,P.x1,P.y0,P.y1,.8)&&speed2(o)>900)ev.push({t:'wall',x:o.x,y:o.y,fish:o===f?1:0});
+   slow(o,POOL_DRAG,150*DT)}
+  if(all.every(o=>!o.on||speed2(o)===0)||w.steps>=MAX_STEPS)settle(w,ev)}
+ if(w.g==='bowl'){const B=BOWL,pins=w.pins.filter(p=>p.on);
+  if(!w.gutter&&f.y>B.pinY+30&&f.y<B.start[1]-40)f.vx+=w.spin*240*DT;
+  f.x+=f.vx*DT;f.y+=f.vy*DT;for(const p of pins){p.x+=p.vx*DT;p.y+=p.vy*DT}
+  if(!w.gutter&&(f.x<B.lane0||f.x>B.lane1)){w.gutter=f.x<B.lane0?-1:1;f.x=w.gutter<0?B.wall0+f.r-2:B.wall1-f.r+2;f.vx=0;ev.push({t:'gutter',x:f.x,y:f.y})}
+  if(!w.gutter)for(const p of pins){const h=collide(f,p,.7);if(h)ev.push({t:'pin',x:p.x,y:p.y,k:h})}
+  for(let i=0;i<pins.length;i++)for(let j=i+1;j<pins.length;j++){const h=collide(pins[i],pins[j],.6);if(h)ev.push({t:'pin',x:pins[i].x,y:pins[i].y,k:h*.6})}
+  for(const p of pins){if(p.x<B.wall0||p.x>B.wall1||p.y<0){p.vx=0;p.vy=0}slow(p,PIN_DRAG,220*DT)}
+  slow(f,BOWL_DRAG,30*DT);
+  const fishDone=f.y<-40||speed2(f)===0||(f.y<B.pinY-140);
+  if((fishDone&&pins.every(p=>speed2(p)===0))||w.steps>=MAX_STEPS)settle(w,ev)}
+ if(w.g==='bounce'){const F=w.F,e=FLING.bounce,mult=()=>1+.5*w.bounces+w.bonus,gain=(pts,o)=>{const v=Math.floor(pts*mult());w.score+=v;w.flingPts+=v;return v};
+  f.vx*=BOUNCE_DRAG;f.vy*=BOUNCE_DRAG;f.x+=f.vx*DT;f.y+=f.vy*DT;w.flight+=DT;const hits=[];
+  if(f.x<F.hx){f.x=F.hx;f.vx=Math.abs(f.vx)*e;hits.push('L')}else if(f.x>w.W-F.hx){f.x=w.W-F.hx;f.vx=-Math.abs(f.vx)*e;hits.push('R')}
+  if(f.y<F.hy){f.y=F.hy;f.vy=Math.abs(f.vy)*e;hits.push('T')}else if(f.y>w.H-F.hy){f.y=w.H-F.hy;f.vy=-Math.abs(f.vy)*e;hits.push('B')}
+  for(const side of hits){w.bounces++;const along=side==='T'||side==='B'?f.x:f.y,ax=side==='L'||side==='R'?'x':'y';w.wallT[ax]=w.flight;ev.push({t:'wall',side,x:f.x,y:f.y,n:w.bounces})
+   for(const sc of w.secrets){if(sc.side!==side||sc.last===w.shot||Math.abs(along-sc.c)>sc.hl+F.hx*.5)continue;if(sc.st>=2){continue}sc.st++;sc.last=w.shot;const v=gain(sc.pts*sc.st,sc);ev.push({t:'secret',id:sc.id,side,kind:sc.kind,st:sc.st,x:f.x,y:f.y,pts:v,mult:mult()})}}
+  if(hits.length&&Math.abs(w.wallT.x-w.wallT.y)<.15){const key=(f.x<w.W/2?'L':'R')+(f.y<w.H/2?'T':'B');if(!w.corners[key]){w.corners[key]=1;const v=gain(60);ev.push({t:'corner',key,x:f.x,y:f.y,pts:v})}}
+  for(const b of w.boxes){if(!b.on)continue;const dx=f.x-b.x,dy=f.y-b.y,rr=f.r+b.r,d2=dx*dx+dy*dy;if(d2>=rr*rr||d2===0)continue;const d=Math.sqrt(d2),nx=dx/d,ny=dy/d,vn=f.vx*nx+f.vy*ny;f.x=b.x+nx*rr;f.y=b.y+ny*rr;if(vn>=0)continue
+   const be=BOX[b.kind].e;f.vx-=(1+be)*vn*nx;f.vy-=(1+be)*vn*ny;w.bounces++;const o={t:'box',id:b.id,kind:b.kind,x:b.x,y:b.y,n:w.bounces,pts:0,broke:0}
+   if(b.kind==='spring'){o.pts=gain(5)}else{b.hp--;if(b.hp<=0){b.on=0;o.broke=1;
+    if(b.kind==='mystery')o.pts=gain(b.prize);else if(b.kind==='chest'){o.pts=gain(60);o.coins=[];for(let k=0;k<4;k++){const a=k*Math.PI/2+.4,cx=Math.round(b.x+Math.cos(a)*70),cy=Math.round(b.y+Math.sin(a)*70);if(cx>20&&cx<w.W-20&&cy>20&&cy<w.H-20){const it={id:w.items.length,kind:'coin',x:cx,y:cy,r:16,pts:15,on:1};w.items.push(it);o.coins.push(it.id)}}}
+    else if(b.kind==='bubble'){o.pts=gain(40);w.bonus+=1;o.bonus=1}else if(b.kind==='ice')o.pts=gain(100);else if(b.kind==='gift')o.pts=gain(120)}else o.crack=1}
+   ev.push(o)}
+  for(const it of w.items){if(!it.on)continue;const dx=f.x-it.x,dy=f.y-it.y,rr=f.r+it.r;if(dx*dx+dy*dy<rr*rr){it.on=0;const v=gain(it.pts);ev.push({t:'item',kind:it.kind,id:it.id,x:it.x,y:it.y,pts:v,mult:mult()})}}
+  if(f.vx*f.vx+f.vy*f.vy<FLING.stopSpeed*FLING.stopSpeed||w.steps>=MAX_STEPS)settle(w,ev)}
+ return ev;
+}
+function settle(w,ev){
+ w.moving=false;const f=w.fish;f.vx=0;f.vy=0;
+ if(w.g==='pool'){
+  if(!f.on){f.on=1;let [x,y]=POOL.start;for(let k=0;k<20&&w.balls.some(b=>b.on&&Math.hypot(b.x-x,b.y-y)<b.r+f.r+2);k++)y-=40;f.x=x;f.y=y;ev.push({t:'respawn'})}
+  for(const b of w.balls){b.vx=0;b.vy=0}
+  if(w.balls.every(b=>!b.on)){const bonus=500+150*(GAMES.pool.shots-w.shot);w.score+=bonus;ev.push({t:'clear',pts:bonus})}}
+ if(w.g==='bowl'){const B=BOWL;let down=0;
+  for(const p of w.pins){if(!p.on)continue;p.vx=0;p.vy=0;if(Math.hypot(p.x-p.sx,p.y-p.sy)>13||p.x<B.lane0-4||p.x>B.lane1+4){p.on=0;down++}}
+  const fr=w.frames[w.frame]||(w.frames[w.frame]=[]);fr.push(down);const left=w.pins.filter(p=>p.on).length;let end=false,pts=0,kind='';
+  if(fr.length===1&&left===0){pts=30+10*w.streak;w.streak++;kind='strike';end=true}else if(fr.length===2){end=true;w.streak=0;if(left===0){pts=20;kind='spare'}else pts=fr[0]+fr[1]}
+  ev.push({t:'roll',down,frame:w.frame,roll:fr.length,kind,pts:end?pts:0});
+  if(end){w.score+=pts;w.frame++;for(const p of w.pins){p.on=1;p.x=p.sx;p.y=p.sy;p.vx=0;p.vy=0}}
+  f.x=B.start[0];f.y=B.start[1];w.gutter=0}
+ if(w.g==='bounce'){ev.push({t:'rest',pts:w.flingPts,n:w.bounces});const broken=w.boxes.filter(b=>!b.on).length,live=w.boxes.length-broken;if(broken&&live<Math.max(4,Math.min(10,Math.round(w.W*w.H/110000)))){const kinds=Object.keys(BOX);if(addBox(w,w.R,kinds[Math.floor(w.R()*kinds.length)]))ev.push({t:'spawn',id:w.boxes.length-1})}}
+ ev.push({t:'settle'});
+}
+// 服务端：整局重放
+function replay(g,seed,shots,dims){
+ if(!GAMES[g]||!Array.isArray(shots)||shots.length>GAMES[g].shots+2)return null;
+ const w=setup(g,seed,dims);for(const s of shots){if(over(w))break;if(!shoot(w,s))return null;while(w.moving)step(w)}
+ if(!over(w))return null;return {score:Math.max(0,Math.round(w.score)),w};
+}
+// ---------------- 存档动作 ----------------
+const MIN_PLAY={bounce:5,pool:6,bowl:8};
+const validDims=d=>d&&Number.isInteger(d.w)&&Number.isInteger(d.h)&&d.w>=320&&d.w<=2560&&d.h>=320&&d.h<=1600;
+function arcAct(s,a,ctx){
+ const fail=msg=>({a:a.a,ok:false,msg});const g=a.g,G=GAMES[g];if(!G)return fail('没有这个游戏');
+ let x=s.arc;if(!x||typeof x!=='object'||x.v!==ARC_VERSION)x=s.arc={v:ARC_VERSION,d:'',n:{},best:{},cur:null,plays:0};
+ if(x.d!==ctx.day){x.d=ctx.day;x.n={};x.db={}}x.db||={};
+ if(a.a==='arcStart'){
+  if((x.n[g]||0)>=G.daily)return fail('今天的 '+G.daily+' 次'+G.name+'已经玩完了，明天再来');
+  x.n[g]=(x.n[g]||0)+1;x.plays=(x.plays||0)+1;const seed=Math.floor((ctx.rand?ctx.rand():Math.random())*2147483647)>>>0;x.cur={g,seed,t:ctx.t};
+  return {a:a.a,ok:true,g,seed,left:G.daily-x.n[g],msg:G.name+'开局'};
+ }
+ if(a.a==='arcEnd'){
+  const c=x.cur;if(!c||c.g!==g)return fail('没有进行中的'+G.name);
+  if(!Array.isArray(a.shots)||!a.shots.every(s=>validShot(s,g)))return fail('出手数据无效');
+  if(ctx.t-c.t<MIN_PLAY[g])return fail('太快了，这局不计分');
+  const r=replay(g,c.seed,a.shots,BOUNCE_DIMS);x.cur=null;if(!r)return fail('这局没有打完，不计分');
+  const sc=r.score,prevBest=x.best[g]||0,prevDay=x.db[g]||0;x.best[g]=Math.max(prevBest,sc);x.db[g]=Math.max(prevDay,sc);
+  const rk=s.b9Rank&&typeof s.b9Rank==='object'?s.b9Rank:(s.b9Rank={since:ctx.t,total:{},daily:{},day:ctx.day});if(rk.day!==ctx.day){rk.day=ctx.day;rk.daily={}}rk.total||={};rk.daily||={};
+  rk.daily[g]=Math.max(rk.daily[g]||0,sc);rk.total[g]=Math.max(rk.total[g]||0,sc);
+  return {a:a.a,ok:true,g,score:sc,best:x.best[g],dayBest:x.db[g],newBest:sc>prevBest,newDay:sc>prevDay,left:G.daily-(x.n[g]||0),msg:G.name+' '+sc+' 分'+(sc>prevBest?'，刷新个人纪录！':'')};
+ }
+ return null;
+}
+function arcAction(s,act,ctx){
+ const a=String(act?.a||'');if(a!=='arcStart'&&a!=='arcEnd')return null;
+ if(ctx.ownerId!=null||ctx.visit)return {a,ok:false,msg:'只能在自己的小岛玩'};
+ return arcAct(s,{a,g:typeof act.g==='string'?act.g:'',shots:act.shots,dims:act.dims&&typeof act.dims==='object'?{w:act.dims.w,h:act.dims.h}:null},ctx);
+}
+
+return {ARC_VERSION,GAMES,DT,rng,POOL,BOWL,FLING,SECRET_PTS,BOUNCE_DIMS,fishSize,setup,validShot,totalShots,over,shoot,step,replay,validDims,arcAct,arcAction};
+})();
+//#endregion
+//#region b26 囤货仓库
+// 仓库等级：格数、每格上限、到价提醒/自动出售条目数、升级价（D币）。存档 state.b26，仓位与数量仍以 b12.vault 为准（vault 是 inv 的预留子集）。
+const B26={cost:[0,80000,300000,1000000],slots:[12,18,22,30],unit:[300,600,1200,2400],alerts:[0,8,16,24],orders:[0,0,8,16],
+ perks:['基础货架 12 格','加石基与二层：18 格、每格 600 个、行情走势、到价提醒','冷库：22 格、每格 1200 个、到价自动出售（管家巡视时执行）','吊车与金招牌：30 格、每格 2400 个、自动出售 16 条']};
+function b26State(s){
+ let d=s.b26;if(!d||typeof d!=='object'||Array.isArray(d))d=s.b26={v:1,lv:1,order:{},alert:{},sold:[]};
+ d.lv=Math.max(1,Math.min(4,Math.floor(Number(d.lv))||1));
+ const clean=(raw,fn,max)=>{const o={};if(raw&&typeof raw==='object'&&!Array.isArray(raw))for(const k of Object.keys(raw).slice(0,max)){const v=fn(k,raw[k]);if(v)o[k]=v}return o};
+ d.order=clean(d.order,(k,v)=>{const [id,q]=k.split(':');return Object.hasOwn(ITEM_NAME,id)&&/^[012]$/.test(q)&&Array.isArray(v)&&Number.isSafeInteger(v[0])&&v[0]>0&&Number.isSafeInteger(v[1])&&v[1]>0?[v[0],v[1]]:null},B26.orders[3]);
+ d.alert=clean(d.alert,(k,v)=>Object.hasOwn(ITEM_NAME,k)&&Number.isSafeInteger(v)&&v>0?v:null,B26.alerts[3]);
+ if(!Array.isArray(d.sold))d.sold=[];d.sold=d.sold.filter(x=>Array.isArray(x)&&x.length===5).slice(-20);d.v=1;return d}
+const b26Lv=s=>b26State(s).lv;
+function b26Check(s,d,id,q,n){
+ const L=b26Lv(s)-1,cur=d.vault[id],sum=cur?cur[0]+cur[1]+cur[2]:0,after=sum-(cur?.[q]||0)+n;
+ if(n>0&&!cur&&Object.keys(d.vault).length>=B26.slots[L])return '仓位已满（'+B26.slots[L]+' 格），升级仓库可以多放几格';
+ if(after>sum&&after>B26.unit[L])return '每格最多放 '+B26.unit[L]+' 个，升级仓库可以放更多';
+ return ''}
+function b26Room(s,d,id){const L=b26Lv(s)-1,cur=d.vault[id];if(!cur&&Object.keys(d.vault).length>=B26.slots[L])return 0;return Math.max(0,B26.unit[L]-(cur?cur[0]+cur[1]+cur[2]:0))}
+function b26Action(s,act,ctx){
+ const a=act?.a;if(a!=='whUp'&&a!=='whOrder'&&a!=='whAlert')return null;
+ const fail=msg=>({a,ok:false,msg});if(ctx.ownerId!=null||ctx.visit)return fail('只能管理自己的仓库');
+ const d=b26State(s),L=d.lv-1;
+ if(a==='whUp'){if(d.lv>=4)return fail('仓库已经是最高级');const cost=B26.cost[d.lv];if(!(ctx.coins>=cost))return fail('D币不足（升级要 '+cost.toLocaleString('zh-CN')+'）');d.lv++;return {a,ok:true,spend:cost,lv:d.lv,msg:'仓库升到 '+d.lv+' 级：'+B26.perks[d.lv-1]}}
+ const id=String(act.id||'');if(!Object.hasOwn(ITEM_NAME,id))return fail('没有这种货物');
+ const price=Math.floor(Number(act.price));if(!(Number.isSafeInteger(price)&&price>=0&&price<=1e9))return fail('价格无效');
+ if(a==='whAlert'){if(d.lv<2)return fail('仓库 2 级开放到价提醒');if(!price){delete d.alert[id];return {a,ok:true,msg:'已取消提醒'}}
+  if(!d.alert[id]&&Object.keys(d.alert).length>=B26.alerts[L])return fail('提醒最多 '+B26.alerts[L]+' 条');d.alert[id]=price;return {a,ok:true,msg:ITEM_NAME[id]+' 到 '+price+' 时提醒'}}
+ const q=act.q;if(!(q===0||q===1||q===2))return fail('品质无效');const key=id+':'+q;
+ if(d.lv<3)return fail('仓库 3 级开放到价自动出售');if(!price){delete d.order[key];return {a,ok:true,msg:'已取消自动出售'}}
+ const n=Math.floor(Number(act.n));if(!(Number.isSafeInteger(n)&&n>0&&n<=B26.unit[3]))return fail('数量无效');
+ if(!d.order[key]&&Object.keys(d.order).length>=B26.orders[L])return fail('自动出售最多 '+B26.orders[L]+' 条');
+ const k12=b12State(s).keep[id];if(k12){k12[q]=0;if(!k12.some(Boolean))delete s.b12.keep[id]}
+ d.order[key]=[price,n];return {a,ok:true,msg:ITEM_NAME[id]+' 价格到 '+price+' 时由管家卖出 '+n+' 个'}}
+// 管家巡视：到价的仓库订单先从预留里放出来再卖（按当天价格，照常扣代卖抽成）
+function b26AutoSell(s,pr,day){
+ const masked=b12WarehouseMasks.get(s),d=s.b12,w=b26State(s),sells=[];if(!masked||w.lv<3)return sells;
+ for(const [key,[price,n]]of Object.entries(w.order)){const [id,qs]=key.split(':'),q=+qs;if(!(pr[id]>=price))continue;
+  const amt=Math.min(n,b12Count(masked.hidden[id]?.[q]),b12Count(d.vault[id]?.[q]));if(!amt)continue;
+  masked.hidden[id][q]-=amt;d.vault[id][q]-=amt;if(!d.vault[id].some(Boolean))delete d.vault[id];(s.inv[id]||=[0,0,0])[q]+=amt;
+  if(amt>=n)delete w.order[key];else w.order[key]=[price,n-amt];w.sold.push([day,id,q,amt,pr[id]]);sells.push({a:'sell',id,q,n:amt})}
+ w.sold=w.sold.slice(-20);return sells}
+//#endregion
 function b12ExtraAction(s,act,ctx) {
+    const wh=b26Action(s,act,ctx);if(wh)return wh;
+    const arc=ARC_RULES.arcAction(s,act,ctx);if(arc)return arc;
     const story=b12StoryAction(s,act,ctx);if(story)return story;
     const guard=b12GuardAction(s,act,ctx);if(guard)return guard;
     if(act.a==='stockBuy'){
@@ -1428,3 +1702,5 @@ function b12StoryAction(s,act,ctx){
  }
  return null;
 }
+
+export {B26,b26State};

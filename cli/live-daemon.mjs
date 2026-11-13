@@ -19,6 +19,10 @@ import {
 import { SnipeScheduler } from '../execution/snipe-scheduler.mjs'
 import { UpdateNotifier } from '../execution/update-notifier.mjs'
 import {
+  computeNextNpcWakeSec,
+  runNpcToyStallSlice,
+} from '../execution/npc-toy-stall.mjs'
+import {
   computeNextXianWakeSec,
   normalizeXianOptions,
   runXianCultivationSlice,
@@ -56,6 +60,7 @@ export async function runLiveAccountTick({
   rulesPath = null,
   maxTickSolveMs = 45000,
   xianOptions = {},
+  npcOptions = { enabled: false },
   dryRun = false,
 }) {
   const normalizedXian = normalizeXianOptions(xianOptions)
@@ -291,10 +296,15 @@ export async function runLiveAccountTick({
   }
 
   // If an urgent Domestic/Visit transaction just fired, re-enter loop promptly before background slices,
-  // while strictly clamping `nextWakeSec` to any committed upcoming snipe's physical staging lead (and xian wake)!
+  // while strictly clamping `nextWakeSec` to any committed upcoming snipe's physical staging lead (and arena/npc/xian wakes)!
   if (!dryRun && controllerOut.status === 'confirmed') {
     const nowAfterTxSec = httpClient.estimatedServerNowSec()
     let confirmedWakeSec = Number(controllerOut.nextWakeSec || (nowAfterTxSec + (adapter.R.WORLD?.minGap || 2)))
+    const goalClaimedInBatch = (controllerOut.compiled?.domesticBatch || []).some((x) => x?.a === 'goal')
+    if (goalClaimedInBatch && runtimeState) {
+      runtimeState.lastBattlePrepAtSec = 0
+      confirmedWakeSec = Math.min(confirmedWakeSec, nowAfterTxSec + 2)
+    }
     const nextSnipeAfterTx = snipeScheduler?.nextExactUnlockInfo(nowAfterTxSec)
     if (nextSnipeAfterTx) {
       const prepLeadAfterTx = snipeScheduler.computePhysicalPrepLeadSec(nextSnipeAfterTx.entry, adapter, httpClient)
@@ -305,10 +315,26 @@ export async function runLiveAccountTick({
     }
     if (snipeScheduler?.needsScheduleRefresh?.()) {
       confirmedWakeSec = nowAfterTxSec
-    } else if (normalizedXian.enabled) {
-      const xianWakeAfterTx = computeNextXianWakeSec(lastInLockWorld || controllerOut.world, nowAfterTxSec, normalizedXian)
-      if (Number.isFinite(xianWakeAfterTx)) {
-        confirmedWakeSec = Math.min(confirmedWakeSec, Math.max(nowAfterTxSec + 1, xianWakeAfterTx))
+    } else {
+      if ((runtimeState?.arenaRemaining || 0) > 0) {
+        confirmedWakeSec = Math.min(confirmedWakeSec, nowAfterTxSec + 9)
+      }
+      if (Boolean(npcOptions?.enabled) && !snipeScheduler?.shouldBlockBackgroundWork(nowAfterTxSec)) {
+        const npcWakeAfterTx = computeNextNpcWakeSec(
+          adapter,
+          lastInLockWorld || controllerOut.txResult?.worldAfter || controllerOut.world,
+          nowAfterTxSec,
+          npcOptions
+        )
+        if (Number.isFinite(npcWakeAfterTx)) {
+          confirmedWakeSec = Math.min(confirmedWakeSec, Math.max(nowAfterTxSec + 2, npcWakeAfterTx))
+        }
+      }
+      if (normalizedXian.enabled) {
+        const xianWakeAfterTx = computeNextXianWakeSec(lastInLockWorld || controllerOut.world, nowAfterTxSec, normalizedXian)
+        if (Number.isFinite(xianWakeAfterTx)) {
+          confirmedWakeSec = Math.min(confirmedWakeSec, Math.max(nowAfterTxSec + 1, xianWakeAfterTx))
+        }
       }
     }
     return {
@@ -329,6 +355,7 @@ export async function runLiveAccountTick({
     arenaBout: null,
     huancai: null,
     xian: null,
+    npc: null,
     discovery: null,
   }
 
@@ -385,6 +412,9 @@ export async function runLiveAccountTick({
         if (runtimeState.arenaRemaining != null && boutOut.status === 'bout-completed') {
           runtimeState.arenaRemaining = Math.max(0, runtimeState.arenaRemaining - 1)
         }
+        if (boutOut.chestMilestoneReached) {
+          runtimeState.lastBattlePrepAtSec = 0
+        }
       } else if (boutOut.status === 'daily-quota-complete' || boutOut.status === 'not-adopted') {
         runtimeState.arenaRemaining = 0
       }
@@ -422,6 +452,25 @@ export async function runLiveAccountTick({
       }
     }
 
+    // C.5b: Daily 52D Toy Stall Slice (`NPC.daily = 52`, `0` stamina, `0` D-coins, 10x Hard Gomoku `1.5×` + Card batches)
+    if (Boolean(npcOptions?.enabled) && !snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())) {
+      const npcOut = await runNpcToyStallSlice({
+        account,
+        adapter,
+        httpClient,
+        journal,
+        lockRootDir,
+        observedWorld: lastInLockWorld || controllerOut.world || null,
+        shouldAbortFn: () => Boolean(snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())),
+        npcOptions,
+        dryRun,
+      })
+      backgroundReport.npc = npcOut
+      if (npcOut?.status === 'confirmed' && npcOut.worldAfter) {
+        lastInLockWorld = npcOut.worldAfter
+      }
+    }
+
     // C.6: Incremental Neighbor Discovery Slice (`main` only, `<= 2` pages, `<= 4` probes)
     if (lastInLockWorld && snipeScheduler?.isStealEnabled() && !snipeScheduler.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())) {
       backgroundReport.discovery = await snipeScheduler.runIncrementalDiscoverySlice(adapter, httpClient, lastInLockWorld, {
@@ -453,6 +502,14 @@ export async function runLiveAccountTick({
   } else if (snipeScheduler?.isStealEnabled() && snipeScheduler.data.discoveryCursor) {
     nextWakeSec = Math.min(nextWakeSec, nowEndSec + 15)
   }
+  if (Boolean(npcOptions?.enabled) && !snipeScheduler?.shouldBlockBackgroundWork(nowEndSec)) {
+    const npcWake = Number.isFinite(backgroundReport.npc?.nextNpcWakeSec)
+      ? backgroundReport.npc.nextNpcWakeSec
+      : computeNextNpcWakeSec(adapter, lastInLockWorld || controllerOut.world, nowEndSec, npcOptions)
+    if (Number.isFinite(npcWake)) {
+      nextWakeSec = Math.min(nextWakeSec, Math.max(nowEndSec + 2, npcWake))
+    }
+  }
   if (normalizedXian.enabled) {
     const xianWake = Number.isFinite(backgroundReport.xian?.nextXianWakeSec)
       ? backgroundReport.xian.nextXianWakeSec
@@ -462,9 +519,9 @@ export async function runLiveAccountTick({
     }
   }
 
-  // Proactive Idle PlanCache Pre-Warming: ONLY when `farmWakeSec` itself (never `xianWake` / `arenaWake`!) is within 45s
+  // Proactive Idle PlanCache Pre-Warming: ONLY when `farmWakeSec` itself (never `xianWake` / `npcWake` / `arenaWake`!) is within 45s
   // and no snipe / schedule refresh is pending, pre-compute the farm wake plan in the background Worker!
-  const prewarmSourceWorld = backgroundReport.xian?.worldAfter || controllerOut.world
+  const prewarmSourceWorld = lastInLockWorld || backgroundReport.npc?.worldAfter || backgroundReport.xian?.worldAfter || controllerOut.world
   if (
     !dryRun &&
     activePlanner &&
@@ -580,6 +637,7 @@ if (isDirectMain) {
     const xianAutoSocial = hasFlag('--xian-auto-social') || process.env.MEME_XIAN_AUTO_SOCIAL === '1'
     const xianAutoDuel = hasFlag('--xian-auto-duel') || process.env.MEME_XIAN_AUTO_DUEL === '1'
     const xianAutoRealm = hasFlag('--xian-auto-realm') || process.env.MEME_XIAN_AUTO_REALM === '1'
+    const npcOptions = { enabled: !hasFlag('--disable-npc') }
     const xianOptions = normalizeXianOptions({
       enabled: enableXian,
       breakMode: xianBreakMode,
@@ -698,6 +756,7 @@ if (isDirectMain) {
         rulesPath,
         maxTickSolveMs,
         xianOptions,
+        npcOptions,
         dryRun,
       })
       await asyncPlanner.close()
@@ -757,6 +816,7 @@ if (isDirectMain) {
             rulesPath,
             maxTickSolveMs,
             xianOptions,
+            npcOptions,
             dryRun,
           })
           const nowSec = httpClient.estimatedServerNowSec()
@@ -801,8 +861,12 @@ if (isDirectMain) {
                 : xianRes?.reason === 'manual-realm-in-progress'
                   ? ' xian=yield(realm)'
                   : ''
+          const npcRes = res.backgroundReport?.npc
+          const npcTickTag = npcRes?.status === 'confirmed'
+            ? ` npc=act(${npcRes.actions?.length || 0})`
+            : ''
           console.log(
-            `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${diagTag}${xianTickTag}${updateNotifier.inlineTag()}`
+            `[${new Date().toISOString()}] [LIVE:${account}] phase=${res.phase} status=${res.controllerOut?.status ?? res.stagedOut?.status} src=${res.controllerOut?.planSource ?? '-'} sleep=${deltaSec}s GETs=${httpClient.stats.getCount} POSTs=${httpClient.stats.postCount}${diagTag}${xianTickTag}${npcTickTag}${updateNotifier.inlineTag()}`
           )
         } catch (err) {
           console.error(`[${new Date().toISOString()}] [LIVE:${account}:ERROR] ${err?.stack || err}`)

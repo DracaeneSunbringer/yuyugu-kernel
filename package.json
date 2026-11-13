@@ -1,6 +1,6 @@
 {
   "name": "yuyugu-unified-kernel",
-  "version": "1.4.4",
+  "version": "1.4.5",
   "license": "MIT",
   "type": "module",
   "repository": "https://github.com/DracaeneSunbringer/yuyugu-kernel",
@@ -8,7 +8,7 @@
   "releaseNotes": {
     "date": "2026-11-13",
     "severity": "normal",
-    "summary": "多波次偷菜时域统一、日记账增量尾索引与离散口粮连续性修复（v1.4.4）：统一多波次 upcomingWaves 调度与资源时序、修复解锁因果预留窗口与零偏移连续夹紧、引入日志字节尾偏移增量索引并消除热路径隐式 O(N) 扫描",
+    "summary": "每日全部完成奖励、擂台每日宝箱、52弟玩具摊与B26仓库规则同步（v1.4.5）：主规划器补齐 goal k=4 全部完成奖励与即时穿戴触发、修复擂台每日宝箱 gear.daily 与空包 POST 并在同锁内穿戴、新增 52弟玩具摊抢占式执行器（15路困难五子棋确定性全胜求解+抽牌清额度）及 B26 仓库规则同步",
     "upgradeCommand": "git pull"
   },
   "engines": {

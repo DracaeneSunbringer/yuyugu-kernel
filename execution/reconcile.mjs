@@ -163,7 +163,7 @@ export function reconcileUnknownWithFreshWorld(
       continue
     }
 
-    if ((tx.kind === 'act' || tx.kind === 'xian-act') && tx.revBefore != null && freshWorld.rev != null) {
+    if ((tx.kind === 'act' || tx.kind === 'xian-act' || tx.kind === 'npc-act') && tx.revBefore != null && freshWorld.rev != null) {
       if (freshWorld.rev <= tx.revBefore && tx.serverNow != null && freshWorld.now != null && freshWorld.now <= tx.serverNow) {
         // Stale or same-second snapshot cannot prove an in-flight request failed; keep unknown until server clock advances
         remainingUnknown++
@@ -497,7 +497,7 @@ export async function executeTransaction({
           worldBefore?.rev != null &&
           priorTx.revBefore != null &&
           Number(priorTx.revBefore) === Number(worldBefore.rev) &&
-          (priorTx.kind === 'act' || priorTx.kind === 'xian-act') &&
+          (priorTx.kind === 'act' || priorTx.kind === 'xian-act' || priorTx.kind === 'npc-act') &&
           priorTx.status === 'confirmed'
         ) {
           priorConfirmedOnSameRev = true
