@@ -244,9 +244,10 @@ export class PlanCache {
  *    guaranteeing a long solve starting at `leadSec = 46s` NEVER blocks `executeStagedSnipe`!
  */
 export class AsyncPlanManager {
-  constructor({ rulesPath, cache = new PlanCache() } = {}) {
+  constructor({ rulesPath, cache = new PlanCache(), createWorkerFn = null } = {}) {
     this.rulesPath = rulesPath
     this.cache = cache
+    this.createWorkerFn = typeof createWorkerFn === 'function' ? createWorkerFn : null
     this.worker = null
     this.closed = false
     this.nextJobId = 1
@@ -262,7 +263,9 @@ export class AsyncPlanManager {
 
   _ensureWorker() {
     if (this.worker) return this.worker
-    const w = new Worker(new URL('./planner-worker.mjs', import.meta.url), { execArgv: [] })
+    const w = this.createWorkerFn
+      ? this.createWorkerFn()
+      : new Worker(new URL('./planner-worker.mjs', import.meta.url), { execArgv: [] })
     w.unref()
     w.on('error', (err) => {
       if (this.activeJob && this.activeJob.worker === w) {
@@ -323,7 +326,7 @@ export class AsyncPlanManager {
         const job = this.activeJob
         if (msg.plan) {
           job.checkpointPlan = msg.plan
-          if (job.adapter && job.envelope) {
+          if (job.adapter && job.envelope && !msg.plan?.raidSchedule?.truncatedByDeadline) {
             this.cache.put({
               adapter: job.adapter,
               account: job.account,
@@ -449,7 +452,7 @@ export class AsyncPlanManager {
       settleFn = (val) => {
         if (settled) return
         settled = true
-        if (val.status === 'solved' && adapter) {
+        if (val.status === 'solved' && adapter && !val.plan?.raidSchedule?.truncatedByDeadline) {
           this.cache.put({
             adapter,
             account,

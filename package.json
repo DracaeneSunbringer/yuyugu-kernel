@@ -1,14 +1,14 @@
 {
   "name": "yuyugu-unified-kernel",
-  "version": "1.4.6",
+  "version": "1.4.7",
   "license": "MIT",
   "type": "module",
   "repository": "https://github.com/DracaeneSunbringer/yuyugu-kernel",
   "description": "Zero-hardcoded-ID unified rolling-horizon economic decision kernel, staged raid scheduler, CRN combat optimizer, and counterfactual audit engine for 52dmeme Pet World (鱼鱼谷)",
   "releaseNotes": {
-    "date": "2026-11-13",
+    "date": "2026-11-14",
     "severity": "normal",
-    "summary": "每日全部完成奖励、擂台每日宝箱、52弟玩具摊与B26仓库规则同步（v1.4.5）：主规划器补齐 goal k=4 全部完成奖励与即时穿戴触发、修复擂台每日宝箱 gear.daily 与空包 POST 并在同锁内穿戴、新增 52弟玩具摊抢占式执行器（15路困难五子棋确定性全胜求解+抽牌清额度）及 B26 仓库规则同步",
+    "summary": "解除预约偷菜下同岛日采集锁死并对齐刷新视野窗口（v1.4.7）：修复主规划器跨岛突袭与同岛日剩余体力双重计数、满体力虚幻回血及按需进食虚高体力下限自锁，使同岛日炸矿/钓鱼/敲矿正常即时执行；对齐 SnipeScheduler 刷新判定与控制器评估窗口并跳过超期截断计划缓存，消除空转轮询",
     "upgradeCommand": "git pull"
   },
   "engines": {

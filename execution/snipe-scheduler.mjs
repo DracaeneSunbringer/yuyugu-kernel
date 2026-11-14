@@ -54,6 +54,9 @@ export class SnipeScheduler {
     selfIds = [],
     domesticOnly = false,
     minStealSpots = 1,
+    controllerHorizonSec = 3600,
+    maxUpcomingTargets = 10,
+    maxReadyProbes = 4,
   } = {}) {
     this.accountKey = accountKey
     this.scheduleFilePath = scheduleFilePath
@@ -62,6 +65,9 @@ export class SnipeScheduler {
     this.selfIds = new Set((selfIds || []).map(Number).filter((n) => Number.isFinite(n) && n > 0))
     this.domesticOnly = Boolean(domesticOnly) || accountKey === 'secondary'
     this.minStealSpots = this.domesticOnly ? 999999 : Math.max(1, Number(minStealSpots || 1))
+    this.controllerHorizonSec = Math.max(60, Number(controllerHorizonSec || 3600))
+    this.maxUpcomingTargets = Math.max(1, Number(maxUpcomingTargets || 10))
+    this.maxReadyProbes = Math.max(1, Number(maxReadyProbes || 4))
     this.data = this._load()
     // Keep most recent raw `visit` snapshots in memory so `runControllerStep` & `executeStagedSnipe` get exact `isle` + `posterior`
     this._liveVisitBundles = new Map()
@@ -683,10 +689,7 @@ export class SnipeScheduler {
           this.activeRaidSchedule.refreshReason = `committed-target-drifted:${idNum}`
         }
       } else if (!this.activeRaidSchedule.evaluatedTargetSet.has(idNum)) {
-        if (
-          (entry.readyEligible && Number(entry.projectedScore || 0) > 0) ||
-          (entry.upcomingEligible && Number(entry.projectedScore || 0) > 0)
-        ) {
+        if (this.wouldTargetEnterControllerSet(nowSec, idNum)) {
           this.activeRaidSchedule.needsRefresh = true
           this.activeRaidSchedule.refreshReason = `new-positive-ev-target:${idNum}`
         }
@@ -945,6 +948,66 @@ export class SnipeScheduler {
    *       * if `leadSec > ceil(T_prep + 2)`, mark `needsRefresh = true` so `live-daemon` wakes `runControllerStep` first;
    *       * if `leadSec <= ceil(T_prep + 2)` (imminent unplanned discovery), allow immediate fast-path staging with audit reason.
    */
+  wouldTargetEnterControllerSet(nowSec, targetId) {
+    if (!this.isStealEnabled()) return false
+    const idNum = Number(targetId)
+    if (!Number.isFinite(idNum) || idNum <= 0) return false
+    const dueReady = Object.values(this.data.targets || {})
+      .filter((e) => e && !this.isTargetBlocked(e, nowSec) && Number(e.projectedScore || 0) > 0 && (
+        e.readyEligible ||
+        (e.upcomingEligible && e.expectedUnlockAt != null && Number(e.expectedUnlockAt) <= nowSec)
+      ))
+      .sort((a, b) => (Number(b.projectedScore || 0) - Number(a.projectedScore || 0)))
+      .slice(0, this.maxReadyProbes)
+    if (dueReady.some((e) => Number(e.id) === idNum)) return true
+    const upcoming = this.collectUpcomingTargetsForController(null, { now: nowSec }, {
+      horizonSec: this.controllerHorizonSec,
+      maxUpcomingTargets: this.maxUpcomingTargets,
+    })
+    return upcoming.some((c) => Number(c.id) === idNum && Number(c.projectedScore || 0) > 0)
+  }
+
+  nextHorizonEntrySec(nowSec) {
+    if (!this.isStealEnabled()) return null
+    const sched = this.activeRaidSchedule
+    let earliestEntrySec = Infinity
+    for (const e of Object.values(this.data.targets || {})) {
+      if (!e || this.isTargetBlocked(e, nowSec)) continue
+      const idNum = Number(e.id)
+      if (sched?.evaluatedTargetSet?.has(idNum) || sched?.committedByTargetId?.has(idNum)) continue
+      const waves = Array.isArray(e.upcomingWaves) && e.upcomingWaves.length > 0
+        ? e.upcomingWaves
+        : (e.upcomingEligible && e.expectedUnlockAt != null
+            ? [{
+                waveIndex: 0,
+                unlockAt: e.expectedUnlockAt,
+                exactUnlockKnown: e.exactUnlockKnown,
+                upcomingSpots: e.upcomingSpots,
+                projectedScore: e.projectedScore,
+                upcomingBeliefSummary: e.upcomingBeliefSummary,
+              }]
+            : [])
+      const cached = this._liveVisitBundles.get(e.id)
+      for (const w of waves) {
+        const unlockAtSec = Math.floor(Number(w.unlockAt || 0))
+        const lead = unlockAtSec - nowSec
+        if (!(lead > this.controllerHorizonSec)) continue
+        if (Number(w.upcomingSpots || 0) < this.minStealSpots) continue
+        const score = Number(w.projectedScore || e.projectedScore || 0)
+        if (!(score > 0)) continue
+        const waveBundle = cached?.waveBundlesByUnlock?.get(unlockAtSec)
+          || (w.waveIndex === 0 ? (cached?.upcomingWaveBundle || cached?.waveBundle || null) : null)
+        const beliefSummary = w.upcomingBeliefSummary || e.upcomingBeliefSummary || null
+        if (!waveBundle && !beliefSummary) continue
+        const candEntrySec = Math.max(nowSec + 1, unlockAtSec - this.controllerHorizonSec)
+        if (candEntrySec < earliestEntrySec && this.wouldTargetEnterControllerSet(candEntrySec, idNum)) {
+          earliestEntrySec = candEntrySec
+        }
+      }
+    }
+    return Number.isFinite(earliestEntrySec) ? earliestEntrySec : null
+  }
+
   nextExactUnlockInfo(nowSec) {
     if (!this.isStealEnabled()) return null
     let best = null
@@ -975,9 +1038,11 @@ export class SnipeScheduler {
         } else {
           const immWindow = Math.ceil(this.computePhysicalPrepLeadSec(entry) + 2)
           if (leadSec > immWindow) {
-            sched.needsRefresh = true
-            if (!sched.refreshReason) {
-              sched.refreshReason = `new-positive-ev-target:${idNum}`
+            if (this.wouldTargetEnterControllerSet(nowSec, idNum)) {
+              sched.needsRefresh = true
+              if (!sched.refreshReason) {
+                sched.refreshReason = `new-positive-ev-target:${idNum}`
+              }
             }
             continue
           }

@@ -1635,18 +1635,16 @@ function optimizeAndSimulateSequence(adapter, {
       if (execPrngMap.size === 0) {
         fn = baseExecPrng
       } else {
-        let h = baseExecSeed ^ 0x811c9dc5
+        let h = (baseExecSeed ^ 0x811c9dc5) >>> 0
         for (let i = 0; i < key.length; i++) {
           h = Math.imul(h ^ key.charCodeAt(i), 0x01000193) >>> 0
         }
-        let state = (h || 0x52d777) >>> 0
-        fn = () => {
-          state = (state + 0x6d2b79f5) >>> 0
-          let z = state
-          z = Math.imul(z ^ (z >>> 15), z | 1)
-          z ^= z + Math.imul(z ^ (z >>> 7), z | 61)
-          return ((z ^ (z >>> 14)) >>> 0) / 4294967296
-        }
+        h ^= h >>> 16
+        h = Math.imul(h, 0x85ebca6b) >>> 0
+        h ^= h >>> 13
+        h = Math.imul(h, 0xc2b2ae35) >>> 0
+        h ^= h >>> 16
+        fn = adapter.makeDeterministicPrng((h || 0x52d777) >>> 0)
       }
       execPrngMap.set(key, fn)
     }
@@ -3040,12 +3038,13 @@ function optimizeAndSimulateSequence(adapter, {
         const committedPassEatUnits = []
         const committedPassWorkUnits = []
 
+        const isRootImmediateBucket = u === 0 && startWorld.now <= t0
         // Unified Stamina × Cash × Workshop-Slots Bounded Knapsack DP across:
         // - Existing stamina-hungry work (`existingCraftWorkUnits` + `bomb`/`fish`/`mine`)
         // - Existing stamina supplies (`inv-eat` + `coffee`)
         // - Cargo edible supplies (`tide_snack` + ALL `q=0` edible crops on `b12Stock`)
         // - Cargo `recipe-bundle`s (1-stage & 2-stage chains), `explosive`s, and `direct` arbitrage!
-        for (let pass = 0; pass < (u === 0 ? 2 : 1) && availCoins > 0; pass++) {
+        for (let pass = 0; pass < (isRootImmediateBucket ? 2 : 1) && availCoins > 0; pass++) {
           const totalOpenSlots = distinctOpenIsles.reduce(
             (sAcc, iIdx) => sAcc + Math.floor((unreservedWorkshopByIsle.get(iIdx) || 0) + 1e-9),
             0
@@ -3523,7 +3522,6 @@ function optimizeAndSimulateSequence(adapter, {
             ...bundledCargoP1,
           ]
           const phase2NonSlotWork = [
-            ...bundledFreeWork,
             ...bundledPaidWork,
             ...bundledCargoExplosive,
             ...(slotsBinding ? [] : bundledRecipeUnits),
@@ -3564,7 +3562,7 @@ function optimizeAndSimulateSequence(adapter, {
             }
           }
           if (rawGcd <= 0) rawGcd = 1
-          const maxCashCells = u === 0 ? (S_eff > 0 ? 250 : 800) : (S_eff > 0 ? 80 : 140)
+          const maxCashCells = isRootImmediateBucket ? (S_eff > 0 ? 250 : 800) : (S_eff > 0 ? 80 : 140)
           const cashUnit = !cashBinding
             ? 1
             : Math.floor(availCoins / rawGcd) > maxCashCells
@@ -3586,7 +3584,24 @@ function optimizeAndSimulateSequence(adapter, {
           const E = Math.min(220, maxReachableEn, Math.max(effectiveFreeEn, totalWorkEnDemand))
           const stride = C + 1
           const sliceSize = (E + 1) * stride
-          if (cashBinding && u === 0) {
+          const bestFreeWorkAtMost = new Float64Array(E + 1)
+          for (let i = 0; i < bundledFreeWork.length; i++) {
+            const fw = bundledFreeWork[i]
+            const cEn = fw.enCost || 0
+            if (cEn <= 0) {
+              if (fw.netGain > 0) {
+                for (let e = 0; e <= E; e++) bestFreeWorkAtMost[e] += fw.netGain
+              }
+              continue
+            }
+            if (cEn > E) continue
+            const gain = fw.netGain
+            for (let e = E; e >= cEn; e--) {
+              const cand = bestFreeWorkAtMost[e - cEn] + gain
+              if (cand > bestFreeWorkAtMost[e]) bestFreeWorkAtMost[e] = cand
+            }
+          }
+          if (cashBinding && isRootImmediateBucket) {
             recordCashGrid('cargo-stamina-slots-dp', cashUnit, rawGcd, (S_eff + 1) * sliceSize)
           }
 
@@ -3770,12 +3785,23 @@ function optimizeAndSimulateSequence(adapter, {
               maxReachableS = sMaxDst
             }
 
-            let bestIdx3 = Math.min(E, effectiveFreeEn) * stride
-            let bestVal3 = dp3[bestIdx3]
-            for (let idx = 0; idx < totalCells3; idx++) {
-              if (dp3[idx] > bestVal3 + 1e-6) {
-                bestVal3 = dp3[idx]
-                bestIdx3 = idx
+            const initRemE = Math.min(E, effectiveFreeEn)
+            let bestIdx3 = initRemE * stride
+            let bestVal3 = dp3[bestIdx3] + bestFreeWorkAtMost[initRemE]
+            let idx = 0
+            for (let s = 0; s <= S_eff; s++) {
+              for (let remE = 0; remE <= E; remE++) {
+                const fwGain = bestFreeWorkAtMost[remE]
+                for (let c = 0; c < stride; c++, idx++) {
+                  const v = dp3[idx]
+                  if (v > -1e17) {
+                    const tot = v + fwGain
+                    if (tot > bestVal3 + 1e-6) {
+                      bestVal3 = tot
+                      bestIdx3 = idx
+                    }
+                  }
+                }
               }
             }
             let curIdx = bestIdx3
@@ -3810,12 +3836,21 @@ function optimizeAndSimulateSequence(adapter, {
               }
             }
           } else {
-            let bestIdx1 = Math.min(E, effectiveFreeEn) * stride
-            let bestVal1 = dp1[bestIdx1]
-            for (let idx = 0; idx < sliceSize; idx++) {
-              if (dp1[idx] > bestVal1 + 1e-6) {
-                bestVal1 = dp1[idx]
-                bestIdx1 = idx
+            const initRemE = Math.min(E, effectiveFreeEn)
+            let bestIdx1 = initRemE * stride
+            let bestVal1 = dp1[bestIdx1] + bestFreeWorkAtMost[initRemE]
+            let idx = 0
+            for (let remE = 0; remE <= E; remE++) {
+              const fwGain = bestFreeWorkAtMost[remE]
+              for (let c = 0; c < stride; c++, idx++) {
+                const v = dp1[idx]
+                if (v > -1e17) {
+                  const tot = v + fwGain
+                  if (tot > bestVal1 + 1e-6) {
+                    bestVal1 = tot
+                    bestIdx1 = idx
+                  }
+                }
               }
             }
             let curIdx = bestIdx1
@@ -5118,7 +5153,7 @@ function optimizeAndSimulateSequence(adapter, {
       }
     }
 
-    // 2b. Compute remaining same-isle passive regen, causal peak farm/craft deficit & future urgent farm demand across `[u+1, isleEnd]`
+    // 2b. Compute remaining same-isle passive regen, chronological demand events, causal peak farm/craft deficit & deferral factor
     const sameIsleFutureIndices = []
     let futureSameIsleRegenEn = 0
     let estFutureSameIsleFarmEn = 0
@@ -5135,6 +5170,17 @@ function optimizeAndSimulateSequence(adapter, {
         hasPostMidnightSameIsleReset = true
       }
     }
+    const isleBoundaryU = adapter.nextIsleBoundary(b.atSec, startWorld.clockStart)
+    const sameIsleRaidsU = futureRaidsU.filter((fr) => R.isleIndex(fr.unlockAtSec) === b.isleIndex)
+    const nextIsleRaidsU = futureRaidsU.filter((fr) => R.isleIndex(fr.unlockAtSec) > b.isleIndex)
+    const sameIsleDemandEvents = []
+    let sameIsleSimEndSec = b.atSec
+    const earliestFutureSameIsleDtSec = sameIsleFutureIndices.length > 0
+      ? Math.max(6, seqBuckets[sameIsleFutureIndices[0]].atSec - b.atSec)
+      : 0
+    const sameIsleDeferFactor = sameIsleFutureIndices.length > 0
+      ? discountFactor(Math.max(Number(objectiveCfg.discountRatePerHour || 0), 0.002), earliestFutureSameIsleDtSec)
+      : 1
     let curRawFishEvForGate = 0
     let maxFutureSameIsleFishEv = 0
     if (sameIsleFutureIndices.length > 0) {
@@ -5159,7 +5205,31 @@ function optimizeAndSimulateSequence(adapter, {
         sameIslePrefixRegenDemand.push({ cumRegen: futureSameIsleRegenEn, cumFarmCraft: cumFarmCraftDemand })
         const defHere = cumFarmCraftDemand - futureSameIsleRegenEn
         if (defHere > peakFarmCraftDeficitEn) peakFarmCraftDeficitEn = defHere
+        if (fuFarm > 0 || fuCraft > 0 || fu === sameIsleFutureIndices[0]) {
+          sameIsleDemandEvents.push({
+            atSec: fSec,
+            farmCraftEn: fuFarm + fuCraft,
+            isFirstFutureBucket: fu === sameIsleFutureIndices[0],
+            raidEn: 0,
+          })
+        }
       }
+      for (let rIdx = 0; rIdx < sameIsleRaidsU.length; rIdx++) {
+        const fr = sameIsleRaidsU[rIdx]
+        sameIsleDemandEvents.push({
+          atSec: fr.unlockAtSec,
+          farmCraftEn: 0,
+          isFirstFutureBucket: false,
+          raidEn: Math.max(0, Math.floor(Number(fr.energyCost || 0))),
+          raidIdx: rIdx,
+        })
+      }
+      sameIsleDemandEvents.sort((a, b2) => (a.atSec - b2.atSec) || (b2.raidEn - a.raidEn))
+      const lastSameIsleBucketSec = seqBuckets[sameIsleFutureIndices[sameIsleFutureIndices.length - 1]].atSec
+      const maxSameIsleRaidSec = sameIsleRaidsU.length > 0 ? sameIsleRaidsU[sameIsleRaidsU.length - 1].unlockAtSec : 0
+      sameIsleSimEndSec = (nextIsleRaidsU.length > 0 || tH >= isleBoundaryU)
+        ? Math.min(tH, isleBoundaryU)
+        : Math.min(tH, isleBoundaryU, Math.max(lastSameIsleBucketSec, maxSameIsleRaidSec))
       if (allowedSet.has('fish')) {
         const fyNow = expectedFishYieldPerCast(adapter, execWorld.state, b.atSec, true)
         curRawFishEvForGate = Object.entries(fyNow.byFish).reduce(
@@ -5433,30 +5503,39 @@ function optimizeAndSimulateSequence(adapter, {
       let anyFeasible = false
       let minFeasiblePostEn = Infinity
       const P = poolTemplate.length
-      const remArr = new Int32Array(P)
+      const baseRemArr = new Int32Array(P)
+      for (let i = 0; i < P; i++) baseRemArr[i] = poolTemplate[i].rem
       const cashFloor = Number(constraints.cashReserveFloor || 0)
+      const initFreeCoins = Math.max(0, Number(coinsStart || 0) - cashFloor)
+      const postMidNatDay = hasPostMidnightSameIsleReset ? R.worldDay(firstPostMidSec) : null
 
-      for (let postE = 0; postE <= maxPostE; postE++) {
-        if (postE < bucketEnFloor) {
-          schedByPostEn[postE] = { feasible: false }
-          continue
-        }
-        for (let i = 0; i < P; i++) remArr[i] = poolTemplate[i].rem
-        let e = postE
-        let enT = postE >= enMaxVal ? b.atSec : exactStartEnTU
-        let freeCoins = Math.max(0, Number(coinsStart || 0) - cashFloor)
-        let curNatDay = b.naturalDay
-        let snackUsedDay = extraSnackUsedToday
-        let coffeeUsedDay = extraCoffeeUsedToday
-        let deferredPrepCost = 0
-        let deferredSameIsleAddedEn = 0
-        let deferredCoffeeEn = 0
-        let deferredCashReserve = 0
-        let deferredEatReserve = null
+      const simulateRaidSequence = (raidsList, {
+        initEn,
+        initEnT,
+        initCoins,
+        initNatDay,
+        initSnackUsedDay,
+        initCoffeeUsedDay,
+        initRemArr,
+      }) => {
+        const rem = new Int32Array(initRemArr)
+        let e = initEn
+        let enT = initEnT
+        let freeCoins = initCoins
+        let curNatDay = initNatDay
+        let snackUsedDay = initSnackUsedDay
+        let coffeeUsedDay = initCoffeeUsedDay
+        let prepCost = 0
+        let sameIsleAddedEn = 0
+        let coffeeEn = 0
+        let postMidSameIsleCoffeeUsed = 0
+        let cashReserve = 0
+        let eatReserve = null
         let feasible = true
+        const addedPerRaid = new Int32Array(raidsList.length)
 
-        for (let rIdx = 0; rIdx < futureRaidsU.length; rIdx++) {
-          const fr = futureRaidsU[rIdx]
+        for (let rIdx = 0; rIdx < raidsList.length; rIdx++) {
+          const fr = raidsList[rIdx]
           const atSec = fr.unlockAtSec
           const needEn = Math.max(0, Math.floor(Number(fr.energyCost || 0)))
           const rNatDay = R.worldDay(atSec)
@@ -5477,7 +5556,7 @@ function optimizeAndSimulateSequence(adapter, {
             let bestOpp = Infinity
             let bestGain = 0
             for (let pIdx = 0; pIdx < P; pIdx++) {
-              if (remArr[pIdx] <= 0) continue
+              if (rem[pIdx] <= 0) continue
               const pe = poolTemplate[pIdx]
               if (pe.cashCost > 0 && freeCoins < pe.cashCost) continue
               if (pe.kind === 'coffee') {
@@ -5514,24 +5593,28 @@ function optimizeAndSimulateSequence(adapter, {
               break
             }
             const chosen = poolTemplate[bestIdx]
-            remArr[bestIdx] -= 1
+            rem[bestIdx] -= 1
             e += bestGain
-            deferredPrepCost += bestOpp
-            if (isSameIsleR) deferredSameIsleAddedEn += bestGain
+            addedPerRaid[rIdx] += bestGain
+            prepCost += bestOpp
+            if (isSameIsleR) sameIsleAddedEn += bestGain
             if (chosen.kind === 'coffee') {
               coffeeUsedDay += 1
+              if (postMidNatDay && curNatDay === postMidNatDay) {
+                postMidSameIsleCoffeeUsed += 1
+              }
               freeCoins -= chosen.cashCost
-              deferredCoffeeEn += bestGain
-              deferredCashReserve += chosen.cashCost
+              coffeeEn += bestGain
+              cashReserve += chosen.cashCost
             } else {
               if (chosen.isSnack) snackUsedDay += 1
               if (chosen.cashCost > 0) {
                 freeCoins -= chosen.cashCost
-                deferredCashReserve += chosen.cashCost
+                cashReserve += chosen.cashCost
               } else if (chosen.q != null) {
-                deferredEatReserve ||= {}
-                deferredEatReserve[chosen.id] ||= [0, 0, 0]
-                deferredEatReserve[chosen.id][chosen.q] += 1
+                eatReserve ||= {}
+                eatReserve[chosen.id] ||= [0, 0, 0]
+                eatReserve[chosen.id][chosen.q] += 1
               }
             }
           }
@@ -5541,20 +5624,169 @@ function optimizeAndSimulateSequence(adapter, {
           e -= needEn
         }
 
-        if (feasible) {
+        return {
+          feasible,
+          terminalRaidEn: e,
+          enT,
+          prepCost,
+          sameIsleAddedEn,
+          coffeeEn,
+          postMidSameIsleCoffeeUsed,
+          cashReserve,
+          eatReserve,
+          addedPerRaid,
+          remArrAfter: rem,
+          freeCoinsAfter: freeCoins,
+          curNatDayAfter: curNatDay,
+          snackUsedAfter: snackUsedDay,
+          coffeeUsedAfter: coffeeUsedDay,
+        }
+      }
+
+      for (let postE = 0; postE <= maxPostE; postE++) {
+        if (postE < bucketEnFloor) {
+          schedByPostEn[postE] = { feasible: false }
+          continue
+        }
+        const simFull = simulateRaidSequence(futureRaidsU, {
+          initEn: postE,
+          initEnT: postE >= enMaxVal ? b.atSec : exactStartEnTU,
+          initCoins: initFreeCoins,
+          initNatDay: b.naturalDay,
+          initSnackUsedDay: extraSnackUsedToday,
+          initCoffeeUsedDay: extraCoffeeUsedToday,
+          initRemArr: baseRemArr,
+        })
+        if (simFull.feasible) {
           anyFeasible = true
           if (postE < minFeasiblePostEn) minFeasiblePostEn = postE
           schedByPostEn[postE] = {
             feasible: true,
-            deferredPrepCost,
-            deferredSameIsleAddedEn,
-            deferredCoffeeEn,
-            deferredCashReserve,
-            deferredEatReserve,
-            terminalRaidEn: e,
+            deferredPrepCost: simFull.prepCost,
+            deferredSameIsleAddedEn: simFull.sameIsleAddedEn,
+            deferredCoffeeEn: simFull.coffeeEn,
+            deferredCashReserve: simFull.cashReserve,
+            deferredEatReserve: simFull.eatReserve,
+            addedPerRaid: simFull.addedPerRaid,
+            terminalRaidEn: simFull.terminalRaidEn,
+            postMidSameIsleCoffeeUsed: simFull.postMidSameIsleCoffeeUsed,
           }
         } else {
           schedByPostEn[postE] = { feasible: false }
+        }
+      }
+
+      let sameIsleOnlyByPostEn = null
+      let evalNextIsleRaids = null
+      let minNextIsleEntryEnFor = null
+      let prepKneeEntriesFor = null
+      if (sameIsleFutureIndices.length > 0 && nextIsleRaidsU.length > 0) {
+        const natDayAtIsleEnd = R.worldDay(isleBoundaryU)
+        sameIsleOnlyByPostEn = new Array(maxPostE + 1)
+        const zeroSameIsleFeasible = {
+          feasible: true,
+          prepCost: 0,
+          sameIsleAddedEn: 0,
+          coffeeEn: 0,
+          postMidSameIsleCoffeeUsed: 0,
+          cashReserve: 0,
+          eatReserve: null,
+          addedPerRaid: new Int32Array(0),
+          remArrAfter: baseRemArr,
+          freeCoinsAfter: initFreeCoins,
+          curNatDayAfter: natDayAtIsleEnd,
+          snackUsedAfter: natDayAtIsleEnd === b.naturalDay ? extraSnackUsedToday : 0,
+          coffeeUsedAfter: natDayAtIsleEnd === b.naturalDay ? extraCoffeeUsedToday : 0,
+        }
+        for (let postE = 0; postE <= maxPostE; postE++) {
+          if (postE < bucketEnFloor) {
+            sameIsleOnlyByPostEn[postE] = { feasible: false }
+            continue
+          }
+          if (sameIsleRaidsU.length === 0) {
+            sameIsleOnlyByPostEn[postE] = zeroSameIsleFeasible
+          } else {
+            const sRes = simulateRaidSequence(sameIsleRaidsU, {
+              initEn: postE,
+              initEnT: postE >= enMaxVal ? b.atSec : exactStartEnTU,
+              initCoins: initFreeCoins,
+              initNatDay: b.naturalDay,
+              initSnackUsedDay: extraSnackUsedToday,
+              initCoffeeUsedDay: extraCoffeeUsedToday,
+              initRemArr: baseRemArr,
+            })
+            if (sRes.feasible && natDayAtIsleEnd !== sRes.curNatDayAfter) {
+              sRes.curNatDayAfter = natDayAtIsleEnd
+              sRes.snackUsedAfter = 0
+              sRes.coffeeUsedAfter = 0
+            }
+            sameIsleOnlyByPostEn[postE] = sRes
+          }
+        }
+
+        const nextMemo = new Map()
+        evalNextIsleRaids = (postE, entryEnAtIsleEnd) => {
+          const pE = Math.max(0, Math.min(maxPostE, Math.floor(postE)))
+          const sRs = sameIsleOnlyByPostEn[pE]
+          if (!sRs || !sRs.feasible) return { feasible: false }
+          const entryE = Math.max(0, Math.min(maxPostE, Math.floor(entryEnAtIsleEnd)))
+          const mKey = sameIsleRaidsU.length === 0 ? entryE : (pE * (maxPostE + 1) + entryE)
+          const hit = nextMemo.get(mKey)
+          if (hit) return hit
+          const nRes = simulateRaidSequence(nextIsleRaidsU, {
+            initEn: entryE,
+            initEnT: isleBoundaryU,
+            initCoins: sRs.freeCoinsAfter,
+            initNatDay: sRs.curNatDayAfter,
+            initSnackUsedDay: sRs.snackUsedAfter,
+            initCoffeeUsedDay: sRs.coffeeUsedAfter,
+            initRemArr: sRs.remArrAfter,
+          })
+          nextMemo.set(mKey, nRes)
+          return nRes
+        }
+
+        const minEntryMemo = new Map()
+        minNextIsleEntryEnFor = (postE) => {
+          const pE = Math.max(0, Math.min(maxPostE, Math.floor(postE)))
+          const sRs = sameIsleOnlyByPostEn[pE]
+          if (!sRs || !sRs.feasible) return Infinity
+          const mKey = sameIsleRaidsU.length === 0 ? 0 : pE
+          if (minEntryMemo.has(mKey)) return minEntryMemo.get(mKey)
+          let ans = Infinity
+          for (let eTry = 0; eTry <= maxPostE; eTry++) {
+            if (evalNextIsleRaids(pE, eTry).feasible) {
+              ans = eTry
+              break
+            }
+          }
+          minEntryMemo.set(mKey, ans)
+          return ans
+        }
+
+        const kneeMemo = new Map()
+        prepKneeEntriesFor = (postE) => {
+          const pE = Math.max(0, Math.min(maxPostE, Math.floor(postE)))
+          const mKey = sameIsleRaidsU.length === 0 ? 0 : pE
+          if (kneeMemo.has(mKey)) return kneeMemo.get(mKey)
+          const minE = minNextIsleEntryEnFor(pE)
+          if (!Number.isFinite(minE)) {
+            kneeMemo.set(mKey, [])
+            return []
+          }
+          const knees = [minE]
+          let prevCost = evalNextIsleRaids(pE, minE).prepCost
+          for (let eTry = minE + 1; eTry <= maxPostE; eTry++) {
+            const nr = evalNextIsleRaids(pE, eTry)
+            if (!nr.feasible) continue
+            if (nr.prepCost < prevCost - 1e-9) {
+              knees.push(eTry)
+              prevCost = nr.prepCost
+              if (prevCost <= 1e-9) break
+            }
+          }
+          kneeMemo.set(mKey, knees)
+          return knees
         }
       }
 
@@ -5563,6 +5795,10 @@ function optimizeAndSimulateSequence(adapter, {
         minFeasiblePostEn,
         maxPostE,
         schedByPostEn,
+        sameIsleOnlyByPostEn,
+        evalNextIsleRaids,
+        minNextIsleEntryEnFor,
+        prepKneeEntriesFor,
       }
     }
 
@@ -5641,6 +5877,7 @@ function optimizeAndSimulateSequence(adapter, {
       remSameIsleRationChunks = null,
       isPostTopUpAlloc = false
     ) => {
+      const initExecEnU = Math.max(0, Math.floor(Number(execWorld.state?.en || 0)))
       const freeOvernightWorkCash = (allowedSet.has('sell') && ksIsle && freeFutureSameIsleEn > 0)
         ? ksIsle.bestAtMost[Math.min(ksIsle.E, freeFutureSameIsleEn)]
         : 0
@@ -5653,7 +5890,77 @@ function optimizeAndSimulateSequence(adapter, {
         : 0
 
       const baseChunks = remSameIsleRationChunks || []
-      const evalSameIsleCont = (eLocalVal, rawCarryEn, lumpyAddedEn, deferredSameIsleAddedEnVal = 0, deferredEatReserve = null, deferredUrgentEn = 0) => {
+      const objTagMap = new WeakMap()
+      let nextObjTag = 1
+      const getObjTag = (obj) => {
+        if (!obj) return 0
+        let t = objTagMap.get(obj)
+        if (!t) {
+          t = nextObjTag++
+          objTagMap.set(obj, t)
+        }
+        return t
+      }
+      const peakIdxByCpe = new Map()
+      const getPeakIdxForCpe = (cpe) => {
+        let pk = peakIdxByCpe.get(cpe)
+        if (pk !== undefined) return pk
+        pk = 0
+        if (ksIsle && ksIsle.E > 0) {
+          let bestSc = ksIsle.bestAtMost[0] * sameIsleDeferFactor
+          for (let idx = 1; idx <= ksIsle.E; idx++) {
+            const sc = ksIsle.bestAtMost[idx] * sameIsleDeferFactor - idx * cpe
+            if (sc > bestSc + 1e-6) {
+              bestSc = sc
+              pk = idx
+            }
+          }
+        }
+        peakIdxByCpe.set(cpe, pk)
+        return pk
+      }
+      const simSurplusMemo = new Map()
+
+      const mergeEatReserves = (aRes, bRes) => {
+        if (!aRes && !bRes) return null
+        const out = {}
+        for (const src of [aRes, bRes]) {
+          if (!src) continue
+          for (const [id, arr] of Object.entries(src)) {
+            out[id] ||= [0, 0, 0]
+            out[id][0] += Number(arr[0] || 0)
+            out[id][1] += Number(arr[1] || 0)
+            out[id][2] += Number(arr[2] || 0)
+          }
+        }
+        return out
+      }
+      const mergeRaidEntries = (sRs, nRs) => ({
+        feasible: Boolean(sRs?.feasible && nRs?.feasible),
+        deferredPrepCost: Number(sRs?.prepCost || 0) + Number(nRs?.prepCost || 0),
+        deferredSameIsleAddedEn: Number(sRs?.sameIsleAddedEn || 0) + Number(nRs?.sameIsleAddedEn || 0),
+        deferredCoffeeEn: Number(sRs?.coffeeEn || 0) + Number(nRs?.coffeeEn || 0),
+        deferredCashReserve: Number(sRs?.cashReserve || 0) + Number(nRs?.cashReserve || 0),
+        deferredEatReserve: mergeEatReserves(sRs?.eatReserve, nRs?.eatReserve),
+        addedPerRaid: sRs?.addedPerRaid || null,
+        terminalRaidEn: Number(nRs?.terminalRaidEn ?? sRs?.terminalRaidEn ?? 0),
+        postMidSameIsleCoffeeUsed: Number(sRs?.postMidSameIsleCoffeeUsed || 0) + Number(nRs?.postMidSameIsleCoffeeUsed || 0),
+      })
+
+      const simulateSameIsleSurplus = (
+        rawCarryEn,
+        deferredEatReserve = null,
+        deferredUrgentEn = 0,
+        raidAddedArr = null,
+        sameIsleCoffeeSpent = 0
+      ) => {
+        const eInt = Math.max(0, Math.floor(rawCarryEn))
+        const dUrgInt = Math.max(0, Math.floor(deferredUrgentEn || 0))
+        const cSpentInt = Math.max(0, Number(sameIsleCoffeeSpent || 0))
+        const memKey = `${eInt}:${dUrgInt}:${cSpentInt}:${getObjTag(deferredEatReserve)}:${getObjTag(raidAddedArr)}`
+        const memHit = simSurplusMemo.get(memKey)
+        if (memHit) return memHit
+
         let chunks = baseChunks
         if (deferredEatReserve && chunks.length > 0) {
           chunks = chunks.map((ch) => {
@@ -5664,20 +5971,40 @@ function optimizeAndSimulateSequence(adapter, {
           }).filter((ch) => ch.count > 0)
         }
 
-        const carryEn = Math.max(0, rawCarryEn)
-        let peakDefWithDeferred = peakFarmCraftDeficitEn
-        if (deferredUrgentEn > 0) {
-          for (const stP of sameIslePrefixRegenDemand) {
-            const defP = stP.cumFarmCraft - Math.max(0, stP.cumRegen - deferredUrgentEn)
-            if (defP > peakDefWithDeferred) peakDefWithDeferred = defP
+        let e = eInt
+        let enT = e >= enMaxVal ? b.atSec : exactStartEnTU
+        let mandatoryDeficit = 0
+        for (const ev of sameIsleDemandEvents) {
+          const adv = advanceScalarStamina(e, enT, enMaxVal, regenStepU, ev.atSec)
+          e = adv.en
+          enT = adv.enT
+          if (ev.raidEn > 0) {
+            const rAdd = raidAddedArr ? Number(raidAddedArr[ev.raidIdx] || 0) : 0
+            if (rAdd > 0) {
+              e += rAdd
+              if (e >= enMaxVal) enT = Math.max(enT, ev.atSec)
+            }
+            const need = ev.raidEn
+            if (e >= need) {
+              e -= need
+            } else {
+              mandatoryDeficit += need - e
+              e = 0
+            }
+          } else {
+            const need = ev.farmCraftEn + (ev.isFirstFutureBucket ? dUrgInt : 0)
+            if (need > 0) {
+              if (e >= need) {
+                e -= need
+              } else {
+                mandatoryDeficit += need - e
+                e = 0
+              }
+            }
           }
-          if (deferredUrgentEn > peakDefWithDeferred) peakDefWithDeferred = deferredUrgentEn
         }
-        const causalDeficit = Math.max(0, peakDefWithDeferred - carryEn)
-        const netRegenBalance = carryEn + futureSameIsleRegenEn + deferredSameIsleAddedEnVal - (raidSched ? sameIsleRaidEn : 0)
-        const effFutureMandatoryEn = totalFutureSameIsleMandatoryEn + deferredUrgentEn
-        const endDeficit = Math.max(0, effFutureMandatoryEn - netRegenBalance)
-        const mandatoryDeficit = Math.max(causalDeficit, endDeficit)
+        const advEnd = advanceScalarStamina(e, enT, enMaxVal, regenStepU, sameIsleSimEndSec)
+        const surplusAtIsleEnd = advEnd.en
 
         let mandatoryRationCost = 0
         let chunkIdx = 0
@@ -5694,7 +6021,7 @@ function optimizeAndSimulateSequence(adapter, {
           chunkRemEn -= take
           remMand -= take
         }
-        let remCoffeeSlots = postMidCoffeeCap
+        let remCoffeeSlots = Math.max(0, postMidCoffeeCap - cSpentInt)
         if (remMand > 0 && remCoffeeSlots > 0 && coffeeEnGain > 0) {
           const cNeed = Math.min(remCoffeeSlots, Math.ceil(remMand / coffeeEnGain))
           mandatoryRationCost += cNeed * coffeePrice * postMidDisc
@@ -5705,64 +6032,137 @@ function optimizeAndSimulateSequence(adapter, {
           mandatoryRationCost += remMand * 450
         }
 
-        const fundedMand = mandatoryDeficit - remMand
-        const surplusForKsIsle = Math.max(0, netRegenBalance + fundedMand - effFutureMandatoryEn)
-        const baseCov = eLocalVal + surplusForKsIsle
+        const totalSurplusPool = Math.max(0, surplusAtIsleEnd - remMand)
+        const simResult = {
+          totalSurplusPool,
+          mandatoryRationCost,
+          chunks,
+          chunkIdx,
+          chunkRemEn,
+          remCoffeeSlots,
+        }
+        simSurplusMemo.set(memKey, simResult)
+        return simResult
+      }
 
+      const scoreSameIsleContFromSurplus = (
+        eLocalVal,
+        surplusSim,
+        lumpyAddedEn,
+        allowWorkRationsHere = true,
+        { holdFromSurplus = 0, overrideCarryNext = null } = {}
+      ) => {
+        const localKsVal = ksLocal ? ksLocal.bestAtMost[Math.min(ksLocal.E, Math.max(0, Math.floor(eLocalVal)))] : 0
+        const availCovForKsIsle = Math.max(0, surplusSim.totalSurplusPool - Math.max(0, Math.floor(holdFromSurplus)))
         let bestW = -1e18
+        let bestFutureKsUsed = 0
+        let bestCarryNext = 0
+
         if (!ksIsle || ksIsle.E <= 0) {
-          const carryNext = Math.min(enMaxVal, Math.min(lumpyAddedEn, surplusForKsIsle))
-          bestW = -mandatoryRationCost + carryNext * nextIsleCarryValuePerEn
-        } else {
-          const allowPostCapWorkRations = isPostTopUpAlloc || (Math.floor(candTotalUEn) + bucketEnFloor >= enMaxVal)
-          for (let kC = 0; kC <= remCoffeeSlots; kC++) {
-            let cov = baseCov + kC * coffeeEnGain
-            let rationWorkCost = 0
-            let ci = chunkIdx
-            let cr = chunkRemEn
-            if (allowPostCapWorkRations) {
-              while (cov < ksIsle.E && ci < chunks.length) {
-                if (cr <= 0) {
-                  ci++
-                  cr = ci < chunks.length ? chunks[ci].count * chunks[ci].energyGain : 0
-                  continue
-                }
-                const cpe = chunks[ci].cpe
-                const maxStep = Math.min(ksIsle.E - cov, cr)
-                let bestDe = 0
-                let bestNet = 0
-                for (let dE = 1; dE <= maxStep; dE++) {
-                  const netGain = (ksIsle.bestAtMost[cov + dE] - ksIsle.bestAtMost[cov]) - dE * cpe
+          const carryNext = overrideCarryNext != null
+            ? Math.min(enMaxVal, Math.min(lumpyAddedEn, overrideCarryNext))
+            : Math.min(enMaxVal, Math.min(lumpyAddedEn, availCovForKsIsle))
+          bestW = localKsVal - surplusSim.mandatoryRationCost + carryNext * nextIsleCarryValuePerEn
+          bestFutureKsUsed = 0
+          bestCarryNext = carryNext
+          return { bestW, bestFutureKsUsed, bestCarryNext }
+        }
+
+        const extraNowFishBonus = (allowedSet.has('fish') && curRawFishEvForGate > maxFutureSameIsleFishEv + 1e-6 && remFishU > 0)
+          ? Math.min(remFishU, Math.floor(eLocalVal / fishCostEnU)) * (curRawFishEvForGate - maxFutureSameIsleFishEv)
+          : 0
+
+        const eLocalClamped = Math.max(0, Math.floor(eLocalVal))
+        const remQuotaCap = Math.max(0, ksIsle.E - eLocalClamped)
+        const evalLaterVal = (covVal) => {
+          const cClamped = Math.max(0, Math.floor(covVal))
+          const capByStamina = ksIsle.bestAtMost[Math.min(ksIsle.E, cClamped)]
+          const totalIsleIdx = Math.min(ksIsle.E, eLocalClamped + cClamped)
+          const capByQuota = Math.max(0, ksIsle.bestAtMost[totalIsleIdx] + extraNowFishBonus - localKsVal)
+          return Math.min(capByStamina, capByQuota)
+        }
+
+        const { chunks, chunkIdx, chunkRemEn, remCoffeeSlots, mandatoryRationCost } = surplusSim
+        for (let kC = 0; kC <= remCoffeeSlots; kC++) {
+          let cov = availCovForKsIsle + kC * coffeeEnGain
+          let rationWorkCost = 0
+          let ci = chunkIdx
+          let cr = chunkRemEn
+          if (allowWorkRationsHere && remQuotaCap > 0) {
+            while (cov < remQuotaCap && ci < chunks.length) {
+              if (cr <= 0) {
+                ci++
+                cr = ci < chunks.length ? chunks[ci].count * chunks[ci].energyGain : 0
+                continue
+              }
+              const cpe = chunks[ci].cpe
+              const maxStep = Math.min(remQuotaCap - cov, cr)
+              const curLater = evalLaterVal(cov)
+              let bestDe = 0
+              let bestNet = 0
+              const testRange = (loD, hiD) => {
+                const lo = Math.max(1, Math.floor(loD))
+                const hi = Math.min(maxStep, Math.ceil(hiD))
+                for (let dE = lo; dE <= hi; dE++) {
+                  const netGain = (evalLaterVal(cov + dE) - curLater) * sameIsleDeferFactor - dE * cpe
                   if (netGain > bestNet + 1e-6) {
                     bestNet = netGain
                     bestDe = dE
                   }
                 }
-                if (bestDe > 0) {
-                  cov += bestDe
-                  rationWorkCost += bestDe * cpe
-                  cr -= bestDe
-                  if (bestDe < maxStep) break
-                } else {
-                  break
+              }
+              if (maxStep <= 32) {
+                testRange(1, maxStep)
+              } else {
+                let loB = 0
+                let hiB = Math.floor(maxStep / 12)
+                while (loB < hiB) {
+                  const mid = (loB + hiB) >> 1
+                  const dM = mid * 12
+                  const dN = (mid + 1) * 12
+                  const vM = (evalLaterVal(cov + dM) - curLater) * sameIsleDeferFactor - dM * cpe
+                  const vN = (evalLaterVal(cov + dN) - curLater) * sameIsleDeferFactor - dN * cpe
+                  if (vN > vM + 1e-9) loB = mid + 1
+                  else hiB = mid
                 }
+                testRange(1, 12)
+                testRange(loB * 12 - 12, loB * 12 + 12)
+                testRange(maxStep - 12, maxStep)
+                const pk = getPeakIdxForCpe(cpe)
+                testRange(pk - eLocalClamped - cov - 12, pk - eLocalClamped - cov + 12)
+                testRange(pk - cov - 12, pk - cov + 12)
+              }
+              if (bestDe > 0) {
+                cov += bestDe
+                rationWorkCost += bestDe * cpe
+                cr -= bestDe
+                if (bestDe < maxStep) break
+              } else {
+                break
               }
             }
-            const lumpySpillCap = Math.min(enMaxVal, lumpyAddedEn + kC * coffeeEnGain)
-            const carryNext = Math.min(lumpySpillCap, Math.max(0, cov - ksIsle.E))
-            const candW = ksIsle.bestAtMost[Math.min(ksIsle.E, cov)]
-              - kC * coffeePrice * postMidDisc
-              - mandatoryRationCost
-              - rationWorkCost
-              + carryNext * nextIsleCarryValuePerEn
-            if (candW > bestW) bestW = candW
+          }
+          const lumpySpillCap = Math.min(enMaxVal, lumpyAddedEn + kC * coffeeEnGain)
+          const rawCarryNext = overrideCarryNext != null
+            ? Math.max(0, overrideCarryNext)
+            : Math.max(0, cov - ksIsle.E)
+          const carryNext = Math.min(lumpySpillCap, rawCarryNext)
+
+          const laterVal = evalLaterVal(cov)
+
+          const candW = localKsVal
+            + laterVal * sameIsleDeferFactor
+            - kC * coffeePrice * postMidDisc
+            - mandatoryRationCost
+            - rationWorkCost
+            + carryNext * nextIsleCarryValuePerEn
+          if (candW > bestW) {
+            bestW = candW
+            bestFutureKsUsed = Math.min(remQuotaCap, availCovForKsIsle)
+            bestCarryNext = carryNext
           }
         }
-        if (allowedSet.has('fish') && curRawFishEvForGate > maxFutureSameIsleFishEv + 1e-6 && remFishU > 0) {
-          const castsNow = Math.min(remFishU, Math.floor(eLocalVal / fishCostEnU))
-          bestW += castsNow * (curRawFishEvForGate - maxFutureSameIsleFishEv)
-        }
-        return bestW
+        return { bestW, bestFutureKsUsed, bestCarryNext }
       }
 
       if (raidSched) {
@@ -5773,6 +6173,10 @@ function optimizeAndSimulateSequence(adapter, {
             bestELocal: 0,
             bestPostEnFloor: Infinity,
             feasible: false,
+            bestRaidPrepCost: Infinity,
+            bestFutureKsUsed: 0,
+            bestCarryNext: 0,
+            bestRaidEntry: null,
           }
         }
         const curEnVal = Math.max(0, Math.floor(candTotalUEn)) + bucketEnFloor
@@ -5780,44 +6184,157 @@ function optimizeAndSimulateSequence(adapter, {
           Math.max(0, curEnVal - Math.max(bucketEnFloor, raidSched.minFeasiblePostEn)),
           urgentFarmEn + ksLocal.E
         )
+        const hasSplitIsleRaids = sameIsleFutureIndices.length > 0 && nextIsleRaidsU.length > 0 && Boolean(raidSched.evalNextIsleRaids)
+        const bucketFloorReleaseAtIsleEnd = isleBoundaryU >= Number(constraints.staminaReserveUntilSec || 0)
+          ? bucketEnFloor
+          : 0
         let bestVal = -1e18
         let bestEF = 0
         let bestELocal = 0
         let bestPostEnFloor = curEnVal
+        let bestRaidPrepCost = Infinity
+        let bestFutureKsUsed = 0
+        let bestCarryNext = 0
+        let bestRaidEntry = null
         let foundFeasible = false
 
         for (let S = 0; S <= maxSpendS; S++) {
-          const postE = curEnVal - S
+          const rawPostE = curEnVal - S
+          const postE = S === 0 && curEnVal > initExecEnU
+            ? Math.min(rawPostE, Math.max(bucketEnFloor, initExecEnU))
+            : rawPostE
           if (postE < 0 || postE > raidSched.maxPostE) continue
-          const rs = raidSched.schedByPostEn[postE]
-          if (!rs || !rs.feasible) continue
+          const allowWorkRationsHere = isPostTopUpAlloc || ((S > 0 ? curEnVal : postE) >= enMaxVal)
+
           const minEFForS = Math.max(0, S - ksLocal.E)
           const maxEFForS = Math.min(urgentFarmEn, S)
-          for (let eF = minEFForS; eF <= maxEFForS; eF++) {
-            const eLocal = S - eF
-            let shiftVal = 0
-            if (sameIsleFutureIndices.length === 0) {
-              const postRaidPool = Math.max(0, rs.terminalRaidEn - bucketEnFloor)
-              const lumpySpillCap = Math.min(enMaxVal, candCoffeeEn + candExpiringSnackEn + rs.deferredCoffeeEn)
-              const carryNext = Math.min(lumpySpillCap, postRaidPool)
-              shiftVal = ksLocal.bestAtMost[eLocal] + carryNext * nextIsleCarryValuePerEn
-            } else {
-              shiftVal = evalSameIsleCont(
-                eLocal,
-                postE - bucketEnFloor,
-                candCoffeeEn + candExpiringSnackEn + rs.deferredCoffeeEn,
-                rs.deferredSameIsleAddedEn,
-                rs.deferredEatReserve,
-                deferredSameIsleFarmEnByEF[eF] || 0
-              )
+          if (minEFForS > maxEFForS) continue
+
+          if (sameIsleFutureIndices.length === 0) {
+            const rs = raidSched.schedByPostEn[postE]
+            if (!rs || !rs.feasible) continue
+            const postRaidPool = Math.max(0, rs.terminalRaidEn - bucketEnFloor)
+            const lumpySpillCap = Math.min(enMaxVal, candCoffeeEn + candExpiringSnackEn + rs.deferredCoffeeEn)
+            const carryNext = Math.min(lumpySpillCap, postRaidPool)
+            const carryMinusPrep = carryNext * nextIsleCarryValuePerEn - rs.deferredPrepCost
+            for (let eF = minEFForS; eF <= maxEFForS; eF++) {
+              const eLocal = S - eF
+              const localKsVal = ksLocal ? ksLocal.bestAtMost[Math.min(ksLocal.E, eLocal)] : 0
+              const tot = V_farmCurve[eF] + localKsVal + carryMinusPrep
+              if (!foundFeasible || tot > bestVal + 1e-9) {
+                foundFeasible = true
+                bestVal = tot
+                bestEF = eF
+                bestELocal = eLocal
+                bestPostEnFloor = postE
+                bestRaidPrepCost = rs.deferredPrepCost
+                bestFutureKsUsed = 0
+                bestCarryNext = carryNext
+                bestRaidEntry = rs
+              }
             }
-            const tot = V_farmCurve[eF] + shiftVal - rs.deferredPrepCost
-            if (!foundFeasible || tot > bestVal + 1e-9) {
-              foundFeasible = true
-              bestVal = tot
-              bestEF = eF
-              bestELocal = eLocal
-              bestPostEnFloor = postE
+          } else if (hasSplitIsleRaids) {
+            const sRs = raidSched.sameIsleOnlyByPostEn?.[postE]
+            if (!sRs || !sRs.feasible) continue
+            const knees = raidSched.prepKneeEntriesFor ? raidSched.prepKneeEntriesFor(postE) : []
+            if (knees.length === 0) continue
+            const preMergedEat = sRs.eatReserve
+            const lumpySpillHere = candCoffeeEn + candExpiringSnackEn
+            for (let eF = minEFForS; eF <= maxEFForS; eF++) {
+              const eLocal = S - eF
+              const defUrgEF = deferredSameIsleFarmEnByEF[eF] || 0
+              const simRes = simulateSameIsleSurplus(
+                postE - bucketEnFloor,
+                preMergedEat,
+                defUrgEF,
+                sRs.addedPerRaid,
+                sRs.postMidSameIsleCoffeeUsed
+              )
+              const maxHoldable = simRes.totalSurplusPool + bucketFloorReleaseAtIsleEnd
+              if (knees[0] > maxHoldable) continue
+              const holdCandidates = []
+              for (const kH of knees) {
+                if (kH <= maxHoldable) {
+                  if (!holdCandidates.includes(kH)) holdCandidates.push(kH)
+                  if (lumpySpillHere > 0) {
+                    const spillHold = Math.min(maxHoldable, enMaxVal, kH + lumpySpillHere)
+                    if (spillHold >= knees[0] && !holdCandidates.includes(spillHold)) holdCandidates.push(spillHold)
+                  }
+                }
+              }
+              const capHold = Math.min(maxHoldable, enMaxVal)
+              if (capHold >= knees[0] && !holdCandidates.includes(capHold)) holdCandidates.push(capHold)
+              if (maxHoldable >= knees[0] && !holdCandidates.includes(maxHoldable)) holdCandidates.push(maxHoldable)
+
+              for (const holdTotal of holdCandidates) {
+                const nRs = raidSched.evalNextIsleRaids(postE, holdTotal)
+                if (!nRs || !nRs.feasible) continue
+                const merged = mergeRaidEntries(sRs, nRs)
+                const effSimRes = nRs.eatReserve
+                  ? simulateSameIsleSurplus(
+                      postE - bucketEnFloor,
+                      merged.deferredEatReserve,
+                      defUrgEF,
+                      sRs.addedPerRaid,
+                      sRs.postMidSameIsleCoffeeUsed
+                    )
+                  : simRes
+                const effMaxHoldable = effSimRes.totalSurplusPool + bucketFloorReleaseAtIsleEnd
+                if (holdTotal > effMaxHoldable) continue
+                const holdFromSurplus = Math.max(0, holdTotal - bucketFloorReleaseAtIsleEnd)
+                const overrideCarryNext = Math.max(0, nRs.terminalRaidEn - bucketEnFloor)
+                const cont = scoreSameIsleContFromSurplus(
+                  eLocal,
+                  effSimRes,
+                  lumpySpillHere + merged.deferredCoffeeEn,
+                  allowWorkRationsHere,
+                  { holdFromSurplus, overrideCarryNext }
+                )
+                const tot = V_farmCurve[eF] + cont.bestW - merged.deferredPrepCost
+                if (!foundFeasible || tot > bestVal + 1e-9) {
+                  foundFeasible = true
+                  bestVal = tot
+                  bestEF = eF
+                  bestELocal = eLocal
+                  bestPostEnFloor = postE
+                  bestRaidPrepCost = merged.deferredPrepCost
+                  bestFutureKsUsed = cont.bestFutureKsUsed
+                  bestCarryNext = cont.bestCarryNext
+                  bestRaidEntry = merged
+                }
+              }
+            }
+          } else {
+            const rs = raidSched.schedByPostEn[postE]
+            if (!rs || !rs.feasible) continue
+            for (let eF = minEFForS; eF <= maxEFForS; eF++) {
+              const eLocal = S - eF
+              const defUrgEF = deferredSameIsleFarmEnByEF[eF] || 0
+              const simRes = simulateSameIsleSurplus(
+                postE - bucketEnFloor,
+                rs.deferredEatReserve,
+                defUrgEF,
+                rs.addedPerRaid,
+                rs.postMidSameIsleCoffeeUsed
+              )
+              const cont = scoreSameIsleContFromSurplus(
+                eLocal,
+                simRes,
+                candCoffeeEn + candExpiringSnackEn + rs.deferredCoffeeEn,
+                allowWorkRationsHere
+              )
+              const tot = V_farmCurve[eF] + cont.bestW - rs.deferredPrepCost
+              if (!foundFeasible || tot > bestVal + 1e-9) {
+                foundFeasible = true
+                bestVal = tot
+                bestEF = eF
+                bestELocal = eLocal
+                bestPostEnFloor = postE
+                bestRaidPrepCost = rs.deferredPrepCost
+                bestFutureKsUsed = cont.bestFutureKsUsed
+                bestCarryNext = cont.bestCarryNext
+                bestRaidEntry = rs
+              }
             }
           }
         }
@@ -5827,10 +6344,17 @@ function optimizeAndSimulateSequence(adapter, {
           bestELocal,
           bestPostEnFloor,
           feasible: foundFeasible,
+          bestRaidPrepCost,
+          bestFutureKsUsed,
+          bestCarryNext,
+          bestRaidEntry,
+          simulateSameIsleSurplus,
+          mergeRaidEntries,
         }
       }
 
       const maxEF = Math.min(urgentFarmEn, Math.max(0, Math.floor(candTotalUEn)))
+      const allowWorkRationsHere = isPostTopUpAlloc || (Math.floor(candTotalUEn) + bucketEnFloor >= enMaxVal)
       let bestVal = -1e18
       let bestEF = 0
       for (let eF = 0; eF <= maxEF; eF++) {
@@ -5855,14 +6379,38 @@ function optimizeAndSimulateSequence(adapter, {
           const eLocalA = Math.min(ksLocal.E, remAfterFarm)
           const maxCarryA = Math.max(Math.max(0, baseSpendableEn - eF - eLocalA), maxCarryNoOverflow)
           const carryA = Math.min(Math.max(0, remAfterFarm - eLocalA), maxCarryA)
-          let bestChoice = evalSameIsleCont(eLocalA, carryA, candCoffeeEn + candExpiringSnackEn, 0, null, defUrgEF)
+          const simA = simulateSameIsleSurplus(carryA, null, defUrgEF)
+          let bestChoice = scoreSameIsleContFromSurplus(
+            eLocalA,
+            simA,
+            candCoffeeEn + candExpiringSnackEn,
+            allowWorkRationsHere
+          ).bestW
           if (peakDefForEF > carryA && eLocalA > 0) {
             const maxCarryB = Math.max(Math.max(0, baseSpendableEn - eF), maxCarryNoOverflow)
             const targetCarryB = Math.min(remAfterFarm, peakDefForEF, maxCarryB)
             const eLocalB = Math.min(ksLocal.E, Math.max(0, remAfterFarm - targetCarryB))
             const carryB = Math.min(Math.max(0, remAfterFarm - eLocalB), maxCarryB)
-            const choiceB = evalSameIsleCont(eLocalB, carryB, candCoffeeEn + candExpiringSnackEn, 0, null, defUrgEF)
+            const simB = simulateSameIsleSurplus(carryB, null, defUrgEF)
+            const choiceB = scoreSameIsleContFromSurplus(
+              eLocalB,
+              simB,
+              candCoffeeEn + candExpiringSnackEn,
+              allowWorkRationsHere
+            ).bestW
             if (choiceB > bestChoice) bestChoice = choiceB
+          }
+          if (maxFutureSameIsleFishEv > curRawFishEvForGate + 1e-6 && eLocalA > 0) {
+            const maxCarryC = Math.max(Math.max(0, baseSpendableEn - eF), maxCarryNoOverflow)
+            const carryC = Math.min(remAfterFarm, maxCarryC)
+            const simC = simulateSameIsleSurplus(carryC, null, defUrgEF)
+            const choiceC = scoreSameIsleContFromSurplus(
+              0,
+              simC,
+              candCoffeeEn + candExpiringSnackEn,
+              allowWorkRationsHere
+            ).bestW
+            if (choiceC > bestChoice) bestChoice = choiceC
           }
           shiftVal = bestChoice
         }
@@ -5878,6 +6426,10 @@ function optimizeAndSimulateSequence(adapter, {
         bestELocal: 0,
         bestPostEnFloor: bucketEnFloor,
         feasible: true,
+        bestRaidPrepCost: 0,
+        bestFutureKsUsed: 0,
+        bestCarryNext: 0,
+        bestRaidEntry: null,
       }
     }
 
@@ -6379,14 +6931,107 @@ function optimizeAndSimulateSequence(adapter, {
       return makeInfeasibleRaidReturn()
     }
     const fundedUrgentEn = finalAlloc.bestEF
-    const committedRaidPostEnFloor = futureRaidsU.length > 0
+    let committedRaidPostEnFloor = futureRaidsU.length > 0
       ? Math.max(bucketEnFloor, finalAlloc.bestPostEnFloor)
       : bucketEnFloor
+    let activeRaidSchedEntry = finalAlloc.bestRaidEntry || (
+      futureRaidsU.length > 0
+        ? (finalRaidSched?.schedByPostEn?.[Math.min(finalRaidSched.maxPostE, committedRaidPostEnFloor)] || null)
+        : null
+    )
+    if (futureRaidsU.length > 0 && finalRaidSched) {
+      const upperPostE = Math.min(finalRaidSched.maxPostE, committedRaidPostEnFloor)
+      const defUrgFinal = deferredSameIsleFarmEnByEF[fundedUrgentEn] || 0
+      const hasSplitFinal = sameIsleFutureIndices.length > 0 && nextIsleRaidsU.length > 0 && Boolean(finalRaidSched.evalNextIsleRaids)
+      const bucketFloorReleaseFinal = isleBoundaryU >= Number(constraints.staminaReserveUntilSec || 0)
+        ? bucketEnFloor
+        : 0
+      for (let rE = bucketEnFloor; rE < upperPostE; rE++) {
+        if (sameIsleFutureIndices.length === 0) {
+          const rEntry = finalRaidSched.schedByPostEn[rE]
+          if (!rEntry || !rEntry.feasible) continue
+          if (rEntry.deferredPrepCost > finalAlloc.bestRaidPrepCost + 1e-6) continue
+          const postRaidPoolR = Math.max(0, rEntry.terminalRaidEn - bucketEnFloor)
+          const lumpySpillCapR = Math.min(enMaxFinalU, addedCoffeeEn + addedExpiringSnackEn + rEntry.deferredCoffeeEn)
+          if (Math.min(lumpySpillCapR, postRaidPoolR) >= finalAlloc.bestCarryNext - 1e-6) {
+            committedRaidPostEnFloor = rE
+            activeRaidSchedEntry = rEntry
+            break
+          }
+        } else if (hasSplitFinal) {
+          const sRsR = finalRaidSched.sameIsleOnlyByPostEn?.[rE]
+          if (!sRsR || !sRsR.feasible) continue
+          const preSimR = finalAlloc.simulateSameIsleSurplus(
+            rE - bucketEnFloor,
+            sRsR.eatReserve,
+            defUrgFinal,
+            sRsR.addedPerRaid,
+            sRsR.postMidSameIsleCoffeeUsed
+          )
+          const maxHoldR = preSimR.totalSurplusPool + bucketFloorReleaseFinal
+          const kneesR = finalRaidSched.prepKneeEntriesFor ? finalRaidSched.prepKneeEntriesFor(rE) : []
+          if (kneesR.length === 0 || kneesR[0] > maxHoldR) continue
+          const holdCandsR = []
+          const lumpySpillFinal = addedCoffeeEn + addedExpiringSnackEn
+          for (const kH of kneesR) {
+            if (kH <= maxHoldR) {
+              if (!holdCandsR.includes(kH)) holdCandsR.push(kH)
+              if (lumpySpillFinal > 0) {
+                const spillHoldR = Math.min(maxHoldR, enMaxFinalU, kH + lumpySpillFinal)
+                if (spillHoldR >= kneesR[0] && !holdCandsR.includes(spillHoldR)) holdCandsR.push(spillHoldR)
+              }
+            }
+          }
+          const capHoldR = Math.min(maxHoldR, enMaxFinalU)
+          if (capHoldR >= kneesR[0] && !holdCandsR.includes(capHoldR)) holdCandsR.push(capHoldR)
+          if (maxHoldR >= kneesR[0] && !holdCandsR.includes(maxHoldR)) holdCandsR.push(maxHoldR)
+          let matchedEntryR = null
+          for (const hR of holdCandsR) {
+            const nRsR = finalRaidSched.evalNextIsleRaids(rE, hR)
+            if (!nRsR || !nRsR.feasible) continue
+            const mergedR = finalAlloc.mergeRaidEntries(sRsR, nRsR)
+            if (mergedR.deferredPrepCost > finalAlloc.bestRaidPrepCost + 1e-6) continue
+            const effSimR = nRsR.eatReserve
+              ? finalAlloc.simulateSameIsleSurplus(
+                  rE - bucketEnFloor,
+                  mergedR.deferredEatReserve,
+                  defUrgFinal,
+                  sRsR.addedPerRaid,
+                  sRsR.postMidSameIsleCoffeeUsed
+                )
+              : preSimR
+            const effMaxHoldR = effSimR.totalSurplusPool + bucketFloorReleaseFinal
+            if (hR > effMaxHoldR) continue
+            const lumpyCapR = Math.min(enMaxFinalU, lumpySpillFinal + mergedR.deferredCoffeeEn)
+            const carryNextR = Math.min(lumpyCapR, Math.max(0, nRsR.terminalRaidEn - bucketEnFloor))
+            if (carryNextR >= finalAlloc.bestCarryNext - 1e-6) {
+              matchedEntryR = mergedR
+              break
+            }
+          }
+          if (matchedEntryR) {
+            committedRaidPostEnFloor = rE
+            activeRaidSchedEntry = matchedEntryR
+            break
+          }
+        } else {
+          const rEntry = finalRaidSched.schedByPostEn[rE]
+          if (!rEntry || !rEntry.feasible) continue
+          if (rEntry.deferredPrepCost > finalAlloc.bestRaidPrepCost + 1e-6) continue
+          const postRaidPoolR = Math.max(0, rEntry.terminalRaidEn - bucketEnFloor)
+          const lumpySpillCapR = Math.min(enMaxFinalU, addedCoffeeEn + addedExpiringSnackEn + rEntry.deferredCoffeeEn)
+          if (Math.min(lumpySpillCapR, postRaidPoolR) >= finalAlloc.bestCarryNext - 1e-6) {
+            committedRaidPostEnFloor = rE
+            activeRaidSchedEntry = rEntry
+            break
+          }
+        }
+      }
+    }
     const minUrgentRaidFloor = futureRaidsU.length > 0
       ? Math.max(bucketEnFloor, finalRaidSched.minFeasiblePostEn)
       : bucketEnFloor
     bucketPlannedPostEnFloor[u] = committedRaidPostEnFloor
-    const activeRaidSchedEntry = finalRaidSched?.schedByPostEn?.[Math.min(finalRaidSched.maxPostE, committedRaidPostEnFloor)] || null
 
     let farmReserveFloor = 0
     if (sameIsleFutureIndices.length > 0) {
@@ -6827,6 +7472,13 @@ function optimizeAndSimulateSequence(adapter, {
     if (allowedSet.has('goal') && typeof R.dailyGoals === 'function') {
       const postSellGoals = collectClaimableGoalActions(R, b.naturalDay, execWorld.state)
       if (postSellGoals.length > 0) pushAndSim(postSellGoals)
+    }
+
+    if (futureRaidsU.length > 0 && bucketPlannedPostEnFloor[u] != null) {
+      bucketPlannedPostEnFloor[u] = Math.max(
+        bucketEnFloor,
+        Math.min(bucketPlannedPostEnFloor[u], Math.floor(Number(execWorld.state?.en || 0)))
+      )
     }
 
     finalBucketActions[u] = bucketActs
@@ -8185,6 +8837,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
   // Scores EVERY candidate BEFORE ranking so candidate comparison (`candidateModes`, `upstreamVariants`, `raidSubsets`)
   // and final quality reporting BOTH use true stochastic policy expectation (exact discrete outcome enumeration
   // for single `harvest`/`fish`/`mine` and/or discrete guarded raid outcomes, or paired CRN M-stream Monte Carlo)!
+  let fastRankingMode = Boolean(options._fastCandidateRankingOnly)
   const scoreDomesticCandidate = (cand) => {
     const candRaids = cand.scheduledUpcomingRaids || []
     const immSig = cand.immediateRaidMeta?.sig || ''
@@ -8377,10 +9030,10 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     }
 
     if (!exactEvaluated) {
-      const defaultM = scenarios.length > 1 && buckets.length > 4 ? 4 : 8
+      const defaultM = scenarios.length > 1 ? 2 : (buckets.length > 4 ? 4 : 8)
       const M = options.stochasticPolicySamples != null
         ? Math.max(1, Math.floor(Number(options.stochasticPolicySamples)))
-        : defaultM
+        : (fastRankingMode ? 1 : defaultM)
       const sampleVals = []
 
       // Pre-compute deterministic prefix state once when `firstStochIdx === -1 && b0`!
@@ -8492,7 +9145,7 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
           ? 'deadline-truncated-monte-carlo-expectation'
           : 'monte-carlo-policy-expectation',
       }
-      if (usedM === M) scoredPrefixCache.set(cacheKey, stats)
+      if (usedM === M && !fastRankingMode) scoredPrefixCache.set(cacheKey, stats)
       Object.assign(cand, stats)
     }
 
@@ -8569,7 +9222,15 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     if (bestDomestic && isPastDeadline()) break
     if (mode === 'hold-in-first-bucket' && bestDomestic) {
       const optActs0 = bestDomestic.trunkActionsByBucket?.[0] || []
-      if (!optActs0.some((a) => a.a === 'sell')) continue
+      const b0Opt = bestDomestic.trunkBucketsUsed?.[0]
+      let execActs0 = optActs0
+      if (b0Opt && optActs0.some((a) => adapter.isStochasticAction(a))) {
+        const p0Opt = makePricesFn(scenarios[0])(b0Opt, baseSoldByIsle)
+        let w0Opt = adapter.advanceTimeOnly(world0, b0Opt.atSec, { futurePrices: p0Opt })
+        w0Opt = applyExogenousArrivals(w0Opt, b0Opt.exogenousArrivalsAtStart)
+        execActs0 = computeCausalStochasticPrefix(adapter, w0Opt, optActs0, adapter.R.WORLD?.maxActions || 40).prefix
+      }
+      if (!execActs0.some((a) => a.a === 'sell')) continue
     }
     if (mode === 'sell-all-now' && bestDomestic && !hasAnySellableInvAtT0) {
       const optActs0 = bestDomestic.trunkActionsByBucket?.[0] || []
@@ -9906,10 +10567,14 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     planOut._selectedCapexActions = preselectedCapexActions
   }
   if (options.skipPostSelectionScoring) {
+    const wasRankedFast = Boolean(fastRankingMode)
     planOut._finalizePostSelectionQuality = () => {
       const targetCand = raidAdjustedDomestic
-      if (!targetCand || targetCand.valueInterpretation != null) return
+      if (!targetCand) return
+      if (targetCand.valueInterpretation != null && !wasRankedFast) return
       const tFin0 = performance.now()
+      fastRankingMode = false
+      targetCand.valueInterpretation = null
       scoreDomesticCandidate(targetCand)
       const q = planOut.quality
       const nextIncumbent = targetCand.policyExpectedValue
@@ -10019,6 +10684,7 @@ export function solveWithHorizonStability(adapter, envelope, objectiveCfgInput =
       prefixMaxBuckets: baseMaxBuckets,
       preselectedCapexActionsOverride: extPaybackSec === basePaybackSec ? reusedCapex : undefined,
       skipPostSelectionScoring: true,
+      _fastCandidateRankingOnly: true,
     })
   } catch (extErr) {
     return {

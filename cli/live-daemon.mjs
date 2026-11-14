@@ -345,6 +345,10 @@ export async function runLiveAccountTick({
         Math.max(nowAfterTxSec + 1, nextSnipeAfterTx.unlockAt - Math.ceil(prepLeadAfterTx + 1))
       )
     }
+    const nextHorizonAfterTx = snipeScheduler?.nextHorizonEntrySec?.(nowAfterTxSec)
+    if (Number.isFinite(nextHorizonAfterTx)) {
+      confirmedWakeSec = Math.min(confirmedWakeSec, Math.max(nowAfterTxSec + 1, Math.ceil(nextHorizonAfterTx)))
+    }
     if (snipeScheduler?.needsScheduleRefresh?.()) {
       confirmedWakeSec = nowAfterTxSec
     } else {
@@ -573,6 +577,10 @@ export async function runLiveAccountTick({
   if (nextSnipe) {
     const prepLeadSec = snipeScheduler.computePhysicalPrepLeadSec(nextSnipe.entry, adapter, httpClient)
     nextWakeSec = Math.min(nextWakeSec, Math.max(nowEndSec + 1, nextSnipe.unlockAt - Math.ceil(prepLeadSec + 1)))
+  }
+  const nextHorizonSec = snipeScheduler?.nextHorizonEntrySec?.(nowEndSec)
+  if (Number.isFinite(nextHorizonSec)) {
+    nextWakeSec = Math.min(nextWakeSec, Math.max(nowEndSec + 1, Math.ceil(nextHorizonSec)))
   }
   const scheduleRefreshReason = snipeScheduler?.needsScheduleRefresh?.()
     ? (snipeScheduler.getScheduleRefreshReason?.() || 'schedule-refresh-due')
