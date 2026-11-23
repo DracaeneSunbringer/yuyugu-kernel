@@ -10,6 +10,7 @@ import { runControllerStep } from '../cli/controller.mjs'
 import { runLiveAccountTick } from '../cli/live-daemon.mjs'
 import { AsyncPlanManager } from '../execution/async-planner.mjs'
 import { KernelHttpClient } from '../execution/http-client.mjs'
+import { computeBattleTrainCost, planBattleTrainSteps } from '../execution/pet-and-battle.mjs'
 import { executeTransaction, reconcileUnknownWithFreshWorld } from '../execution/reconcile.mjs'
 import { SnipeScheduler } from '../execution/snipe-scheduler.mjs'
 import { buildObjectiveConfig } from '../model/objective.mjs'
@@ -1115,6 +1116,198 @@ test('Phase 19.7: executeTransaction inherits omitted /act metadata for PlanCach
       sendFn: async () => { throw new Error('must not send on rev=17237 when server is at 17238') },
     })
     assert.equal(staleAfterReanchor.status, 'stale-prestate-aborted')
+  } finally {
+    await planner.close()
+  }
+})
+
+test('Phase 19.8: Breakthrough training stays OFF by default, obeys tiered pricing/cashReserveFloor/maxDailyXp, allocates level-up stat points before bout, and invalidates PlanCache', async () => {
+  const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: CLOCK_START })
+  const t0 = findSummerMidDaySec(adapter)
+  const tiers = [[100, 30], [200, 45], [300, 60]]
+
+  assert.equal(computeBattleTrainCost(0, 300, tiers), 13500)
+  assert.equal(computeBattleTrainCost(50, 250, tiers), 12000)
+
+  const sampleGear = {
+    coins: 4000,
+    daily: { trained: 0 },
+    prices: { trainDaily: 300, trainTiers: tiers },
+  }
+  assert.equal(planBattleTrainSteps(sampleGear, { enabled: false }).shouldTrain, false)
+  const reserveCapped = planBattleTrainSteps(sampleGear, { enabled: true, cashReserveFloor: 500 })
+  assert.equal(reserveCapped.shouldTrain, true)
+  assert.deepEqual(reserveCapped.steps, [
+    { xp: 100, cost: 3000 },
+    { xp: 10, cost: 450 },
+  ])
+
+  const maxCapCapped = planBattleTrainSteps({ ...sampleGear, coins: 100000 }, { enabled: true, maxDailyXp: 100 })
+  assert.deepEqual(maxCapCapped.steps, [{ xp: 100, cost: 3000 }])
+
+  const tmpDir = makeTempDir('kernel-p19-train-')
+  const lockRoot = path.join(tmpDir, 'locks')
+  const profilePath = path.join(tmpDir, 'profiles.json')
+  const journal = new ContentAddressedJournal({ rootDir: path.join(tmpDir, 'journal'), account: 'main' })
+  const planner = new AsyncPlanManager({ rulesPath: RULES_PATH })
+
+  try {
+    const idleWorld = makeIdleWaitingWorld(adapter, t0, 0)
+    let serverLevel = 12
+    let serverFree = 0
+    let serverTrained = 0
+    let serverCoins = 200000
+    let serverPoints = { str: 20, vit: 4, agi: 0, spd: 4 }
+    let boutLevel = null
+    const callOrder = []
+    const trainRequests = []
+
+    const buildGearSnap = () => ({
+      coins: serverCoins,
+      level: serverLevel,
+      free: serverFree,
+      points: { ...serverPoints },
+      daily: { trained: serverTrained, chest: 5, chestMax: 5, battles: 15, need: 3, earned: 5, ready: false, nextAt: null },
+      prices: { trainDaily: 300, trainTiers: tiers, respec: 3000 },
+      gear: {
+        weapon: { id: 'w_rest', enh: 2 },
+        armor: { id: 'a_rest', enh: 2 },
+        charm: { id: 'c_revive', enh: 2 },
+      },
+      items: [
+        { id: 'w_rest', enh: 2 },
+        { id: 'a_rest', enh: 2 },
+        { id: 'c_revive', enh: 2 },
+      ],
+      catalog: [
+        { id: 'w_rest', name: 'RestBlade', slot: 'weapon', rarity: 4, skill: true, stats: { atk: 34, hp: 45, spd: 0, agi: 5, def: 10 } },
+        { id: 'a_rest', name: 'RestPlate', slot: 'armor', rarity: 4, stats: { def: 35, hp: 60, atk: 0, spd: 0, agi: 0 } },
+        { id: 'c_revive', name: 'ReviveCharm', slot: 'charm', rarity: 4, stats: { hp: 55, def: 20 }, passive: { kind: 'revive', value: 0.3 } },
+      ],
+      breakdown: {
+        hp: { base: 80 + serverLevel * 14, total: 80 + serverLevel * 14 + (serverPoints.vit || 0) * 6 },
+        atk: { base: 10 + serverLevel * 2.5, total: Math.round(10 + serverLevel * 2.5 + (serverPoints.str || 0) * 1.1) },
+        def: { base: 0, total: 15 },
+        agi: { base: 10 + serverLevel * 1.3, total: Math.round(10 + serverLevel * 1.3 + (serverPoints.agi || 0) * 1.2) },
+        spd: { base: 10 + serverLevel * 1.0, total: Math.round(10 + serverLevel * 1.0 + (serverPoints.spd || 0) * 1.1) },
+      },
+    })
+
+    let simMs = t0 * 1000
+    const httpClient = new KernelHttpClient({
+      baseUrl: 'https://game.example.invalid',
+      cookieHeader: 'sid=test',
+      nowMsFn: () => simMs,
+      sleepMsFn: async (ms) => { simMs += ms },
+      fetchImpl: async (urlStr, init = {}) => {
+        const u = new URL(urlStr)
+        const p = u.pathname
+        const body = init.body ? JSON.parse(init.body) : null
+        callOrder.push(`${init.method || 'GET'} ${p}${u.search || ''}`)
+
+        if (p === '/api/pet/world') {
+          return new Response(JSON.stringify({ ...structuredClone(idleWorld), now: Math.floor(simMs / 1000) }), { status: 200 })
+        }
+        if (p === '/api/pet/state' && (init.method || 'GET') === 'GET') {
+          return new Response(JSON.stringify({ adopted: true, progress: { total: 1400, level: serverLevel, cap: 1000 } }), { status: 200 })
+        }
+        if (p === '/api/pet/battle/home') {
+          return new Response(JSON.stringify({ adopted: true, today: { used: 0, limit: 5 }, chests: [], history: [] }), { status: 200 })
+        }
+        if (p === '/api/pet/world/guard-log') {
+          return new Response(JSON.stringify({ battles: [] }), { status: 200 })
+        }
+        if (p === '/api/pet/battle/gear') {
+          return new Response(JSON.stringify(buildGearSnap()), { status: 200 })
+        }
+        if (p === '/api/pet/battle/train' && init.method === 'POST') {
+          const xp = Number(u.searchParams.get('xp') || 0)
+          const cost = computeBattleTrainCost(serverTrained, xp, tiers)
+          serverCoins -= cost
+          serverTrained += xp
+          serverLevel = 13
+          serverFree += 3
+          trainRequests.push({ xp, cost, operation: body?.operation || null })
+          return new Response(JSON.stringify(buildGearSnap()), { status: 200 })
+        }
+        if (p === '/api/pet/battle/points' && init.method === 'POST') {
+          serverPoints = { ...body.points }
+          serverFree = 0
+          return new Response(JSON.stringify(buildGearSnap()), { status: 200 })
+        }
+        if (p === '/api/pet/battle/opponents') {
+          return new Response(JSON.stringify({ opponents: [{ id: 901, name: 'Foe', level: 8, left: 3, power: 300 }] }), { status: 200 })
+        }
+        if (p === '/api/pet/battle' && init.method === 'POST') {
+          boutLevel = serverLevel
+          return new Response(JSON.stringify({ id: 777, created_at: Math.floor(simMs / 1000), xp: 15, result: 'win', coins: 200, fighters: [] }), { status: 200 })
+        }
+        return new Response(JSON.stringify({}), { status: 200 })
+      },
+    })
+
+    const runtimeState = {
+      lastPetCareAtSec: t0,
+      lastBattlePrepAtSec: 0,
+      lastBoutFinishedAtMs: 0,
+      lastHuancaiCheckAtSec: t0,
+      lastCapexEvalAtSec: t0,
+      arenaRemaining: null,
+    }
+
+    // 1) Default (battleTrainOptions omitted): NEVER trains automatically
+    const offTick = await runLiveAccountTick({
+      account: 'main',
+      adapter,
+      httpClient,
+      journal,
+      snipeScheduler: new SnipeScheduler({ accountKey: 'main', domesticOnly: true }),
+      lockRootDir: lockRoot,
+      profileStorePath: profilePath,
+      runtimeState,
+      baseUserConstraints: { domesticOnly: true, allowCapex: false, cashReserveFloor: 10 },
+      solverOptions: { checkHorizonStability: false },
+      asyncPlanner: planner,
+      rulesPath: RULES_PATH,
+    })
+    assert.equal(trainRequests.length, 0, 'Breakthrough training MUST stay disabled by default')
+    assert.equal(offTick.backgroundReport.battlePrep.trainSummary.enabled, false)
+    assert.equal(offTick.backgroundReport.battlePrep.trainSummary.xpTrained, 0)
+    assert.equal(planner.cache.byAccount.has('main'), true, 'Cache remains warm when no coins were spent training')
+
+    // 2) Enabled: trains +300 XP with UUID operation, allocates newly unlocked +3 stat points before bout, and invalidates PlanCache!
+    callOrder.length = 0
+    runtimeState.lastBattlePrepAtSec = 0
+    runtimeState.lastPetCareAtSec = Math.floor(simMs / 1000)
+    runtimeState.lastHuancaiCheckAtSec = Math.floor(simMs / 1000)
+    const onTick = await runLiveAccountTick({
+      account: 'main',
+      adapter,
+      httpClient,
+      journal,
+      snipeScheduler: new SnipeScheduler({ accountKey: 'main', domesticOnly: true }),
+      lockRootDir: lockRoot,
+      profileStorePath: profilePath,
+      runtimeState,
+      baseUserConstraints: { domesticOnly: true, allowCapex: false, cashReserveFloor: 10 },
+      solverOptions: { checkHorizonStability: false },
+      asyncPlanner: planner,
+      rulesPath: RULES_PATH,
+      battleTrainOptions: { enabled: true },
+    })
+
+    assert.equal(trainRequests.length, 1)
+    assert.equal(trainRequests[0].xp, 300)
+    assert.equal(trainRequests[0].cost, 13500)
+    assert.ok(typeof trainRequests[0].operation === 'string' && trainRequests[0].operation.length >= 16)
+    assert.equal(onTick.backgroundReport.battlePrep.trainSummary.xpTrained, 300)
+    assert.equal(onTick.backgroundReport.battlePrep.pointAllocations.length >= 1, true, 'Must allocate +3 level-up points inside the same prep lock')
+    const idxTrain = callOrder.findIndex((c) => c.startsWith('POST /api/pet/battle/train'))
+    const idxPoints = callOrder.findIndex((c) => c === 'POST /api/pet/battle/points')
+    const idxBout = callOrder.findIndex((c) => c === 'POST /api/pet/battle')
+    assert.ok(idxTrain >= 0 && idxPoints > idxTrain && idxBout > idxPoints, `Expected causal order train -> points -> battle, got ${JSON.stringify(callOrder)}`)
+    assert.equal(boutLevel, 13, 'Arena bout must run after level-up from breakthrough training')
+    assert.equal(planner.cache.byAccount.has('main'), false, 'PlanCache must be invalidated after training spends D-coins')
   } finally {
     await planner.close()
   }

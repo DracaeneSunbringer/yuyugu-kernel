@@ -280,9 +280,105 @@ export function isDailyBattleChestReady(daily) {
   return earned > opened
 }
 
+const BATTLE_TRAIN_CHUNKS = [300, 200, 100, 50, 10]
+
+export function computeBattleTrainCost(done, xp, trainTiers = [[100, 30], [200, 45], [300, 60]]) {
+  const start = Math.max(0, Math.floor(Number(done || 0)))
+  const add = Math.max(0, Math.floor(Number(xp || 0)))
+  if (add <= 0) return 0
+  const tiers = Array.isArray(trainTiers) && trainTiers.length > 0
+    ? trainTiers
+    : [[100, 30], [200, 45], [300, 60]]
+  let cost = 0
+  for (let i = start; i < start + add; i++) {
+    const hit = tiers.find(([upTo]) => i < Number(upTo)) || tiers[tiers.length - 1]
+    cost += Number(hit?.[1] || 0)
+  }
+  return cost
+}
+
+export function planBattleTrainSteps(gearSnap, {
+  enabled = false,
+  cashReserveFloor = 0,
+  maxDailyXp = Infinity,
+} = {}) {
+  if (!enabled) {
+    return { shouldTrain: false, reason: 'disabled', steps: [], totalXp: 0, totalCost: 0 }
+  }
+  const trainDaily = Math.max(0, Math.floor(Number(gearSnap?.prices?.trainDaily ?? 300)))
+  const trained = Math.max(0, Math.floor(Number(gearSnap?.daily?.trained ?? 0)))
+  const effectiveTarget = Number.isFinite(Number(maxDailyXp))
+    ? Math.min(trainDaily, Math.max(0, Math.floor(Number(maxDailyXp))))
+    : trainDaily
+  let rem = Math.max(0, effectiveTarget - trained)
+  if (rem < 10) {
+    return {
+      shouldTrain: false,
+      reason: trained >= trainDaily ? 'daily-cap-reached' : 'target-cap-reached',
+      trained,
+      trainDaily,
+      effectiveTarget,
+      steps: [],
+      totalXp: 0,
+      totalCost: 0,
+    }
+  }
+  const trainTiers = Array.isArray(gearSnap?.prices?.trainTiers) && gearSnap.prices.trainTiers.length > 0
+    ? gearSnap.prices.trainTiers
+    : [[100, 30], [200, 45], [300, 60]]
+  const reserve = Math.max(0, Math.floor(Number(cashReserveFloor || 0)))
+  let curCoins = Math.max(0, Math.floor(Number(gearSnap?.coins ?? 0)))
+  let curTrained = trained
+  const steps = []
+
+  while (rem >= 10) {
+    let picked = null
+    for (const chunk of BATTLE_TRAIN_CHUNKS) {
+      if (chunk > rem) continue
+      const cost = computeBattleTrainCost(curTrained, chunk, trainTiers)
+      if (curCoins - cost >= reserve) {
+        picked = { xp: chunk, cost }
+        break
+      }
+    }
+    if (!picked) break
+    steps.push(picked)
+    curCoins -= picked.cost
+    curTrained += picked.xp
+    rem -= picked.xp
+  }
+
+  if (steps.length === 0) {
+    return {
+      shouldTrain: false,
+      reason: 'insufficient-coins-above-reserve',
+      trained,
+      trainDaily,
+      effectiveTarget,
+      coins: curCoins,
+      cashReserveFloor: reserve,
+      steps: [],
+      totalXp: 0,
+      totalCost: 0,
+    }
+  }
+
+  return {
+    shouldTrain: true,
+    reason: 'eligible',
+    trained,
+    trainDaily,
+    effectiveTarget,
+    steps,
+    totalXp: steps.reduce((s, x) => s + x.xp, 0),
+    totalCost: steps.reduce((s, x) => s + x.cost, 0),
+  }
+}
+
 /**
  * Step 2 of Combat/Pet Causal Pipeline:
- * Syncs battle history + guard log profiles, opens ready daily chests, equips optimal resting defense gear,
+ * Syncs battle history + guard log profiles, opens ready daily chests, optionally runs daily
+ * Breakthrough Training (`allowBattleTrain`, default OFF), equips optimal resting defense gear,
  * and allocates free stat points (including newly earned level-up points + multi-pass breakpoint observation)
  * strictly inside `.battle-gear.<account>.lock`!
  */
@@ -290,6 +386,9 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
   accountKey = 'main',
   lockRoot,
   storePath,
+  allowBattleTrain = false,
+  cashReserveFloor = 0,
+  maxBattleTrainXp = Infinity,
   dryRun = false,
 } = {}) {
   let homeData
@@ -313,6 +412,11 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
   if (dryRun) {
     const gearSnap = await httpClient.getJson('/api/pet/battle/gear')
     const plan = planGearAndPoints(gearSnap)
+    const trainPlan = planBattleTrainSteps(gearSnap, {
+      enabled: Boolean(allowBattleTrain),
+      cashReserveFloor,
+      maxDailyXp: maxBattleTrainXp,
+    })
     return {
       ok: true,
       adopted: true,
@@ -320,6 +424,7 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
       homeData,
       gearSnap,
       plan,
+      trainPlan,
       syncedArenaCount,
       syncedGuardCount,
     }
@@ -351,6 +456,46 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
       if (Number(gearSnap?.daily?.chest ?? prevOpened) <= prevOpened) break
     }
     recordObservedPanel(st, gearSnap)
+
+    // Optional Breakthrough Training (`--enable-battle-train`, default OFF):
+    // Runs BEFORE stat point allocation so any level-up (`+3` free points) from trained XP is allocated immediately!
+    const trainStepsExecuted = []
+    let xpTrained = 0
+    let trainCoinsSpent = 0
+    let trainError = null
+    if (allowBattleTrain) {
+      for (let tStep = 0; tStep < 8; tStep++) {
+        const tPlan = planBattleTrainSteps(gearSnap, {
+          enabled: true,
+          cashReserveFloor,
+          maxDailyXp: maxBattleTrainXp,
+        })
+        if (!tPlan.shouldTrain || tPlan.steps.length === 0) break
+        const nextChunk = tPlan.steps[0]
+        const prevTrained = Math.max(0, Math.floor(Number(gearSnap?.daily?.trained ?? 0)))
+        const operation = crypto.randomUUID()
+        const trRes = await httpClient.postJson(`/api/pet/battle/train?xp=${nextChunk.xp}`, { operation })
+        if (!trRes.ok) {
+          trainError = trRes.body?.error || trRes.body?.msg || trRes.error || `HTTP ${trRes.status}`
+          break
+        }
+        trainStepsExecuted.push({ xp: nextChunk.xp, cost: nextChunk.cost, operation })
+        xpTrained += nextChunk.xp
+        trainCoinsSpent += nextChunk.cost
+        gearSnap = trRes.body?.catalog ? trRes.body : await httpClient.getJson('/api/pet/battle/gear')
+        recordObservedPanel(st, gearSnap)
+        if (Math.floor(Number(gearSnap?.daily?.trained ?? prevTrained)) <= prevTrained) break
+      }
+    }
+    const trainSummary = {
+      enabled: Boolean(allowBattleTrain),
+      xpTrained,
+      coinsSpent: trainCoinsSpent,
+      trainedAfter: Math.max(0, Math.floor(Number(gearSnap?.daily?.trained ?? 0))),
+      trainDaily: Math.max(0, Math.floor(Number(gearSnap?.prices?.trainDaily ?? 300))),
+      stepsExecuted: trainStepsExecuted,
+      error: trainError,
+    }
 
     // First equip optimal resting defense gear ( recovers any prior `dirty` state as well! )
     let plan = planGearAndPoints(gearSnap)
@@ -408,6 +553,7 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
       gearSnap,
       restingGear: effResting,
       chestsOpened,
+      trainSummary,
       equippedChanges,
       pointAllocations,
       syncedArenaCount,

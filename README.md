@@ -107,6 +107,8 @@ Start-Process node `
 | `--domestic-only` | 关 | 纯内政模式，不拉取邻居列表、不执行出访 |
 | `--allow-capex` | 关 | 回本周期合理时自动买地与升级建筑、工具 |
 | `--no-capex` | 关 | 强制关闭自动买地与基建升级 |
+| `--enable-battle-train` | **关** | 开启宠物擂台每日「突破训练」自动用 D币兑换额外经验（也可设 `MEME_ENABLE_BATTLE_TRAIN=1`，**默认关闭**；开启后在装备/加点锁内优先完成训练，升级新增属性点当轮立即分配） |
+| `--battle-train-max <xp>` | `300` | 开启 `--enable-battle-train` 时限定每日最多兑换的训练经验上限（如设为 `100` 仅兑换第一档 `30 D/点`；也可设 `MEME_BATTLE_TRAIN_MAX`） |
 | `--enable-xian` | **关** | 开启「大肥鱼修仙记」（`state.xs` 修仙）独立日常托管（也可设 `MEME_ENABLE_XIAN=1`）；与小岛金币、体力、仓库完全隔离，默认开启药园/丹房/打坐与 2.0 零灵力日常（宗门俸禄、委托刷新与安全交差、每日 3 次叙话拿心境），序章选灵根、弹幕斗法及手动秘境全程让位 |
 | `--xian-break-mode <mode>` | `smart` | 境界冲关策略：`smart`（默认，综合药园等级、培元丹存量、灵根成长与 9 层修为垫子的联合策略）、`eager`（丹药与修为齐备即冲）、`manual`（只攒丹药与修为，不自动冲关；也可设 `MEME_XIAN_BREAK_MODE`） |
 | `--xian-auto-fuse` | **关** | 筑基后是否自动尝试变异灵根融合（也可设 `MEME_XIAN_AUTO_FUSE=1`，**默认关闭**，原因与手操建议见下文） |

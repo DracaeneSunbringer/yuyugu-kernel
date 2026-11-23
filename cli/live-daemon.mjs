@@ -62,6 +62,7 @@ export async function runLiveAccountTick({
   maxTickSolveMs = 45000,
   xianOptions = {},
   npcOptions = { enabled: false },
+  battleTrainOptions = { enabled: false },
   arcadeStandbyOptions = {},
   dryRun = false,
 }) {
@@ -433,13 +434,24 @@ export async function runLiveAccountTick({
       (httpClient.estimatedServerNowSec() - Number(runtimeState.lastBattlePrepAtSec || 0)) >= 120
 
     if (battlePrepDue && !snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())) {
+      const allowBattleTrain = Boolean(battleTrainOptions?.enabled || effectiveConstraints?.allowBattleTrain)
+      const maxBattleTrainXp = Number.isFinite(Number(battleTrainOptions?.maxDailyXp))
+        ? Number(battleTrainOptions.maxDailyXp)
+        : (Number.isFinite(Number(effectiveConstraints?.maxBattleTrainXp)) ? Number(effectiveConstraints.maxBattleTrainXp) : Infinity)
       backgroundReport.battlePrep = await syncBattleProfilesAndPreparation(httpClient, {
         accountKey: account,
         lockRoot: lockRootDir,
         storePath: profileStorePath,
+        allowBattleTrain,
+        cashReserveFloor: Number(effectiveConstraints?.cashReserveFloor ?? 10),
+        maxBattleTrainXp,
         dryRun,
       })
       runtimeState.lastBattlePrepAtSec = httpClient.estimatedServerNowSec()
+      if (Number(backgroundReport.battlePrep?.trainSummary?.xpTrained || 0) > 0) {
+        activePlanner?.cache?.invalidate(account)
+        lastInLockWorld = null
+      }
       const home = backgroundReport.battlePrep?.homeData
       if (home?.adopted) {
         const used = Number(home.today?.used || 0)
@@ -757,6 +769,17 @@ if (isDirectMain) {
     const xianAutoDuel = hasFlag('--xian-auto-duel') || process.env.MEME_XIAN_AUTO_DUEL === '1'
     const xianAutoRealm = hasFlag('--xian-auto-realm') || process.env.MEME_XIAN_AUTO_REALM === '1'
     const npcOptions = { enabled: !hasFlag('--disable-npc') }
+    const enableBattleTrain =
+      hasFlag('--enable-battle-train') ||
+      process.env.MEME_ENABLE_BATTLE_TRAIN === '1' ||
+      process.env.MEME_BATTLE_TRAIN === '1'
+    const battleTrainMaxRaw = getArg('--battle-train-max', process.env.MEME_BATTLE_TRAIN_MAX || '')
+    const battleTrainOptions = {
+      enabled: enableBattleTrain,
+      ...(battleTrainMaxRaw !== '' && Number.isFinite(Number(battleTrainMaxRaw))
+        ? { maxDailyXp: Math.max(0, Math.floor(Number(battleTrainMaxRaw))) }
+        : {}),
+    }
     const arcadeStandbyEnabled = !hasFlag('--disable-arcade-standby') && process.env.MEME_DISABLE_ARCADE_STANDBY !== '1'
     const arcadeStandbyTtlRaw = Number(getArg('--arcade-standby-ttl', process.env.MEME_ARCADE_STANDBY_TTL || '180'))
     const arcadeStandbyOptions = {
@@ -897,6 +920,7 @@ if (isDirectMain) {
         maxTickSolveMs,
         xianOptions,
         npcOptions,
+        battleTrainOptions,
         arcadeStandbyOptions,
         dryRun,
       })
@@ -935,7 +959,7 @@ if (isDirectMain) {
     const xianBootTag = xianOptions.enabled
       ? `on(break=${xianOptions.breakMode},fuse=${xianOptions.autoFuse ? xianOptions.fuseTarget : 'off'}${xianOpt3Tags.length ? `,opt3=${xianOpt3Tags.join('+')}` : ''})`
       : 'off'
-    console.log(`[${new Date().toISOString()}] [LIVE:${account}] kernel=v${updateNotifier.localVersion} steal=${domesticOnly ? 'off' : 'on'} xian=${xianBootTag} started pid=${process.pid}`)
+    console.log(`[${new Date().toISOString()}] [LIVE:${account}] kernel=v${updateNotifier.localVersion} steal=${domesticOnly ? 'off' : 'on'} xian=${xianBootTag}${battleTrainOptions.enabled ? ' train=on' : ''} started pid=${process.pid}`)
     updateNotifier.maybeCheckInBackground()
 
     try {
@@ -960,6 +984,7 @@ if (isDirectMain) {
             maxTickSolveMs,
             xianOptions,
             npcOptions,
+            battleTrainOptions,
             arcadeStandbyOptions,
             dryRun,
           })
