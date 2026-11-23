@@ -1,3 +1,5 @@
+import { isBenignWaitPlanRegen } from '../model/observations.mjs'
+
 const INDEPENDENT_POST_COLLECTION_ACTIONS = new Set([
   'harvest',
   'collect',
@@ -9,97 +11,222 @@ const INDEPENDENT_POST_COLLECTION_ACTIONS = new Set([
   'goal',
 ])
 
+function intersectInvLowerBound(prevInv = {}, nextInv = {}) {
+  const out = {}
+  for (const id of Object.keys(prevInv || {})) {
+    const prevRow = Array.isArray(prevInv[id]) ? prevInv[id] : [0, 0, 0]
+    const nextRow = Array.isArray(nextInv?.[id]) ? nextInv[id] : [0, 0, 0]
+    const row = [
+      Math.min(Math.max(0, Number(prevRow[0] || 0)), Math.max(0, Number(nextRow[0] || 0))),
+      Math.min(Math.max(0, Number(prevRow[1] || 0)), Math.max(0, Number(nextRow[1] || 0))),
+      Math.min(Math.max(0, Number(prevRow[2] || 0)), Math.max(0, Number(nextRow[2] || 0))),
+    ]
+    if (row[0] > 0 || row[1] > 0 || row[2] > 0) out[id] = row
+  }
+  return out
+}
+
+function craftHasDeterministicQ0Coverage(adapter, simLowerWorld, act, stochProducedIds) {
+  if (!stochProducedIds || stochProducedIds.size === 0) return true
+  const rec = adapter?.graph?.recipesById?.get(act?.id)
+    || adapter?.R?.RECIPES?.find((r) => r?.id === act?.id)
+  if (!rec?.in) return true
+  const count = Math.max(1, Math.min(20, Math.floor(Number(act?.n || 1)) || 1))
+  for (const [inId, rawNeed] of Object.entries(rec.in)) {
+    if (!stochProducedIds.has(inId)) continue
+    const q0Have = Math.floor(Number(simLowerWorld?.state?.inv?.[inId]?.[0] || 0))
+    if (q0Have < Number(rawNeed || 0) * count) {
+      return false
+    }
+  }
+  return true
+}
+
 /**
- * Computes the causally safe executable prefix from `rawDomestic`:
- * - All deterministic actions before the first stochastic action are included up to `maxBatch`.
- * - Multiple mutually-independent mature plot `harvest`s, `collect`s, `trap`s, and field care (`clear`/`water`/`feed`/`pet`/`goal`)
- *   batch together in a SINGLE `POST /api/pet/world/act` (`<= 40`), truncating ONLY when a downstream action
- *   would consume or depend on unobserved stochastic yields (`sell`/`craft`/`eat`/`stockBuy`/`plant` needing harvest drops)
- *   or after a single stamina-extraction stochastic action (`fish`/`mine`/`bomb`/`npc`/`scratch`).
+ * Identifies item IDs whose post-batch server inventory (`worldAfter.state.inv`)
+ * was stochastically augmented beyond the deterministic Zero-Yield Lower Bound
+ * during `executedActions` (without hardcoding any catalog IDs).
+ */
+export function detectStochasticAugmentedItemIds(adapter, worldBefore, worldAfter, executedActions = []) {
+  const augmented = new Set()
+  if (!worldAfter?.state?.inv || !Array.isArray(executedActions) || executedActions.length === 0) {
+    return augmented
+  }
+  const canSim = Boolean(
+    adapter &&
+    typeof adapter.simulateBatch === 'function' &&
+    typeof adapter.cloneWorld === 'function' &&
+    worldBefore?.state
+  )
+  if (!canSim) return augmented
+
+  let simLowerWorld = adapter.cloneWorld(worldBefore)
+  const simT = worldBefore?.now
+  const simPrices = worldBefore?.prices || {}
+
+  for (const act of executedActions) {
+    if (!act) continue
+    const isStoch = Boolean(adapter.isStochasticAction?.(act))
+    if (isStoch) {
+      const prevInv = structuredClone(simLowerWorld.state?.inv || {})
+      const prevCoins = simLowerWorld.coins
+      const step = adapter.simulateBatch(simLowerWorld, [act], { t: simT, prices: simPrices })
+      if (!step.allOk) break
+      simLowerWorld = step.afterWorld
+      simLowerWorld.state.inv = intersectInvLowerBound(prevInv, simLowerWorld.state?.inv)
+      if (act.a === 'harvest' || act.a === 'trap') {
+        simLowerWorld.coins = prevCoins
+      }
+      continue
+    }
+    const step = adapter.simulateBatch(simLowerWorld, [act], { t: simT, prices: simPrices })
+    if (!step.allOk) break
+    simLowerWorld = step.afterWorld
+  }
+
+  const lowerInv = simLowerWorld.state?.inv || {}
+  const afterInv = worldAfter.state?.inv || {}
+  for (const [id, afterRow] of Object.entries(afterInv)) {
+    if (!Array.isArray(afterRow)) continue
+    const lowerRow = Array.isArray(lowerInv[id]) ? lowerInv[id] : [0, 0, 0]
+    for (let q = 0; q < 3; q++) {
+      if (Math.floor(Number(afterRow[q] || 0)) > Math.floor(Number(lowerRow[q] || 0))) {
+        augmented.add(id)
+        break
+      }
+    }
+  }
+  return augmented
+}
+
+/**
+ * Compiles the causally safe executable prefix from `rawDomestic` using a
+ * Zero-Yield Lower-Bound Sandbox (`simLowerWorld`) driven by `adapter.simulateBatch`:
+ * - Collection stochastic actions (`harvest`, `trap`) mutate plot/trap state and stamina while holding
+ *   random drops at zero (`simLowerWorld.state.inv = intersectInvLowerBound(...)`, `coins = prevCoins`).
+ * - Any subsequent deterministic action (`eat`, `plant`, `water`, `feed`, `clear`, `collect`, `pet`, `goal`,
+ *   `buy`, `stockBuy`, `sell`, `craft` with pre-existing `q=0` coverage) that passes `adapter.simulateBatch`
+ *   in `simLowerWorld` is proven independent of unobserved drops and executes in the SAME atomic batch (`<= 40`).
+ * - Single stamina-extraction stochastic actions (`fish`, `mine`, `bomb`, `npc`, `scratch`) stop immediately
+ *   after executing at most 1 action (or before entering if already inside a collection-stochastic batch).
+ * - Any trailing orphan `eat`/`coffee` before a truncation point (`truncatedAfterStochastic || truncatedByBatchLimit`)
+ *   is withheld so Batch 2 begins cleanly with that top-up right before its consumer.
  */
 export function computeCausalStochasticPrefix(adapter, worldBefore, rawDomestic = [], maxBatch = 40) {
   const capped = rawDomestic.slice(0, maxBatch)
-  const truncatedByBatchLimit = rawDomestic.length > maxBatch
+  const rawExceedsBatchLimit = rawDomestic.length > maxBatch
   let containsStochasticAction = false
   let stochasticTriggerAction = null
   let seenCollectionStoch = false
-  const taintedItems = new Set()
-  let taintedAll = false
+  const stochProducedIds = new Set()
+  let untrackedStochYield = false
   let endIdx = capped.length
 
-  const recipeTouchesTainted = (recId, seen = new Set()) => {
-    if (taintedAll) return true
-    if (seen.has(recId)) return false
-    seen.add(recId)
-    const rec = adapter.graph?.recipesById?.get(recId)
-    if (!rec?.in) return false
-    for (const inId of Object.keys(rec.in)) {
-      if (taintedItems.has(inId) || recipeTouchesTainted(inId, seen)) return true
-    }
-    return false
-  }
+  const canSimulate = Boolean(
+    adapter &&
+    typeof adapter.simulateBatch === 'function' &&
+    typeof adapter.cloneWorld === 'function' &&
+    worldBefore &&
+    worldBefore.state
+  )
+  let simLowerWorld = canSimulate ? adapter.cloneWorld(worldBefore) : null
+  const simT = worldBefore?.now
+  const simPrices = worldBefore?.prices || {}
 
   for (let i = 0; i < capped.length; i++) {
     const act = capped[i]
-    const isStoch = adapter.isStochasticAction(act)
+    const isStoch = Boolean(adapter?.isStochasticAction?.(act))
 
-    if (!containsStochasticAction) {
-      if (isStoch) {
+    if (isStoch) {
+      if (act.a === 'harvest' || act.a === 'trap') {
+        if (act.a === 'harvest') {
+          const cId = simLowerWorld?.state?.plots?.[act.i]?.c ?? worldBefore?.state?.plots?.[act.i]?.c
+          if (cId) stochProducedIds.add(cId)
+          else untrackedStochYield = true
+        } else {
+          for (const f of adapter?.R?.FISH || []) {
+            if (f?.id) stochProducedIds.add(f.id)
+          }
+        }
+
+        if (simLowerWorld) {
+          const prevInv = structuredClone(simLowerWorld.state?.inv || {})
+          const prevCoins = simLowerWorld.coins
+          const step = adapter.simulateBatch(simLowerWorld, [act], { t: simT, prices: simPrices })
+          if (!step.allOk) {
+            if (!containsStochasticAction) {
+              // Preserve prefix up to failing action so `compileExecutablePrefix` reports rule rejection accurately.
+              break
+            }
+            endIdx = i
+            break
+          }
+          simLowerWorld = step.afterWorld
+          simLowerWorld.state.inv = intersectInvLowerBound(prevInv, simLowerWorld.state?.inv)
+          simLowerWorld.coins = prevCoins
+        }
+
+        if (!containsStochasticAction) {
+          containsStochasticAction = true
+          stochasticTriggerAction = act.a
+        }
+        seenCollectionStoch = true
+        continue
+      }
+
+      // Single stamina extraction (`fish`, `mine`, `bomb`, `npc`, `scratch`)
+      if (!containsStochasticAction) {
         containsStochasticAction = true
         stochasticTriggerAction = act.a
-        if (act.a === 'harvest') {
-          seenCollectionStoch = true
-          const cId = worldBefore?.state?.plots?.[act.i]?.c
-          if (cId) {
-            taintedItems.add(cId)
-            taintedItems.add(`sd_${cId}`)
-          } else {
-            taintedAll = true
-          }
-        } else if (act.a === 'trap') {
-          seenCollectionStoch = true
-          for (const f of adapter.R?.FISH || []) taintedItems.add(f.id)
-        } else {
-          // Single stamina extraction (`fish`, `mine`, `bomb`, `npc`, `scratch`): include this action and stop after it
-          endIdx = i + 1
+        endIdx = i + 1
+        break
+      }
+      endIdx = i
+      break
+    }
+
+    // Deterministic action (`isStoch === false`)
+    if (!seenCollectionStoch) {
+      if (simLowerWorld) {
+        const step = adapter.simulateBatch(simLowerWorld, [act], { t: simT, prices: simPrices })
+        if (!step.allOk) {
           break
         }
+        simLowerWorld = step.afterWorld
       }
       continue
     }
 
-    // Already inside a collection-stochastic batch (`seenCollectionStoch === true`):
-    if (INDEPENDENT_POST_COLLECTION_ACTIONS.has(act.a)) {
-      if (act.a === 'harvest') {
-        const cId = worldBefore?.state?.plots?.[act.i]?.c
-        if (cId) {
-          taintedItems.add(cId)
-          taintedItems.add(`sd_${cId}`)
-        } else {
-          taintedAll = true
-        }
-      } else if (act.a === 'trap') {
-        for (const f of adapter.R?.FISH || []) taintedItems.add(f.id)
-      }
-      continue
+    // Post-collection deterministic action (`seenCollectionStoch === true`)
+    if (untrackedStochYield || !simLowerWorld) {
+      if (INDEPENDENT_POST_COLLECTION_ACTIONS.has(act.a)) continue
+      if (!untrackedStochYield && (act.a === 'sell' || act.a === 'eat') && !stochProducedIds.has(act.id)) continue
+      endIdx = i
+      break
     }
 
-    // Check if a deterministic action neither consumes tainted items nor re-allocates working capital post-harvest
-    if (act.a === 'sell' || act.a === 'eat') {
-      if (!taintedAll && !taintedItems.has(act.id)) continue
-    } else if (act.a === 'craft') {
-      if (!recipeTouchesTainted(act.id)) continue
+    if (act.a === 'sell' && stochProducedIds.has(act.id)) {
+      endIdx = i
+      break
     }
 
-    // Any downstream action depending on unobserved harvest yield/bonus-seeds (`plant` of harvested crop,
-    // `stockBuy`, `sell`/`craft`/`eat` of harvested crop, or switching to `mine`/`fish`/`bomb`) waits for receipt!
-    endIdx = i
-    break
+    if (act.a === 'craft' && !craftHasDeterministicQ0Coverage(adapter, simLowerWorld, act, stochProducedIds)) {
+      endIdx = i
+      break
+    }
+
+    const step = adapter.simulateBatch(simLowerWorld, [act], { t: simT, prices: simPrices })
+    if (!step.allOk) {
+      endIdx = i
+      break
+    }
+    simLowerWorld = step.afterWorld
   }
 
   const prefix = capped.slice(0, endIdx)
+  const hitBatchLimit = endIdx === capped.length && rawExceedsBatchLimit
   const truncatedAfterStochastic = containsStochasticAction && endIdx < rawDomestic.length
-  if (truncatedAfterStochastic) {
+  if (truncatedAfterStochastic || hitBatchLimit) {
     while (
       prefix.length > 0 &&
       (prefix[prefix.length - 1].a === 'eat' || prefix[prefix.length - 1].a === 'coffee')
@@ -111,7 +238,7 @@ export function computeCausalStochasticPrefix(adapter, worldBefore, rawDomestic 
     prefix,
     containsStochasticAction,
     truncatedAfterStochastic,
-    truncatedByBatchLimit: endIdx === capped.length && truncatedByBatchLimit,
+    truncatedByBatchLimit: hitBatchLimit,
     stochasticTriggerAction,
   }
 }
@@ -434,7 +561,9 @@ export function compileExecutablePrefix(adapter, worldBefore, plan, options = {}
     if (isWaitBucket0) {
       const refAt0 = adapter.advanceTimeOnly({ ...worldBefore, now: at0 }, at0)
       const refNow = adapter.advanceTimeOnly(worldBefore, nowW)
-      const passiveRegenCrossed = Math.floor(Number(refNow.state?.en || 0)) > Math.floor(Number(refAt0.state?.en || 0))
+      const rawRegenCrossed = Math.floor(Number(refNow.state?.en || 0)) > Math.floor(Number(refAt0.state?.en || 0))
+      const passiveRegenCrossed = rawRegenCrossed
+        && !isBenignWaitPlanRegen(adapter, { ...worldBefore, now: at0 }, worldBefore, plan)
       if (nowW >= earliestTransition || passiveRegenCrossed) {
         return {
           status: 'plan-invalid',

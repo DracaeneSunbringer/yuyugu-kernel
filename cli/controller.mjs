@@ -201,19 +201,23 @@ export async function runControllerStep({
 
     if (compiled.status === 'wait') {
       if (journal) {
-        journal.recordWaitDecision({
-          decisionId: plan.planId,
-          worldBefore: effectiveWorldBefore,
-          envelope,
-          objectiveCfg: objCfg,
-          rulesHash: adapter.rulesHash,
-          rulesSourceText: adapter.rulesSourceText,
-          objectiveHash: plan.objectiveHash,
-          constraintsHash: plan.constraintsHash,
-          plannedWakeSec: plan.nextWakeSec,
-          reason: compiled.waitReason,
-          planSummary: fullPlanArchive,
-        })
+        const waitSig = `${effectiveWorldBefore?.rev ?? -1}:${plan.nextWakeSec ?? -1}:${compiled.waitReason || ''}:${plan.constraintsHash || ''}:${plan.objectiveHash || ''}`
+        if (journal._lastRecordedWaitSig !== waitSig) {
+          journal._lastRecordedWaitSig = waitSig
+          journal.recordWaitDecision({
+            decisionId: plan.planId,
+            worldBefore: effectiveWorldBefore,
+            envelope,
+            objectiveCfg: objCfg,
+            rulesHash: adapter.rulesHash,
+            rulesSourceText: adapter.rulesSourceText,
+            objectiveHash: plan.objectiveHash,
+            constraintsHash: plan.constraintsHash,
+            plannedWakeSec: plan.nextWakeSec,
+            reason: compiled.waitReason,
+            planSummary: fullPlanArchive,
+          })
+        }
       }
       return {
         status: 'waiting',
@@ -236,6 +240,7 @@ export async function runControllerStep({
       if (typeof sendVisitFn !== 'function') {
         throw new Error('sendVisitFn is required to execute a planned visit transaction')
       }
+      if (journal) journal._lastRecordedWaitSig = null
       const visitOp = compiled.visitOperations[0]
       const txRes = await executeTransaction({
         journal,
@@ -286,6 +291,7 @@ export async function runControllerStep({
       throw new Error('sendActFn is required to execute a planned domestic act transaction')
     }
 
+    if (journal) journal._lastRecordedWaitSig = null
     const txRes = await executeTransaction({
       journal,
       adapter,
@@ -313,13 +319,37 @@ export async function runControllerStep({
       }),
       fetchAfterWorldFn: fetchWorldFn,
     })
-    asyncPlanner?.cache?.invalidate(account)
+    const neighborSig = buildNeighborSignature(observedNeighbors, envelope)
+    const continuedEntry = (
+      txRes.status === 'confirmed' &&
+      txRes.worldAfter &&
+      !snipeScheduler?.needsScheduleRefresh?.() &&
+      typeof asyncPlanner?.cache?.advanceAfterCommittedPrefix === 'function'
+    )
+      ? asyncPlanner.cache.advanceAfterCommittedPrefix({
+          adapter,
+          account,
+          plan,
+          horizonStability,
+          envelope,
+          objectiveCfg: objCfg,
+          neighborTargets: observedNeighbors,
+          neighborSig,
+          compiled,
+          worldBefore: effectiveWorldBefore,
+          worldAfter: txRes.worldAfter,
+        })
+      : null
+    if (!continuedEntry) {
+      asyncPlanner?.cache?.invalidate(account)
+    }
     if (txRes.status === 'confirmed' && txRes.worldAfter && snipeScheduler?.activeRaidSchedule) {
       snipeScheduler.activeRaidSchedule.sourceFarmDigest = computeStaticFarmStateDigest(txRes.worldAfter)
     }
 
     const needsContinuation = txRes.status === 'confirmed'
       && (
+        Boolean(continuedEntry) ||
         compiled.containsStochasticAction ||
         compiled.truncatedAfterStochastic ||
         compiled.truncatedByBatchLimit ||
@@ -328,6 +358,7 @@ export async function runControllerStep({
       )
 
     if (
+      !continuedEntry &&
       needsContinuation &&
       asyncPlanner &&
       txRes.worldAfter &&
@@ -480,7 +511,7 @@ export async function runControllerStep({
     })
     const objCfg = buildObjectiveConfig(objectiveCfg)
     const runStability = solverOptions.checkHorizonStability === true
-      || (solverOptions.checkHorizonStability !== false && neighborTargets.length === 0)
+      || (solverOptions.checkHorizonStability !== false && neighborTargets.length === 0 && upcomingNeighborTargets.length === 0)
 
     const tSolveStartMs = nowMsFn()
     const asyncOut = await asyncPlanner.solveOrPreempt({
@@ -495,6 +526,7 @@ export async function runControllerStep({
       deadlineAtMs,
       shouldPreemptFn,
       maxClockDriftSec: maxCachedPlanDriftSec,
+      allowFutureMinGap: !dryRun && nowMsFn === Date.now,
       nowMsFn,
     })
     const solveElapsedMs = Math.max(0, nowMsFn() - tSolveStartMs)
@@ -551,11 +583,30 @@ export async function runControllerStep({
         }
       }
 
-      const inLockWorld = await fetchWorldFn()
+      let inLockWorld = await fetchWorldFn()
       if (!inLockWorld || !inLockWorld.state) {
         throw new Error(`Failed to fetch authoritative in-lock world snapshot for ${account}`)
       }
       adapter.syncClock(inLockWorld.clockStart)
+
+      const minGap = adapter.R.WORLD?.minGap || 2
+      const initialInLockNow = Math.floor(Number(inLockWorld.now || 0))
+      const targetAt0 = Math.floor(Number(plan?.trunkBuckets?.[0]?.atSec ?? initialInLockNow))
+      if (
+        planSource === 'cache-hit' &&
+        targetAt0 > initialInLockNow &&
+        (targetAt0 - initialInLockNow) <= minGap &&
+        !shouldPreemptFn?.() &&
+        nowMsFn() + (targetAt0 - initialInLockNow) * 1000 + 800 < deadlineAtMs
+      ) {
+        const waitMs = Math.max(50, Math.min(2500, (targetAt0 - initialInLockNow) * 1000 + 60))
+        await new Promise((r) => setTimeout(r, waitMs))
+        const refreshed = await fetchWorldFn()
+        if (refreshed && refreshed.state) {
+          inLockWorld = refreshed
+          adapter.syncClock(inLockWorld.clockStart)
+        }
+      }
 
       let inLockReconcile = preReconcile
       if (journal) {
@@ -704,7 +755,7 @@ export async function runControllerStep({
 
     const objCfg = buildObjectiveConfig(objectiveCfg)
     const runStability = solverOptions.checkHorizonStability === true
-      || (solverOptions.checkHorizonStability !== false && neighborTargets.length === 0)
+      || (solverOptions.checkHorizonStability !== false && neighborTargets.length === 0 && upcomingNeighborTargets.length === 0)
     const tSolveStartMs = nowMsFn()
     let plan
     let horizonStability = null
@@ -767,7 +818,7 @@ if (isDirectMain) {
     return idx >= 0 && idx + 1 < args.length ? args[idx + 1] : defVal
   }
   const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-  const fixturePath = path.resolve(rootDir, getArg('--fixture', 'fixtures/sample-snapshot.json'))
+  const fixturePath = path.resolve(rootDir, getArg('--fixture', 'fixtures/live-20261111.json'))
   const account = getArg('--account', 'main')
   const rulesPath = path.resolve(rootDir, 'rules/pet-world-rules.js')
 

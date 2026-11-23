@@ -98,8 +98,9 @@ function rankChapterNpcPriority(npcId) {
       if (opt.pill?.peiyuan) priority += 200 * opt.pill.peiyuan
       if (opt.pill?.huiling) priority += 40 * opt.pill.huiling
       if (opt.seed) priority += 80
-      if (opt.mind && opt.mind > 0) priority += opt.mind * 2
-      if (opt.luck && opt.luck > 0) priority += opt.luck * 2
+      if (opt.mind) priority += opt.mind * 2
+      if (opt.luck) priority += opt.luck * 2
+      if (opt.fav && opt.fav < 0) priority -= 5
     }
   }
   return priority
@@ -115,6 +116,47 @@ const TALK_PRIORITY_NPCS = Array.from(new Set([
 ]))
 const AREA_PRIORITY_DESC = Object.keys(AREAS).sort((a, b) => AREAS[b].need - AREAS[a].need)
 const REALM_BEAM_WIDTH = 14
+
+/**
+ * Resolves the ordered list of target chapter NPCs for `--xian-auto-social` according to `socialTarget`:
+ *   - `'all'` (default): All `CHAPTERS` NPCs ranked by `rankChapterNpcPriority` (Master -> Companion -> Sworn -> Peiyuan -> Mind/Luck).
+ *   - `'master'`: Only NPCs whose chapters grant `rel === 1` (`师父`).
+ *   - `'companion'`: Only NPCs whose chapters grant `rel === 2` (`道侣`).
+ *   - `'sworn'`: Only NPCs whose chapters grant `rel === 3` (`结拜`).
+ *   - `'rel'`: Only NPCs whose chapters grant any relationship (`rel === 1 || rel === 2 || rel === 3`).
+ *   - Comma-separated tokens (e.g. `'castle'`, `'castle,sup'`, `'master,companion'`): Combines keywords and explicit NPC IDs in user-specified priority order.
+ */
+export function resolveSocialTargetNpcs(socialTarget = 'all') {
+  const raw = String(socialTarget || 'all').trim().toLowerCase()
+  if (!raw || raw === 'all') return SOCIAL_GIFT_PRIORITY_NPCS
+  const tokens = raw.split(',').map((s) => s.trim()).filter(Boolean)
+  if (tokens.length === 0 || tokens.includes('all')) return SOCIAL_GIFT_PRIORITY_NPCS
+
+  const hasRel = (id, relCode) =>
+    (CHAPTERS[id] || []).some((ch) => (ch.opt || []).some((o) => o.rel === relCode))
+
+  const out = []
+  const pushUnique = (id) => {
+    if (Object.hasOwn(CHAPTERS, id) && !out.includes(id)) out.push(id)
+  }
+
+  for (const tok of tokens) {
+    if (tok === 'master') {
+      for (const id of SOCIAL_GIFT_PRIORITY_NPCS) if (hasRel(id, 1)) pushUnique(id)
+    } else if (tok === 'companion') {
+      for (const id of SOCIAL_GIFT_PRIORITY_NPCS) if (hasRel(id, 2)) pushUnique(id)
+    } else if (tok === 'sworn') {
+      for (const id of SOCIAL_GIFT_PRIORITY_NPCS) if (hasRel(id, 3)) pushUnique(id)
+    } else if (tok === 'rel') {
+      for (const id of SOCIAL_GIFT_PRIORITY_NPCS) {
+        if (hasRel(id, 1) || hasRel(id, 2) || hasRel(id, 3)) pushUnique(id)
+      }
+    } else {
+      pushUnique(tok)
+    }
+  }
+  return out
+}
 
 function selectPreferredEquippedTech(x) {
   if (!Array.isArray(x?.techs) || x.techs.length === 0) return null
@@ -166,6 +208,8 @@ export function normalizeXianOptions(raw = {}) {
   const breakMode = VALID_XIAN_BREAK_MODES.has(breakRaw) ? breakRaw : 'smart'
   const fuseTargetRaw = String(raw?.fuseTarget || 'auto').trim().toLowerCase()
   const fuseTarget = VALID_XIAN_FUSE_TARGETS.has(fuseTargetRaw) ? fuseTargetRaw : 'auto'
+  const socialTargetRaw = String(raw?.socialTarget || 'all').trim().toLowerCase()
+  const socialTarget = socialTargetRaw || 'all'
   const maxActionsRaw = Number(raw?.maxActionsPerBatch ?? MAX_XS_BATCH)
   const autoAll = Boolean(raw?.autoAll || raw?.opt3)
   return {
@@ -175,6 +219,7 @@ export function normalizeXianOptions(raw = {}) {
     fuseTarget,
     autoEvents: autoAll || Boolean(raw?.autoEvents),
     autoSocial: autoAll || Boolean(raw?.autoSocial),
+    socialTarget,
     autoDuel: autoAll || Boolean(raw?.autoDuel),
     autoRealm: autoAll || Boolean(raw?.autoRealm),
     maxActionsPerBatch: Number.isFinite(maxActionsRaw)
@@ -215,6 +260,12 @@ export function assertSafeXianBatch(actions, _world = null, rawOptions = {}) {
     if ((name === 'xsGift' || name === 'xsChap') && !opts.autoSocial) {
       throw new Error(`${name} is forbidden when autoSocial is disabled`)
     }
+    if ((name === 'xsGift' || name === 'xsChap') && opts.socialTarget !== 'all') {
+      const allowedNpcs = resolveSocialTargetNpcs(opts.socialTarget)
+      if (!allowedNpcs.includes(String(act?.el || ''))) {
+        throw new Error(`${name} target '${act?.el}' is outside configured socialTarget='${opts.socialTarget}'`)
+      }
+    }
     if (name === 'xsAb' && !opts.autoDuel) {
       throw new Error('xsAb is forbidden when autoDuel is disabled')
     }
@@ -247,9 +298,10 @@ function maxPentagonMatchingCount(baseElements) {
  * On a 4-root chain (`P_4`), strictly selects an endpoint edge (`totalReachableFusions === 2`) and
  * never picks the middle edge (`totalReachableFusions === 1`), preserving dual-variant fusion.
  */
-export function selectOptimalFusionPair(roots, fuseTarget = 'auto') {
+export function selectOptimalFusionPair(roots, fuseTarget = 'auto', lv = 1) {
   const base = Array.isArray(roots?.e) ? roots.e : []
   if (base.length < 2) return null
+  const priorityList = Number(lv || 1) >= 5 ? EQUIP_TECH_PRIORITY_LV5 : VARIANT_TECH_PRIORITY
   const candidates = []
   for (let i = 0; i < base.length; i++) {
     for (let j = i + 1; j < base.length; j++) {
@@ -259,7 +311,7 @@ export function selectOptimalFusionPair(roots, fuseTarget = 'auto') {
       if (fuseTarget !== 'auto' && f.id !== fuseTarget) continue
       const rest = base.filter((_, idx) => idx !== i && idx !== j)
       const totalReachableFusions = 1 + maxPentagonMatchingCount(rest)
-      const rank = VARIANT_TECH_PRIORITY.indexOf(f.id)
+      const rank = priorityList.indexOf(f.id)
       candidates.push({
         key,
         e1: base[i],
@@ -336,7 +388,7 @@ function computeHeldPeiyuanFloorWhileSubLv5(x, nowSec, opts) {
     hold = Math.max(hold, Number(x.cv?.r || 0) + 1)
   }
   if (opts.autoFuse && !(Number(x.fuseCd || 0) > nowSec)) {
-    const pair = selectOptimalFusionPair(x.roots, opts.fuseTarget)
+    const pair = selectOptimalFusionPair(x.roots, opts.fuseTarget, x.lv)
     if (pair) {
       if (Number(x.cv?.r || 0) >= 1) {
         hold = Math.max(hold, 2)
@@ -360,10 +412,10 @@ function computeDesiredPeiyuanStock(x, nowSec, opts) {
   if (opts.breakMode === 'manual') {
     // Keep a convenient manual reserve (`max(2, r + 1)` pills) in bag for manual fusion or manual breakthrough,
     // then dedicate 100% of plots to Lv5 `leizhu`.
-    const pair = selectOptimalFusionPair(x.roots, opts.fuseTarget)
+    const pair = selectOptimalFusionPair(x.roots, opts.fuseTarget, x.lv)
     return Math.max(pair ? 2 : 0, breakNeed)
   }
-  const fuseReserve = opts.autoFuse && r >= 1 && selectOptimalFusionPair(x.roots, opts.fuseTarget) ? 2 : 0
+  const fuseReserve = opts.autoFuse && r >= 1 && selectOptimalFusionPair(x.roots, opts.fuseTarget, x.lv) ? 2 : 0
   const retryMultiplier = Number(x.cv?.s || 1) >= 8 ? 2 : 1
   return breakNeed * retryMultiplier + fuseReserve
 }
@@ -382,31 +434,79 @@ function getPendingSectHerbNeeds(x, nowSec) {
   return needs
 }
 
-function getSocialHerbNeeds(x, nowSec, opts) {
-  const reserve = {}
-  if (!opts?.autoSocial) return reserve
+function getSocialHerbNeeds(x, nowSec, opts, alchemyAndSectNeed = {}) {
+  const bagReserveAdd = {}
+  const plantNeedAdd = {}
+  if (!opts?.autoSocial) return { bagReserveAdd, plantNeedAdd }
   const d = xsDay(nowSec)
   const lv = Number(x.lv || 1)
-  const heldRemaining = {}
-  for (const [h, qty] of Object.entries(x.bag || {})) {
-    heldRemaining[h] = Number(qty || 0)
+  const { counts: inGround } = countInGroundByHerb(x)
+  const freeInBag = {}
+  const freeInGround = {}
+  for (const herbId of Object.keys(HERBS)) {
+    const bagQty = Number(x.bag?.[herbId] || 0)
+    const groundQty = Number(inGround[herbId] || 0)
+    const floor = Number(alchemyAndSectNeed[herbId] || 0)
+    freeInBag[herbId] = Math.max(0, bagQty - floor)
+    freeInGround[herbId] = Math.max(0, bagQty + groundQty - floor - freeInBag[herbId])
   }
-  for (const id of SOCIAL_GIFT_PRIORITY_NPCS) {
+
+  const targetNpcs = resolveSocialTargetNpcs(opts?.socialTarget)
+  let newPlantsScheduled = 0
+  let seenTopUnfinished = false
+  for (const id of targetNpcs) {
     const chList = CHAPTERS[id]
     if (!chList) continue
     const v = x.npc?.[id] || [0, 0, 0, 0]
-    if (v[2] >= chList.length || v[0] >= 300 || v[3] === d) continue
-    const favPrefs = PREF[id]?.[0] || []
-    for (const herbId of favPrefs) {
-      if (PILLS[herbId] || !HERBS[herbId] || HERBS[herbId].lv > lv) continue
-      if (Number(heldRemaining[herbId] || 0) >= 1) {
-        heldRemaining[herbId] -= 1
-        reserve[herbId] = (reserve[herbId] || 0) + 1
-        break
+    if (v[2] >= chList.length || v[0] >= 300) continue
+    const isTopTarget = !seenTopUnfinished
+    seenTopUnfinished = true
+
+    const favPrefs = (PREF[id]?.[0] || []).filter((h) => !PILLS[h] && HERBS[h] && HERBS[h].lv <= lv)
+    if (favPrefs.length === 0) continue
+
+    if (v[3] !== d) {
+      const bagMatch = favPrefs.find((h) => Number(freeInBag[h] || 0) >= 1)
+      if (bagMatch) {
+        freeInBag[bagMatch] -= 1
+        bagReserveAdd[bagMatch] = (bagReserveAdd[bagMatch] || 0) + 1
+        continue
+      }
+      const groundMatch = favPrefs.find((h) => Number(freeInGround[h] || 0) >= 1)
+      if (groundMatch) {
+        freeInGround[groundMatch] -= 1
+        bagReserveAdd[groundMatch] = (bagReserveAdd[groundMatch] || 0) + 1
+        plantNeedAdd[groundMatch] = (plantNeedAdd[groundMatch] || 0) + 1
+        continue
+      }
+      if ((lv >= 3 || isTopTarget) && newPlantsScheduled < 2) {
+        const fastHerb = [...favPrefs].sort((a, b) => HERBS[a].grow - HERBS[b].grow || HERBS[a].seed - HERBS[b].seed)[0]
+        bagReserveAdd[fastHerb] = (bagReserveAdd[fastHerb] || 0) + 1
+        plantNeedAdd[fastHerb] = (plantNeedAdd[fastHerb] || 0) + 1
+        newPlantsScheduled += 1
+      }
+    } else if (isTopTarget && lv >= 4) {
+      // Pre-stock 1 gift herb for the #1 unfinished target (`castle` until 300 fav) so midnight gifting is instant
+      const bagMatch = favPrefs.find((h) => Number(freeInBag[h] || 0) >= 1)
+      if (bagMatch) {
+        freeInBag[bagMatch] -= 1
+        bagReserveAdd[bagMatch] = (bagReserveAdd[bagMatch] || 0) + 1
+      } else {
+        const groundMatch = favPrefs.find((h) => Number(freeInGround[h] || 0) >= 1)
+        if (groundMatch) {
+          freeInGround[groundMatch] -= 1
+          bagReserveAdd[groundMatch] = (bagReserveAdd[groundMatch] || 0) + 1
+          plantNeedAdd[groundMatch] = (plantNeedAdd[groundMatch] || 0) + 1
+        } else if (newPlantsScheduled < 2) {
+          const fastHerb = [...favPrefs].sort((a, b) => HERBS[a].grow - HERBS[b].grow || HERBS[a].seed - HERBS[b].seed)[0]
+          bagReserveAdd[fastHerb] = (bagReserveAdd[fastHerb] || 0) + 1
+          plantNeedAdd[fastHerb] = (plantNeedAdd[fastHerb] || 0) + 1
+          newPlantsScheduled += 1
+        }
       }
     }
   }
-  return reserve
+  return { bagReserveAdd, plantNeedAdd }
 }
 
 function computeAlchemyHerbTargets(x, nowSec, opts) {
@@ -423,35 +523,41 @@ function computeAlchemyHerbTargets(x, nowSec, opts) {
     : 0
 
   const sectNeeds = getPendingSectHerbNeeds(x, nowSec)
-  const socialNeeds = getSocialHerbNeeds(x, nowSec, opts)
-
-  const needHerbs = {
+  const alchemyAndSectNeed = {
     lingcao: huilingBatches * 3 + peiyuanBatches * 2 + (sectNeeds.lingcao || 0),
     jingu: huilingBatches * 1 + (sectNeeds.jingu || 0),
     linglan: peiyuanBatches * 1 + (sectNeeds.linglan || 0),
   }
   for (const [h, n] of Object.entries(sectNeeds)) {
-    if (!Object.hasOwn(needHerbs, h)) needHerbs[h] = n
+    if (!Object.hasOwn(alchemyAndSectNeed, h)) alchemyAndSectNeed[h] = n
+  }
+
+  const { bagReserveAdd, plantNeedAdd } = getSocialHerbNeeds(x, nowSec, opts, alchemyAndSectNeed)
+
+  const needHerbs = { ...alchemyAndSectNeed }
+  for (const [h, n] of Object.entries(plantNeedAdd)) {
+    needHerbs[h] = (needHerbs[h] || 0) + n
   }
 
   const alchemyAndSectReserve = {
-    lingcao: Math.max(6, huilingBatches * 3 + peiyuanBatches * 2) + (sectNeeds.lingcao || 0),
-    jingu: Math.max(2, huilingBatches * 1) + (sectNeeds.jingu || 0),
-    linglan: (canGrowLinglan ? Math.max(2, peiyuanBatches * 1) : 0) + (sectNeeds.linglan || 0),
+    lingcao: Math.max(6, alchemyAndSectNeed.lingcao),
+    jingu: Math.max(2, alchemyAndSectNeed.jingu),
+    linglan: canGrowLinglan ? Math.max(2, alchemyAndSectNeed.linglan) : 0,
   }
   for (const [h, n] of Object.entries(sectNeeds)) {
     if (!Object.hasOwn(alchemyAndSectReserve, h)) alchemyAndSectReserve[h] = n
   }
 
   const bagReserve = { ...alchemyAndSectReserve }
-  for (const [h, n] of Object.entries(socialNeeds)) {
-    bagReserve[h] = (bagReserve[h] || 0) + n
+  for (const [h, n] of Object.entries(bagReserveAdd)) {
+    bagReserve[h] = Math.max(bagReserve[h] || 0, (alchemyAndSectNeed[h] || 0) + n)
   }
 
   return {
     huilingBatches,
     peiyuanBatches,
     sectNeeds,
+    alchemyAndSectNeed,
     needHerbs,
     alchemyAndSectReserve,
     bagReserve,
@@ -604,14 +710,18 @@ function projectMeditationAfterRise(x, nowSec) {
   return { d, gainCv, s, xp }
 }
 
-function findNextDailyTalkNpc(x, nowSec) {
+function findNextDailyTalkNpc(x, nowSec, opts = {}) {
   const d = xsDay(nowSec)
   const chatted = x.ch?.d === d && Array.isArray(x.ch.ids) ? x.ch.ids : []
   if (chatted.length >= 3) return null
   const chattedSet = new Set(chatted)
-  const candidates = TALK_PRIORITY_NPCS.filter((id) => !chattedSet.has(id))
+  const targetNpcs = resolveSocialTargetNpcs(opts?.socialTarget)
+  const orderedTalkPool = Array.from(new Set([...targetNpcs, ...TALK_PRIORITY_NPCS]))
+  const candidates = orderedTalkPool.filter((id) => !chattedSet.has(id))
   if (candidates.length === 0) return null
+  const activeTargetSet = new Set(targetNpcs)
   const chapterPriority = candidates.find((id) => {
+    if (!activeTargetSet.has(id)) return false
     const chList = CHAPTERS[id]
     if (!chList) return false
     const v = x.npc?.[id] || [0, 0, 0, 0]
@@ -633,7 +743,7 @@ function findTurnInableSectTaskIndex(x, nowSec, opts) {
   const allowBreak = shouldAllowBreakPolicy(x, opts)
   const breakNeed = curR < REALMS.length - 1 ? curR + 1 : 0
   const retryMult = Number(x.cv?.s || 1) >= 8 && allowBreak ? 2 : 1
-  const fuseReserve = opts?.autoFuse && curR >= 1 && selectOptimalFusionPair(x.roots, opts.fuseTarget) ? 2 : 0
+  const fuseReserve = opts?.autoFuse && curR >= 1 && selectOptimalFusionPair(x.roots, opts.fuseTarget, x.lv) ? 2 : 0
   const peiyuanReserve = Math.max(
     breakNeed * retryMult + fuseReserve,
     computeHeldPeiyuanFloorWhileSubLv5(x, nowSec, opts)
@@ -764,8 +874,9 @@ function scoreSocialOrEventOutcome(x, nowSec, eff, who, cost = null, opts = {}) 
 
 function findNextSocialAction(x, nowSec, opts) {
   if (!opts?.autoSocial) return null
+  const targetNpcs = resolveSocialTargetNpcs(opts?.socialTarget)
   const r = Number(x.cv?.r || 0)
-  for (const id of SOCIAL_GIFT_PRIORITY_NPCS) {
+  for (const id of targetNpcs) {
     const chList = CHAPTERS[id]
     if (!chList) continue
     const v = x.npc?.[id] || [0, 0, 0, 0]
@@ -788,8 +899,8 @@ function findNextSocialAction(x, nowSec, opts) {
 
   const d = xsDay(nowSec)
   const lv = Number(x.lv || 1)
-  const { alchemyAndSectReserve } = computeAlchemyHerbTargets(x, nowSec, opts)
-  for (const id of SOCIAL_GIFT_PRIORITY_NPCS) {
+  const { alchemyAndSectNeed } = computeAlchemyHerbTargets(x, nowSec, opts)
+  for (const id of targetNpcs) {
     const chList = CHAPTERS[id]
     if (!chList) continue
     const v = x.npc?.[id] || [0, 0, 0, 0]
@@ -797,7 +908,7 @@ function findNextSocialAction(x, nowSec, opts) {
     const favs = PREF[id]?.[0] || []
     for (const h of favs) {
       if (PILLS[h] || !HERBS[h] || HERBS[h].lv > lv) continue
-      if (Number(x.bag?.[h] || 0) > Number(alchemyAndSectReserve[h] || 0)) {
+      if (Number(x.bag?.[h] || 0) > Number(alchemyAndSectNeed[h] || 0)) {
         return { a: 'gift', el: id, herb: h }
       }
     }
@@ -1183,7 +1294,7 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
       if (readyTaskIdx >= 0) {
         if (emit({ a: 'task', n: readyTaskIdx })) continue
       }
-      const talkNpcId = findNextDailyTalkNpc(sim, t)
+      const talkNpcId = findNextDailyTalkNpc(sim, t, opts)
       if (talkNpcId) {
         if (emit({ a: 'talk', el: talkNpcId })) continue
       }
@@ -1242,17 +1353,32 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     }
   }
 
+  const isPeiyuanUrgentlyShort = () => {
+    if ((sim.lv || 1) < 5) return true
+    if (
+      shouldAllowBreakPolicy(sim, opts) &&
+      Number(sim.cv?.s || 1) >= 8 &&
+      Number(sim.pills?.peiyuan || 0) < Number(sim.cv?.r || 0) + 1
+    ) {
+      return true
+    }
+    if (
+      opts.autoFuse &&
+      Number(sim.cv?.r || 0) >= 1 &&
+      !(Number(sim.fuseCd || 0) > t) &&
+      Boolean(selectOptimalFusionPair(sim.roots, opts.fuseTarget)) &&
+      Number(sim.pills?.peiyuan || 0) < 2
+    ) {
+      return true
+    }
+    return false
+  }
+
   const isUrgentCauldronReady = () => {
     if (sim.brew) return false
     const needHuilingToday = Number(sim.pills?.huiling || 0) < PILL_DAILY - dpUsedToday(sim, t)
     if (needHuilingToday && hasBrewIngredients(sim, 'huiling')) return true
-    const needPeiyuanUrgently =
-      (sim.lv || 1) < 5 ||
-      Number(sim.pills?.peiyuan || 0) < computeHeldPeiyuanFloorWhileSubLv5(sim, t, opts) ||
-      (shouldAllowBreakPolicy(sim, opts) &&
-        Number(sim.cv?.s || 1) >= 8 &&
-        Number(sim.pills?.peiyuan || 0) < Number(sim.cv?.r || 0) + 1)
-    if (needPeiyuanUrgently && hasBrewIngredients(sim, 'peiyuan')) return true
+    if (isPeiyuanUrgentlyShort() && hasBrewIngredients(sim, 'peiyuan')) return true
     return false
   }
 
@@ -1291,12 +1417,7 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
   // 2. Harvest mature plots (`g >= 3`), prioritizing missing alchemy recipe herbs first, then highest-value herb,
   //    aligning onto `sim.log % 4 === 3` (`2x` yield!)
   const needHuilingNow = Number(sim.pills?.huiling || 0) < PILL_DAILY - dpUsedToday(sim, t)
-  const needPeiyuanNow =
-    (sim.lv || 1) < 5 ||
-    Number(sim.pills?.peiyuan || 0) < computeHeldPeiyuanFloorWhileSubLv5(sim, t, opts) ||
-    (shouldAllowBreakPolicy(sim, opts) &&
-      Number(sim.cv?.s || 1) >= 8 &&
-      Number(sim.pills?.peiyuan || 0) < Number(sim.cv?.r || 0) + 1)
+  const needPeiyuanNow = isPeiyuanUrgentlyShort()
   const isRecipeBottleneckHerb = (herb) => {
     if (needHuilingNow && PILLS.huiling.need[herb] && Number(sim.bag?.[herb] || 0) < PILLS.huiling.need[herb]) {
       return 1
@@ -1375,6 +1496,32 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     actions.length < opts.maxActionsPerBatch
   ) {
     if (!emit({ a: 'use', herb: 'peiyuan' })) break
+  }
+
+  // 3b. 0-en Sect & Social pass BEFORE selling/planting so gifted/turned-in herbs are immediately replanted on open plots!
+  const todayDay = xsDay(t)
+  const hadTodayTasksInitially = sim.tk?.d === todayDay
+  if (sim.sp !== todayDay && actions.length < opts.maxActionsPerBatch) {
+    emit({ a: 'stipend' })
+  }
+  if (hadTodayTasksInitially) {
+    while (actions.length < opts.maxActionsPerBatch) {
+      const taskIdx = findTurnInableSectTaskIndex(sim, t, opts)
+      if (taskIdx < 0) break
+      if (!emit({ a: 'task', n: taskIdx })) break
+    }
+  }
+  while (actions.length < opts.maxActionsPerBatch) {
+    const npcId = findNextDailyTalkNpc(sim, t, opts)
+    if (!npcId) break
+    if (!emit({ a: 'talk', el: npcId })) break
+  }
+  if (opts.autoSocial) {
+    while (actions.length < opts.maxActionsPerBatch) {
+      const socialAct = findNextSocialAction(sim, t, opts)
+      if (!socialAct) break
+      if (!emit(socialAct)) break
+    }
   }
 
   // 4. Sell surplus herbs in compact batches (`n <= 99`) so stone capital is liquid before seed buying
@@ -1502,9 +1649,7 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     emit({ a: 'equip', el: preferredTech })
   }
 
-  // 10b. Option 2 (Default ON): 0-en Sect & Mind dailies (`xsStipend`, claim safe `xsTask`, `xsTalk` <= 3/d, refresh `xsTasks`)
-  const todayDay = xsDay(t)
-  const hadTodayTasksInitially = sim.tk?.d === todayDay
+  // 10b. Follow-up 0-en Sect & Social pass (in case a farm/alchemy step unlocked a task or chapter)
   if (sim.sp !== todayDay && actions.length < opts.maxActionsPerBatch) {
     emit({ a: 'stipend' })
   }
@@ -1516,7 +1661,7 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
     }
   }
   while (actions.length < opts.maxActionsPerBatch) {
-    const npcId = findNextDailyTalkNpc(sim, t)
+    const npcId = findNextDailyTalkNpc(sim, t, opts)
     if (!npcId) break
     if (!emit({ a: 'talk', el: npcId })) break
   }
@@ -1623,17 +1768,9 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
 
   // Normal 30-minute meditation cycle (continues even at `s=9` when break is deferred to build `>=1.43x` failure cushion!)
   if (!handledMedInBreak) {
-    if (sim.med && t - Number(sim.med.t || 0) >= MED_MAX && actions.length + 1 <= opts.maxActionsPerBatch) {
-      if (emit({ a: 'rise' }) && actions.length < opts.maxActionsPerBatch) {
-        emit({ a: 'sit' })
-      }
-    } else if (!sim.med && actions.length < opts.maxActionsPerBatch) {
-      emit({ a: 'sit' })
-    }
-
     // Optional Root Fusion (`--xian-auto-fuse`, default OFF):
-    // Requires `r >= 1`, `!(fuseCd > t)`, `peiyuan >= 2`, `stone >= 200`, BOTH base root techs already learned in `sim.techs`,
-    // and low `cv.xp` window (`<= max(15, 12% of cvNeed)`) so 45% failure loses ~0 XP!
+    // Requires `r >= 1`, `!(fuseCd > t)`, `peiyuan >= 2`, `stone >= 200`, and BOTH base root techs already learned in `sim.techs`.
+    // Placed BEFORE `xsRise` so an in-flight meditation is both shielded from 20% failure tax AND boosted by the new variant rootMult on success!
     if (
       opts.autoFuse &&
       Number(sim.cv?.r || 0) >= 1 &&
@@ -1642,17 +1779,24 @@ export function planXianActions(world, nowSec = Number(world?.now || 0), rawOpti
       Number(sim.stone || 0) >= 200 &&
       actions.length < opts.maxActionsPerBatch
     ) {
-      const pair = selectOptimalFusionPair(sim.roots, opts.fuseTarget)
+      const pair = selectOptimalFusionPair(sim.roots, opts.fuseTarget, sim.lv)
       if (pair) {
         const learned = new Set(sim.techs || [])
         const bothBaseTechsLearned = learned.has(pair.e1) && learned.has(pair.e2)
-        const lowXpCap = Math.max(15, Math.floor(cvNeed(Number(sim.cv?.r || 0), Number(sim.cv?.s || 1)) * 0.12))
-        if (bothBaseTechsLearned && Number(sim.cv?.xp || 0) <= lowXpCap) {
+        if (bothBaseTechsLearned) {
           if (emit({ a: 'fuse', el: pair.key })) {
             emittedStochastic = true
           }
         }
       }
+    }
+
+    if (sim.med && t - Number(sim.med.t || 0) >= MED_MAX && actions.length + 1 <= opts.maxActionsPerBatch) {
+      if (emit({ a: 'rise' }) && actions.length < opts.maxActionsPerBatch) {
+        emit({ a: 'sit' })
+      }
+    } else if (!sim.med && actions.length < opts.maxActionsPerBatch) {
+      emit({ a: 'sit' })
     }
   }
 

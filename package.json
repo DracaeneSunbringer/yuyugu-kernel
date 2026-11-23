@@ -1,14 +1,14 @@
 {
   "name": "yuyugu-unified-kernel",
-  "version": "1.4.7",
+  "version": "1.4.8",
   "license": "MIT",
   "type": "module",
   "repository": "https://github.com/DracaeneSunbringer/yuyugu-kernel",
   "description": "Zero-hardcoded-ID unified rolling-horizon economic decision kernel, staged raid scheduler, CRN combat optimizer, and counterfactual audit engine for 52dmeme Pet World (鱼鱼谷)",
   "releaseNotes": {
-    "date": "2026-11-14",
+    "date": "2026-11-20",
     "severity": "normal",
-    "summary": "解除预约偷菜下同岛日采集锁死并对齐刷新视野窗口（v1.4.7）：修复主规划器跨岛突袭与同岛日剩余体力双重计数、满体力虚幻回血及按需进食虚高体力下限自锁，使同岛日炸矿/钓鱼/敲矿正常即时执行；对齐 SnipeScheduler 刷新判定与控制器评估窗口并跳过超期截断计划缓存，消除空转轮询",
+    "summary": "全链路性能、缓存复用、内存收敛与偷菜前瞻探测优化（v1.4.8）：(1) 缓存 worldDay/isleDay、优化 fastCloneJson 与 P=1/SPFA 售卖调度、收敛求解状态键、在存在预约偷菜时跳过双视野稳定性重算并对核心状态增量做剪枝与记忆化；(2) 修复 idle wait 被动体力 +1 与 +2s 预热缓存未命中，并去重 wait-decision 审计事件；(3) 为在线守护进程启用 compactRuntimeIndex 与 _liveVisitBundles/gearData 上界淘汰，并在无 unknown 事务时 O(1) 跳过对账落盘；(4) 修复 visit 写桶冷却空转、90s 临期锁定目标优先复检及非阻塞 gear-lock 超时处理",
     "upgradeCommand": "git pull"
   },
   "engines": {

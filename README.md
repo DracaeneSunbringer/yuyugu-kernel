@@ -113,6 +113,7 @@ Start-Process node `
 | `--xian-fuse-target <el>` | `auto` | 开启 `--xian-auto-fuse` 时限定目标变异属性：`auto`（默认，按五元环最大匹配选路）或 `ice` / `thunder` / `wind` / `lava` / `poison`（也可设 `MEME_XIAN_FUSE_TARGET`） |
 | `--xian-opt3` / `--xian-auto-all` | **关** | 一键开启修仙 2.0 全部四项可选高阶托管（也可设 `MEME_XIAN_AUTO_ALL=1`，含下面 4 个分项开关） |
 | `--xian-auto-social` | **关** | 2.0 选项 3：自动推动人脉往事剧情（避开负心境与结仇选项）并用富余喜好草药赠礼（绝不送丹药；也可设 `MEME_XIAN_AUTO_SOCIAL=1`） |
+| `--xian-social-target <target>` | `all` | 限定 `--xian-auto-social` 的赠礼与往事目标范围：`all`（默认，按拜师→结拜→培元丹→心境优先级推进全部往事同门）、`master`（仅拜师线，如 `castle`）、`companion`（仅道侣线）、`sworn`（仅结拜线）、`rel`（仅师父/道侣/结拜关系线）或逗号分隔的指定角色 ID（如 `castle,sup`；也可设 `MEME_XIAN_SOCIAL_TARGET`） |
 | `--xian-auto-events` | **关** | 2.0 选项 3：按 `600s` 冷却自动触发每日 3 次机缘，并基于已知种子 `cur.r` 确定性选出无亏损最优选项（也可设 `MEME_XIAN_AUTO_EVENTS=1`） |
 | `--xian-auto-duel` | **关** | 2.0 选项 3：优先完成宗门 `win` 委托并在灵力充裕时模拟配招发起必胜切磋（也可设 `MEME_XIAN_AUTO_DUEL=1`） |
 | `--xian-auto-realm` | **关** | 2.0 选项 3：通过 3 层确定性 Beam Search 验证 100% 必胜首领后自动攻略秘境并带回全额掉落与首通奖励（也可设 `MEME_XIAN_AUTO_REALM=1`） |

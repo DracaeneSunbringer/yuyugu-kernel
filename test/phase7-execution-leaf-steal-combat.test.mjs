@@ -763,6 +763,21 @@ test('Phase 7.6: Pure unified-model EV steal gating (profitable 1-spot target IS
   const bSlice = await secondarySched.runIncrementalDiscoverySlice(adapter, secondaryClient, w)
   assert.equal(bSlice.status, 'disabled-for-account')
   assert.equal(secondaryCalls, 0)
+
+  const secondaryStealC = normalizeUserConstraints({ domesticOnly: false, minStealSpots: 0, allowThiefBuffPurchase: true }, 'secondary')
+  assert.equal(secondaryStealC.maxStealsPerIsleDay, null)
+  assert.equal(secondaryStealC.minStealSpots, 0)
+  assert.equal(secondaryStealC.allowThiefBuffPurchase, true)
+  const secondaryStealSched = new SnipeScheduler({ accountKey: 'secondary', domesticOnly: false, minStealSpots: 1 })
+  assert.equal(secondaryStealSched.isStealEnabled(), true)
+  assert.equal(secondaryStealSched.minStealSpots, 1)
+  const secSnapEntry = secondaryStealSched.recordVisitSnapshot(adapter, w, 77701, {
+    now: w.now,
+    owner: profitableOneSpot.owner,
+    isle: profitableOneSpot.isle,
+  })
+  assert.equal(secSnapEntry.readyEligible, true)
+  assert.ok(secSnapEntry.projectedScore > 0)
 })
 
 test('Phase 7.7: Strict Pet -> Gear/Points -> Arena causal ordering (Lv12->Lv13 before fight), ascending history cursor, cooldown preemption & Huancai 22:30 CST floor', async () => {
@@ -1331,4 +1346,419 @@ test('Phase 7.8: Convergence regressions — 3x/spot guard-win loot, zero unlock
     userConstraints: { allowThiefBuffPurchase: false },
   })
   assert.equal(freshEvaluator.marginalContext.sourceWorldRev, postTxWorld.rev, 'Cache miss must rebuild fresh R1 marginalContext')
+})
+
+test('Phase 7.9: Activity-driven discovery prioritizes unindexed active farmers & awakened islands over quiescent empty backlog, and scans Page-1 head while sweeping deep cursor', async () => {
+  const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: baseWorld.clockStart })
+  const tmp = makeTempDir('p7-discovery-')
+  const T_now = 1794362100
+  const iDay = adapter.R.isleDay(T_now)
+  const curSeason = adapter.R.seasonOf(iDay)
+  const targetCrop = adapter.R.CROPS
+    .filter((c) => c.seasons.includes(curSeason))
+    .sort((a, b) => b.price - a.price)[0]
+  assert.ok(targetCrop, 'Seasonal crop must exist for Phase 7.9')
+
+  const wVisitor = adapter.advanceTimeOnly(baseWorld, T_now)
+  wVisitor.coins = 500000
+  wVisitor.state.en = 80
+  wVisitor.state.b12 = {
+    ...(wVisitor.state.b12 || {}),
+    effects: {
+      stealth: { id: 'cloak', until: T_now + 3600 },
+      carry: { id: 'sack', until: T_now + 3600 },
+    },
+  }
+
+  const schedPath = path.join(tmp, 'snipe-schedule.json')
+  const scheduler = new SnipeScheduler({
+    accountKey: 'main',
+    scheduleFilePath: schedPath,
+    minStealSpots: 1,
+  })
+
+  for (let i = 1; i <= 10; i++) {
+    const id = 87000 + i
+    scheduler.data.targets[String(id)] = {
+      id,
+      name: `DeadEmpty${i}`,
+      level: 1,
+      guard: false,
+      newbie: false,
+      ownerLeft: 999,
+      readyEligible: false,
+      stealableCount: 0,
+      upcomingEligible: false,
+      upcomingSpots: 0,
+      expectedUnlockAt: null,
+      exactUnlockKnown: false,
+      quiescentEmpty: true,
+      emptyStreak: 1,
+      lastKnownOwnerActiveAt: T_now - 5000,
+      nextProbeAt: T_now - 100,
+      blockedUntil: 0,
+      cooldownUntil: 0,
+      plotUnlockAt: {},
+      updatedAt: T_now - 1000,
+    }
+  }
+  scheduler.data.targets['88001'] = {
+    id: 88001,
+    name: 'AwakenedEmpty',
+    level: 10,
+    guard: false,
+    newbie: false,
+    ownerLeft: 999,
+    readyEligible: false,
+    stealableCount: 0,
+    upcomingEligible: false,
+    upcomingSpots: 0,
+    expectedUnlockAt: null,
+    exactUnlockKnown: false,
+    quiescentEmpty: true,
+    emptyStreak: 2,
+    lastKnownOwnerActiveAt: T_now - 5000,
+    nextProbeAt: T_now + 1000,
+    blockedUntil: 0,
+    cooldownUntil: 0,
+    plotUnlockAt: {},
+    updatedAt: T_now - 1000,
+  }
+  scheduler.data.discoveryCursor = 'cursor-deep'
+  scheduler.data.lastHeadScanAtSec = 0
+
+  const makeGrowingVisit = (id, name, level) => ({
+    now: T_now,
+    clockStart: baseWorld.clockStart,
+    owner: { id, name, level, guard: false, newbie: false },
+    rules: { protect: 1800, perPlot: 2, perPen: 2, perOwner: 999 },
+    left: { today: 999, owner: 999 },
+    isle: {
+      plots: Array.from({ length: 6 }, () => ({
+        c: targetCrop.id,
+        stage: 1,
+        left: 600,
+        steal: false,
+        stolen: 0,
+      })),
+      barn: [],
+    },
+    state: {
+      tools: { spr: 3 },
+      plots: Array.from({ length: 6 }, () => ({
+        c: targetCrop.id,
+        t: T_now - 60,
+        w: 3,
+        g: 0,
+        h: 0,
+      })),
+      barn: [],
+    },
+  })
+
+  const visitedIds = []
+  const neighborCursors = []
+  const mockClient = new KernelHttpClient({
+    cookieHeader: 'sid=test',
+    nowMsFn: () => T_now * 1000,
+    fetchImpl: async (url) => {
+      const u = new URL(url)
+      if (u.pathname === '/api/pet/world/neighbors') {
+        const cursor = u.searchParams.get('cursor')
+        neighborCursors.push(cursor || null)
+        if (!cursor) {
+          return {
+            status: 200,
+            headers: new Map(),
+            text: async () => JSON.stringify({
+              asOf: T_now,
+              neighbors: [
+                { id: 88002, name: 'HeadActiveFarmer', level: 16, plots: 0, pens: 0, canSteal: false, canHelp: true, active: T_now - 20, newbie: false },
+                { id: 88001, name: 'AwakenedEmpty', level: 10, plots: 0, pens: 0, canSteal: false, canHelp: true, active: T_now - 10, newbie: false },
+              ],
+              nextCursor: 'cursor-from-head',
+            }),
+          }
+        }
+        if (cursor === 'cursor-deep') {
+          const deadList = Array.from({ length: 10 }, (_, idx) => ({
+            id: 87001 + idx,
+            name: `DeadEmpty${idx + 1}`,
+            level: 1,
+            plots: 0,
+            pens: 0,
+            canSteal: false,
+            canHelp: true,
+            active: T_now - 5000,
+            newbie: false,
+          }))
+          return {
+            status: 200,
+            headers: new Map(),
+            text: async () => JSON.stringify({
+              asOf: T_now,
+              neighbors: [
+                ...deadList,
+                { id: 88003, name: 'DeepTailFarmer', level: 14, plots: 0, pens: 0, canSteal: false, canHelp: false, active: T_now - 60, newbie: false },
+                { id: 88004, name: 'StaleTailAccount', level: 1, plots: 0, pens: 0, canSteal: false, canHelp: true, active: T_now - 200000, newbie: false },
+              ],
+              nextCursor: 'cursor-deep-2',
+            }),
+          }
+        }
+      }
+      const mVisit = u.pathname.match(/^\/api\/pet\/world\/visit\/(\d+)$/)
+      if (mVisit) {
+        const id = Number(mVisit[1])
+        visitedIds.push(id)
+        if (id === 88001) return { status: 200, headers: new Map(), text: async () => JSON.stringify(makeGrowingVisit(88001, 'AwakenedEmpty', 10)) }
+        if (id === 88002) return { status: 200, headers: new Map(), text: async () => JSON.stringify(makeGrowingVisit(88002, 'HeadActiveFarmer', 16)) }
+        if (id === 88003) return { status: 200, headers: new Map(), text: async () => JSON.stringify(makeGrowingVisit(88003, 'DeepTailFarmer', 14)) }
+        throw new Error(`Unexpected /visit/${id} probe!`)
+      }
+      throw new Error(`Unexpected fetch ${url}`)
+    },
+  })
+
+  const discOut = await scheduler.runIncrementalDiscoverySlice(adapter, mockClient, wVisitor, {
+    maxPages: 2,
+    maxProbes: 3,
+    markedSyncIntervalSec: 999999,
+  })
+  assert.equal(discOut.status, 'slice-complete')
+  assert.equal(discOut.pagesScanned, 2)
+  assert.deepEqual(neighborCursors, [null, 'cursor-deep'], 'Must scan Page-1 head AND advance rolling cursor')
+  assert.equal(scheduler.data.discoveryCursor, 'cursor-deep-2', 'Page-1 head scan must not clobber rolling discoveryCursor')
+  assert.deepEqual(
+    visitedIds,
+    [88001, 88002, 88003],
+    'Must prioritize awakened island & active unindexed head/tail farmers over quiescent backlog and stale accounts'
+  )
+
+  for (let i = 1; i <= 10; i++) {
+    const dead = scheduler.data.targets[String(87000 + i)]
+    assert.ok(
+      dead.nextProbeAt >= T_now + adapter.R.ISLE_SPAN,
+      `Unchanged quiescent empty target ${87000 + i} must back off without wasting /visit probes`
+    )
+  }
+  for (const id of [88001, 88002, 88003]) {
+    const ent = scheduler.data.targets[String(id)]
+    assert.equal(ent.upcomingEligible, true)
+    assert.equal(ent.quiescentEmpty, false)
+  }
+
+  // Verify exponential backoff on confirmed quiescent empty island (1800s -> 3600s)
+  const emptyVisit = {
+    now: T_now,
+    clockStart: baseWorld.clockStart,
+    owner: { id: 88005, name: 'EmptyIsland', level: 1, guard: false, newbie: false },
+    rules: { protect: 1800, perPlot: 2, perPen: 2, perOwner: 999 },
+    left: { today: 999, owner: 999 },
+    isle: { plots: Array(6).fill(null), barn: [] },
+    state: { tools: { spr: 0 }, plots: Array(6).fill(null), barn: [] },
+  }
+  const e1 = scheduler.recordVisitSnapshot(adapter, wVisitor, 88005, emptyVisit)
+  assert.equal(e1.quiescentEmpty, true)
+  assert.equal(e1.emptyStreak, 1)
+  assert.equal(e1.nextProbeAt, T_now + 1800)
+  const e2 = scheduler.recordVisitSnapshot(adapter, wVisitor, 88005, emptyVisit)
+  assert.equal(e2.quiescentEmpty, true)
+  assert.equal(e2.emptyStreak, 2)
+  assert.equal(e2.nextProbeAt, T_now + 3600)
+})
+
+test('Phase 7.10: Shared scan store relays cursor, buffers pending directory items with zero duplicate /visit probes, syncs snapshots zero-HTTP, and keeps EV + blocks independent per account', async () => {
+  const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: baseWorld.clockStart })
+  const tmp = makeTempDir('p7-shared-scan-')
+  const sharedScanPath = path.join(tmp, 'shared-island-scan.json')
+  const schedPathA = path.join(tmp, 'snipe-schedule.main.json')
+  const schedPathB = path.join(tmp, 'snipe-schedule.secondary.json')
+
+  const T_now = 1794362100
+  const iDay = adapter.R.isleDay(T_now)
+  const curSeason = adapter.R.seasonOf(iDay)
+  const iIdx = adapter.R.isleIndex(T_now)
+  const targetCrop = adapter.R.CROPS
+    .filter((c) => c.seasons.includes(curSeason))
+    .sort((a, b) => b.price - a.price)[0]
+  assert.ok(targetCrop)
+  const plantedAt = T_now - 10000
+
+  const wA = adapter.advanceTimeOnly(baseWorld, T_now)
+  wA.coins = 500000
+  wA.state.en = 80
+  wA.state.iq = { d: iIdx, craft: 80, mine: 0, fish: 0, bomb: 0 }
+  wA.state.tools = { ...wA.state.tools, pick: 4, rod: 4 }
+  wA.state.b12 = {
+    ...(wA.state.b12 || {}),
+    effects: {
+      stealth: { id: 'cloak', until: T_now + 3600 },
+      carry: { id: 'sack', until: T_now + 3600 },
+    },
+  }
+
+  const wB = adapter.advanceTimeOnly(baseWorld, T_now)
+  wB.coins = 500000
+  wB.state.en = 80
+  wB.state.iq = { d: iIdx, craft: 0, mine: 100, fish: 80, bomb: 10 }
+  wB.state.b12 = {
+    ...(wB.state.b12 || {}),
+    effects: {
+      stealth: { id: 'cloak', until: T_now + 3600 },
+      carry: { id: 'sack', until: T_now + 3600 },
+    },
+  }
+
+  const schedA = new SnipeScheduler({
+    accountKey: 'main',
+    scheduleFilePath: schedPathA,
+    sharedScanFilePath: sharedScanPath,
+    minStealSpots: 1,
+  })
+  const schedB = new SnipeScheduler({
+    accountKey: 'secondary',
+    scheduleFilePath: schedPathB,
+    sharedScanFilePath: sharedScanPath,
+    domesticOnly: false,
+    minStealSpots: 1,
+  })
+
+  const makeGrowingVisit = (id) => ({
+    now: T_now,
+    clockStart: baseWorld.clockStart,
+    owner: { id, name: `SharedFarmer${id}`, level: 15, guard: false, newbie: false },
+    rules: { protect: 1800, perPlot: 2, perPen: 2, perOwner: 999 },
+    left: { today: 999, owner: 999 },
+    isle: {
+      plots: Array.from({ length: 6 }, () => ({
+        c: targetCrop.id,
+        stage: 1,
+        left: 600,
+        steal: false,
+        stolen: 0,
+      })),
+      barn: [],
+    },
+    state: {
+      tools: { spr: 3 },
+      plots: Array.from({ length: 6 }, () => ({
+        c: targetCrop.id,
+        t: plantedAt,
+        w: 3,
+        g: 0,
+        h: 0,
+      })),
+      barn: [],
+    },
+  })
+
+  const pageCallsA = []
+  const pageCallsB = []
+  const visitCalls = []
+  const makeMockClient = (pageLog, tag) => new KernelHttpClient({
+    cookieHeader: `sid=${tag}`,
+    nowMsFn: () => T_now * 1000,
+    fetchImpl: async (url) => {
+      const u = new URL(url)
+      if (u.pathname === '/api/pet/world/neighbors') {
+        const cursor = u.searchParams.get('cursor') || null
+        pageLog.push(cursor)
+        if (!cursor) {
+          return {
+            status: 200,
+            headers: new Map(),
+            text: async () => JSON.stringify({
+              asOf: T_now,
+              neighbors: Array.from({ length: 6 }, (_, idx) => ({
+                id: 99001 + idx,
+                name: `SharedFarmer${99001 + idx}`,
+                level: 15,
+                plots: 0,
+                pens: 0,
+                canSteal: false,
+                canHelp: true,
+                active: T_now - 30 - idx,
+                newbie: false,
+              })),
+              nextCursor: 'page-2',
+            }),
+          }
+        }
+        if (cursor === 'page-2') {
+          return {
+            status: 200,
+            headers: new Map(),
+            text: async () => JSON.stringify({
+              asOf: T_now,
+              neighbors: [],
+              nextCursor: null,
+            }),
+          }
+        }
+      }
+      const mVisit = u.pathname.match(/^\/api\/pet\/world\/visit\/(\d+)$/)
+      if (mVisit) {
+        const id = Number(mVisit[1])
+        visitCalls.push({ by: tag, id })
+        return {
+          status: 200,
+          headers: new Map(),
+          text: async () => JSON.stringify(makeGrowingVisit(id)),
+        }
+      }
+      throw new Error(`Unexpected fetch ${url}`)
+    },
+  })
+
+  const clientA = makeMockClient(pageCallsA, 'main')
+  const clientB = makeMockClient(pageCallsB, 'secondary')
+
+  const sliceA = await schedA.runIncrementalDiscoverySlice(adapter, clientA, wA, {
+    maxPages: 1,
+    maxProbes: 3,
+    markedSyncIntervalSec: 999999,
+  })
+  assert.equal(sliceA.status, 'slice-complete')
+  assert.deepEqual(pageCallsA, [null])
+  assert.deepEqual(visitCalls.filter((x) => x.by === 'main').map((x) => x.id), [99001, 99002, 99003])
+
+  const sliceB = await schedB.runIncrementalDiscoverySlice(adapter, clientB, wB, {
+    maxPages: 1,
+    maxProbes: 3,
+    markedSyncIntervalSec: 999999,
+  })
+  assert.equal(sliceB.status, 'slice-complete')
+  assert.deepEqual(pageCallsB, ['page-2'], 'Partner must relay from page-2 instead of re-fetching Page 1')
+  assert.deepEqual(
+    visitCalls.filter((x) => x.by === 'secondary').map((x) => x.id),
+    [99004, 99005, 99006],
+    'Partner must drain buffered pendingDirItems with 0 duplicate /visit calls'
+  )
+  assert.equal(visitCalls.length, 6, 'Both accounts combined must perform only 6 total /visit requests for all 6 targets')
+
+  const upA = schedA.collectUpcomingTargetsForController(adapter, wA)
+  const upB = schedB.collectUpcomingTargetsForController(adapter, wB)
+  assert.equal(upA.length, 6)
+  assert.equal(upB.length, 6)
+  for (let id = 99001; id <= 99006; id++) {
+    assert.equal(schedA.data.targets[String(id)].upcomingEligible, true)
+    assert.equal(schedB.data.targets[String(id)].upcomingEligible, true)
+  }
+  assert.notEqual(
+    schedA.data.targets['99001'].projectedScore,
+    schedB.data.targets['99001'].projectedScore,
+    'Each account must evaluate unified EV independently from shared objective snapshots'
+  )
+
+  // Account-specific daily block on schedA must NEVER block schedB
+  schedA.recordSnipeReceipt(adapter, 99001, {
+    ok: false,
+    status: 409,
+    body: { error: '今天偷过该岛主' },
+  }, T_now)
+  assert.equal(schedA.isTargetBlocked(schedA.data.targets['99001'], T_now), true)
+  schedB.ingestSharedScanUpdates(adapter, wB)
+  assert.equal(schedB.isTargetBlocked(schedB.data.targets['99001'], T_now), false)
+  assert.equal(schedB.data.targets['99001'].upcomingEligible, true)
 })

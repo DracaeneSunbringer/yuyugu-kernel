@@ -325,7 +325,8 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
     }
   }
 
-  return withGearLock(lockRoot, accountKey, async () => {
+  try {
+    return await withGearLock(lockRoot, accountKey, async () => {
     const chestsOpened = []
     for (const ch of homeData.chests || []) {
       if (ch && ch.ready && !ch.opened && ch.tier != null) {
@@ -414,7 +415,21 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
       dirty: st.dirty,
       equipError,
     }
-  })
+    })
+  } catch (err) {
+    if (/Failed to acquire gear lock/i.test(String(err?.message || ''))) {
+      return {
+        ok: false,
+        adopted: true,
+        stage: 'gear-lock-timeout',
+        error: err.message,
+        homeData,
+        syncedArenaCount,
+        syncedGuardCount,
+      }
+    }
+    throw err
+  }
 }
 
 export function pickArenaOpponent(opponentsList = [], excludeIds = null) {

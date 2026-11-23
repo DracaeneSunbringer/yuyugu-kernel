@@ -93,7 +93,7 @@ export async function runLiveAccountTick({
       fetchWorldFn,
       userConstraints: baseUserConstraints,
       stageWindowSec: stageTriggerSec,
-      postUnlockOffsetMs: 25,
+      postUnlockOffsetMs: account === 'main' ? 25 : 180,
       arcadeStandbyOptions,
     })
     if (stagedOut?.status === 'standby-manual-arcade') {
@@ -116,6 +116,7 @@ export async function runLiveAccountTick({
   }
 
   // Phase A: Physical-Cooldown Staged Snipe Fast Lane (`leadSec <= T_prep + 1s` enters unified staged countdown)
+  snipeScheduler?.ingestSharedScanUpdates?.(adapter, null, baseUserConstraints)
   const urgentAtEntry = await runUrgentStagedSnipeIfImminent()
   if (urgentAtEntry) return urgentAtEntry
 
@@ -153,6 +154,7 @@ export async function runLiveAccountTick({
     ? { ...solverOptions, checkHorizonStability: false }
     : solverOptions
 
+  let capexEvaluatedAtSec = null
   const controllerOut = await runControllerStep({
     adapter,
     journal,
@@ -223,8 +225,8 @@ export async function runLiveAccountTick({
         Boolean(runtimeState?.pendingCapex) ||
         (nowW - Number(runtimeState?.lastCapexEvalAtSec || 0)) >= 600
       )
-      if (capexDue && runtimeState) {
-        runtimeState.lastCapexEvalAtSec = nowW
+      if (capexDue) {
+        capexEvaluatedAtSec = nowW
       }
       effectiveConstraints = {
         ...baseUserConstraints,
@@ -267,6 +269,9 @@ export async function runLiveAccountTick({
       runtimeState.consecutivePlanInvalid = Number(runtimeState.consecutivePlanInvalid || 0) + 1
     } else if (controllerOut?.status === 'confirmed' || controllerOut?.status === 'waiting') {
       runtimeState.consecutivePlanInvalid = 0
+      if (Number.isFinite(capexEvaluatedAtSec)) {
+        runtimeState.lastCapexEvalAtSec = capexEvaluatedAtSec
+      }
     }
     if (controllerOut?.status === 'deferred-by-deadline') {
       runtimeState.consecutiveDeferred = Number(runtimeState.consecutiveDeferred || 0) + 1
@@ -332,25 +337,40 @@ export async function runLiveAccountTick({
   if (!dryRun && controllerOut.status === 'confirmed') {
     const nowAfterTxSec = httpClient.estimatedServerNowSec()
     let confirmedWakeSec = Number(controllerOut.nextWakeSec || (nowAfterTxSec + (adapter.R.WORLD?.minGap || 2)))
+    const bucketApiPath = controllerOut.transactionKind === 'visit'
+      ? '/api/pet/world/visit/0'
+      : '/api/pet/world/act'
+    const remainingBucketMs = typeof httpClient.getRemainingBucketCooldownMs === 'function'
+      ? Number(httpClient.getRemainingBucketCooldownMs('POST', bucketApiPath) || 0)
+      : 0
+    const bucketReadyWakeSec = remainingBucketMs > 0
+      ? Math.ceil((httpClient.estimatedServerNowMs() + remainingBucketMs) / 1000)
+      : nowAfterTxSec
+    confirmedWakeSec = Math.max(confirmedWakeSec, bucketReadyWakeSec)
     const goalClaimedInBatch = (controllerOut.compiled?.domesticBatch || []).some((x) => x?.a === 'goal')
     if (goalClaimedInBatch && runtimeState) {
       runtimeState.lastBattlePrepAtSec = 0
-      confirmedWakeSec = Math.min(confirmedWakeSec, nowAfterTxSec + 2)
+      confirmedWakeSec = Math.min(confirmedWakeSec, Math.max(nowAfterTxSec + 2, bucketReadyWakeSec))
     }
     const nextSnipeAfterTx = snipeScheduler?.nextExactUnlockInfo(nowAfterTxSec)
     if (nextSnipeAfterTx) {
       const prepLeadAfterTx = snipeScheduler.computePhysicalPrepLeadSec(nextSnipeAfterTx.entry, adapter, httpClient)
+      const snipeWakeFloor = controllerOut.transactionKind === 'visit' ? bucketReadyWakeSec : (nowAfterTxSec + 1)
       confirmedWakeSec = Math.min(
         confirmedWakeSec,
-        Math.max(nowAfterTxSec + 1, nextSnipeAfterTx.unlockAt - Math.ceil(prepLeadAfterTx + 1))
+        Math.max(snipeWakeFloor, nextSnipeAfterTx.unlockAt - Math.ceil(prepLeadAfterTx + 1))
       )
     }
     const nextHorizonAfterTx = snipeScheduler?.nextHorizonEntrySec?.(nowAfterTxSec)
     if (Number.isFinite(nextHorizonAfterTx)) {
       confirmedWakeSec = Math.min(confirmedWakeSec, Math.max(nowAfterTxSec + 1, Math.ceil(nextHorizonAfterTx)))
     }
+    const nextProbeAfterTx = snipeScheduler?.nextCommittedProbeWakeSec?.(nowAfterTxSec)
+    if (Number.isFinite(nextProbeAfterTx)) {
+      confirmedWakeSec = Math.min(confirmedWakeSec, Math.max(nowAfterTxSec + 1, Math.ceil(nextProbeAfterTx)))
+    }
     if (snipeScheduler?.needsScheduleRefresh?.()) {
-      confirmedWakeSec = nowAfterTxSec
+      confirmedWakeSec = Math.max(nowAfterTxSec, bucketReadyWakeSec)
     } else {
       if ((runtimeState?.arenaRemaining || 0) > 0) {
         confirmedWakeSec = Math.min(confirmedWakeSec, nowAfterTxSec + 9)
@@ -456,12 +476,12 @@ export async function runLiveAccountTick({
       }
     }
 
-    // C.4: Huancai Daily 10D Floor FOURTH (`22:30 CST` cycle, `main` only by default)
+    // C.4: Huancai Daily 10D Floor FOURTH (`22:30 CST` cycle, disabled by default unless opted in via `effectiveConstraints.allowHuancaiFloor === true`)
     const huancaiDue = (httpClient.estimatedServerNowSec() - Number(runtimeState.lastHuancaiCheckAtSec || 0)) >= 600
     if (huancaiDue && !snipeScheduler?.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec())) {
       backgroundReport.huancai = await runHuancaiDailyCheck(httpClient, {
         accountKey: account,
-        allowHuancaiFloor: account === 'main',
+        allowHuancaiFloor: Boolean(effectiveConstraints.allowHuancaiFloor),
         cashReserveFloor: Number(effectiveConstraints.cashReserveFloor ?? 10),
         stateFilePath: huancaiStatePath,
         dryRun,
@@ -582,6 +602,10 @@ export async function runLiveAccountTick({
   if (Number.isFinite(nextHorizonSec)) {
     nextWakeSec = Math.min(nextWakeSec, Math.max(nowEndSec + 1, Math.ceil(nextHorizonSec)))
   }
+  const nextProbeSec = snipeScheduler?.nextCommittedProbeWakeSec?.(nowEndSec)
+  if (Number.isFinite(nextProbeSec)) {
+    nextWakeSec = Math.min(nextWakeSec, Math.max(nowEndSec + 1, Math.ceil(nextProbeSec)))
+  }
   const scheduleRefreshReason = snipeScheduler?.needsScheduleRefresh?.()
     ? (snipeScheduler.getScheduleRefreshReason?.() || 'schedule-refresh-due')
     : null
@@ -590,7 +614,9 @@ export async function runLiveAccountTick({
   } else if ((runtimeState.arenaRemaining || 0) > 0) {
     nextWakeSec = Math.min(nextWakeSec, nowEndSec + 9)
   } else if (snipeScheduler?.isStealEnabled() && snipeScheduler.data.discoveryCursor) {
-    nextWakeSec = Math.min(nextWakeSec, nowEndSec + 15)
+    const indexedTargetCount = Object.keys(snipeScheduler.data?.targets || {}).length
+    const isWarmDiscovery = indexedTargetCount >= 200 && Number(snipeScheduler.data?.lastHeadScanAtSec || 0) > 0
+    nextWakeSec = Math.min(nextWakeSec, nowEndSec + (isWarmDiscovery ? 45 : 15))
   }
   if (Boolean(npcOptions?.enabled) && !snipeScheduler?.shouldBlockBackgroundWork(nowEndSec)) {
     const npcWake = Number.isFinite(backgroundReport.npc?.nextNpcWakeSec)
@@ -709,7 +735,9 @@ if (isDirectMain) {
       .split(',')
       .map((s) => Number(s.trim()))
       .filter((n) => Number.isFinite(n) && n > 0)
-    const domesticOnly = hasFlag('--domestic-only') || hasFlag('--no-steal') || account === 'secondary'
+    const enableStealFlag = hasFlag('--enable-steal') || process.env.MEME_ENABLE_STEAL === '1'
+    const disableStealFlag = hasFlag('--domestic-only') || hasFlag('--no-steal') || process.env.MEME_DISABLE_STEAL === '1'
+    const domesticOnly = disableStealFlag ? true : (enableStealFlag ? false : account === 'secondary')
     const allowCapexFlag = hasFlag('--allow-capex')
     const noCapexFlag = hasFlag('--no-capex')
     const maxTickSolveMs = Math.max(1000, Number(getArg('--max-tick-solve-ms', '45000')) || 45000)
@@ -724,7 +752,8 @@ if (isDirectMain) {
     const xianFuseTarget = getArg('--xian-fuse-target', process.env.MEME_XIAN_FUSE_TARGET || 'auto')
     const xianAutoAll = hasFlag('--xian-opt3') || hasFlag('--xian-auto-all') || process.env.MEME_XIAN_AUTO_ALL === '1'
     const xianAutoEvents = hasFlag('--xian-auto-events') || process.env.MEME_XIAN_AUTO_EVENTS === '1'
-    const xianAutoSocial = hasFlag('--xian-auto-social') || process.env.MEME_XIAN_AUTO_SOCIAL === '1'
+    const xianAutoSocial = hasFlag('--xian-auto-social') || hasFlag('--xian-social-target') || process.env.MEME_XIAN_AUTO_SOCIAL === '1' || Boolean(process.env.MEME_XIAN_SOCIAL_TARGET)
+    const xianSocialTarget = getArg('--xian-social-target', process.env.MEME_XIAN_SOCIAL_TARGET || 'all')
     const xianAutoDuel = hasFlag('--xian-auto-duel') || process.env.MEME_XIAN_AUTO_DUEL === '1'
     const xianAutoRealm = hasFlag('--xian-auto-realm') || process.env.MEME_XIAN_AUTO_REALM === '1'
     const npcOptions = { enabled: !hasFlag('--disable-npc') }
@@ -742,6 +771,7 @@ if (isDirectMain) {
       autoAll: xianAutoAll,
       autoEvents: xianAutoEvents,
       autoSocial: xianAutoSocial,
+      socialTarget: xianSocialTarget,
       autoDuel: xianAutoDuel,
       autoRealm: xianAutoRealm,
     })
@@ -767,6 +797,7 @@ if (isDirectMain) {
     const lockRootDir = path.join(dataRootDir, 'locks')
     const profileStorePath = getArg('--opponent-profiles', path.join(dataRootDir, 'opponent-profiles.json'))
     const scheduleFilePath = path.join(dataRootDir, `snipe-schedule.${account}.json`)
+    const sharedScanFilePath = getArg('--shared-scan', path.join(dataRootDir, 'shared-island-scan.json'))
     const huancaiStatePath = path.join(dataRootDir, `huancai-state.${account}.json`)
 
     const httpClient = new KernelHttpClient({
@@ -779,14 +810,23 @@ if (isDirectMain) {
       : null
 
     const adapter = await loadRulesAdapterFromFile(rulesPath)
-    const journal = dryRun ? null : new ContentAddressedJournal({ rootDir: journalRootDir, account })
+    const journal = dryRun ? null : new ContentAddressedJournal({
+      rootDir: journalRootDir,
+      account,
+      compactRuntimeIndex: true,
+    })
     const partnerJournal = (!dryRun && (fs.existsSync(partnerJournalDir) || fs.existsSync(partnerSessionPath)))
-      ? new ContentAddressedJournal({ rootDir: journalRootDir, account: partnerAccount })
+      ? new ContentAddressedJournal({
+          rootDir: journalRootDir,
+          account: partnerAccount,
+          compactRuntimeIndex: true,
+        })
       : null
 
     const snipeScheduler = new SnipeScheduler({
       accountKey: account,
       scheduleFilePath: dryRun ? null : scheduleFilePath,
+      sharedScanFilePath: dryRun ? null : sharedScanFilePath,
       profileStorePath,
       gearLockRoot: lockRootDir,
       selfIds,
@@ -794,10 +834,14 @@ if (isDirectMain) {
       minStealSpots: domesticOnly ? 999999 : 1,
     })
 
-    const effectiveAllowCapex = noCapexFlag ? false : (allowCapexFlag ? true : domesticOnly)
+    const effectiveAllowCapex = noCapexFlag ? false : (allowCapexFlag ? true : (domesticOnly || account === 'secondary'))
     const baseUserConstraints = !domesticOnly
       ? {
+          domesticOnly: false,
           allowCapex: effectiveAllowCapex,
+          ...(effectiveAllowCapex
+            ? { capexTargets: { plotsMax: 24, barnMax: 8, trapsMax: 4, houseMax: 0, toolsMax: { rod: 4, pick: 4, spr: 3 } } }
+            : {}),
           minStealSpots: 0,
           allowThiefBuffPurchase: true,
           allowGuardBuffPurchase: false,
@@ -882,14 +926,16 @@ if (isDirectMain) {
     }
     const xianOpt3Tags = [
       xianOptions.autoEvents ? 'ev' : '',
-      xianOptions.autoSocial ? 'soc' : '',
+      xianOptions.autoSocial
+        ? (xianOptions.socialTarget && xianOptions.socialTarget !== 'all' ? `soc(${xianOptions.socialTarget})` : 'soc')
+        : '',
       xianOptions.autoDuel ? 'duel' : '',
       xianOptions.autoRealm ? 'rlm' : '',
     ].filter(Boolean)
     const xianBootTag = xianOptions.enabled
       ? `on(break=${xianOptions.breakMode},fuse=${xianOptions.autoFuse ? xianOptions.fuseTarget : 'off'}${xianOpt3Tags.length ? `,opt3=${xianOpt3Tags.join('+')}` : ''})`
       : 'off'
-    console.log(`[${new Date().toISOString()}] [LIVE:${account}] kernel=v${updateNotifier.localVersion} xian=${xianBootTag} started pid=${process.pid}`)
+    console.log(`[${new Date().toISOString()}] [LIVE:${account}] kernel=v${updateNotifier.localVersion} steal=${domesticOnly ? 'off' : 'on'} xian=${xianBootTag} started pid=${process.pid}`)
     updateNotifier.maybeCheckInBackground()
 
     try {

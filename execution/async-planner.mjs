@@ -6,7 +6,33 @@ import {
   computeStaticFarmStateDigest,
   isFarmDomainPassiveCompatible,
 } from '../model/observations.mjs'
-import { compileExecutablePrefix, computeEarliestDomesticTransitionSec } from '../planner/compile-prefix.mjs'
+import {
+  compileExecutablePrefix,
+  computeEarliestDomesticTransitionSec,
+  detectStochasticAugmentedItemIds,
+} from '../planner/compile-prefix.mjs'
+
+function recipeTouchesItemSet(adapter, recId, itemSet, seen = new Set()) {
+  if (!recId || !itemSet || itemSet.size === 0 || seen.has(recId)) return false
+  seen.add(recId)
+  const rec = adapter?.graph?.recipesById?.get(recId)
+    || adapter?.R?.RECIPES?.find((r) => r?.id === recId)
+  if (!rec?.in) return false
+  for (const inId of Object.keys(rec.in)) {
+    if (itemSet.has(inId) || recipeTouchesItemSet(adapter, inId, itemSet, seen)) return true
+  }
+  return false
+}
+
+function batchTouchesStochasticLiquidationOrCraft(adapter, domesticBatch = [], stochasticProducedIds = new Set()) {
+  if (!stochasticProducedIds || stochasticProducedIds.size === 0) return false
+  for (const act of domesticBatch) {
+    if (!act) continue
+    if (act.a === 'sell' && stochasticProducedIds.has(act.id)) return true
+    if (act.a === 'craft' && recipeTouchesItemSet(adapter, act.id, stochasticProducedIds)) return true
+  }
+  return false
+}
 
 function canonicalizeBeliefItem(b) {
   return {
@@ -101,8 +127,10 @@ export class PlanCache {
     envelope,
     objectiveCfg,
     neighborSig = 'none',
+    readyNeighborSig = null,
     plan,
     horizonStability = null,
+    isContinuation = false,
     createdAtMs = Date.now(),
   }) {
     if (!account || !worldBefore || !plan) return null
@@ -126,7 +154,9 @@ export class PlanCache {
       constraintsHash: envelope?.constraintsHash || plan.constraintsHash,
       objectiveHash: objectiveCfg?.objectiveHash || plan.objectiveHash,
       neighborSig,
+      readyNeighborSig: readyNeighborSig ?? neighborSig,
       isWaitPlan,
+      isContinuation: Boolean(isContinuation || plan?._isContinuation),
       invalidateAtSec,
       envelope,
       plan,
@@ -158,8 +188,10 @@ export class PlanCache {
     constraintsHash,
     objectiveHash,
     neighborSig = 'none',
+    readyNeighborSig = null,
     maxClockDriftSec = Infinity,
     evictExpired = true,
+    allowFutureMinGap = false,
   }) {
     const rawEntries = this.byAccount.get(account)
     if (!rawEntries || !world) return null
@@ -175,6 +207,10 @@ export class PlanCache {
       if (liveStaticDigest === null) liveStaticDigest = computeStaticFarmStateDigest(world)
       return liveStaticDigest
     }
+    const neighborMatches = (entry) => (
+      entry.neighborSig === neighborSig ||
+      (entry.isContinuation && readyNeighborSig != null && (entry.readyNeighborSig ?? entry.neighborSig) === readyNeighborSig)
+    )
 
     const kept = []
     let hit = null
@@ -190,6 +226,33 @@ export class PlanCache {
           continue
         }
         kept.push(entry)
+        const minGap = adapter?.R?.WORLD?.minGap || 2
+        if (
+          !hit &&
+          allowFutureMinGap &&
+          !entry.isWaitPlan &&
+          driftSec >= -minGap &&
+          (!constraintsHash || entry.constraintsHash === constraintsHash) &&
+          (!objectiveHash || entry.objectiveHash === objectiveHash) &&
+          neighborMatches(entry) &&
+          entry.atSec < computeEarliestDomesticTransitionSec(adapter, world, null) &&
+          isFarmDomainPassiveCompatible(adapter, world, entry.worldBefore, {
+            isWaitPlan: false,
+            staticDigestBase: getLiveStaticDigest(),
+          })
+        ) {
+          const advancedWorld = {
+            ...adapter.advanceTimeOnly(world, entry.atSec),
+            rev: world.rev,
+          }
+          const compiled = compileExecutablePrefix(adapter, advancedWorld, entry.plan, { maxClockDriftSec })
+          if (compiled.status !== 'plan-invalid') {
+            hit = {
+              ...entry,
+              compiled,
+            }
+          }
+        }
         continue
       }
 
@@ -197,6 +260,7 @@ export class PlanCache {
         !isFarmDomainPassiveCompatible(adapter, entry.worldBefore, world, {
           isWaitPlan: entry.isWaitPlan,
           staticDigestBase: entry.staticFarmDigest,
+          plan: entry.plan,
         })
       ) {
         if (liveRev <= entry.rev) {
@@ -210,7 +274,7 @@ export class PlanCache {
       if (driftSec > maxClockDriftSec) continue
       if (constraintsHash && entry.constraintsHash !== constraintsHash) continue
       if (objectiveHash && entry.objectiveHash !== objectiveHash) continue
-      if (entry.neighborSig !== neighborSig) continue
+      if (!neighborMatches(entry)) continue
 
       const compiled = compileExecutablePrefix(adapter, world, entry.plan, { maxClockDriftSec })
       if (compiled.status === 'plan-invalid') continue
@@ -226,6 +290,135 @@ export class PlanCache {
     }
 
     return hit
+  }
+
+  /**
+   * Advances the unexecuted suffix of `plan.trunkBuckets[0]` onto `worldAfter`
+   * after `compiled.domesticBatch` is confirmed by `/api/pet/world/act`:
+   * - Eliminates redundant global re-solves across multi-batch `harvest + plant` (> 40 actions)
+   *   and sequential intra-isle extraction (`[eat?, fish/mine/bomb]` steps).
+   * - Automatically rejects continuation (falling back to a fresh solve) whenever any physical
+   *   transition expired, `nextCompiled` fails feasibility, or Batch 2 would `sell` / `craft`
+   *   items whose stock was stochastically augmented by unobserved random drops.
+   */
+  advanceAfterCommittedPrefix({
+    adapter,
+    account,
+    plan,
+    horizonStability = null,
+    envelope,
+    objectiveCfg,
+    neighborTargets = [],
+    neighborSig = 'none',
+    compiled,
+    worldBefore,
+    worldAfter,
+    createdAtMs = Date.now(),
+  }) {
+    if (
+      !adapter ||
+      !account ||
+      !plan ||
+      !worldAfter?.state ||
+      !compiled ||
+      compiled.truncatedByTransition ||
+      compiled.nextTransactionKind !== 'act'
+    ) {
+      return null
+    }
+    const rawBucket0 = plan.trunkBuckets?.[0]
+    if (!rawBucket0) return null
+    const rawDomestic0 = Array.isArray(rawBucket0.domesticActions) ? rawBucket0.domesticActions : []
+    const rawVisits0 = Array.isArray(rawBucket0.visitActions) ? rawBucket0.visitActions : []
+    const committedCount = Array.isArray(compiled.domesticBatch) ? compiled.domesticBatch.length : 0
+    if (committedCount <= 0 || committedCount > rawDomestic0.length) return null
+
+    const remainingDomestic = rawDomestic0.slice(committedCount)
+    if (remainingDomestic.length === 0 && rawVisits0.length === 0) {
+      return null
+    }
+
+    const nowAfter = Math.floor(Number(worldAfter.now || 0))
+    const at0 = Math.floor(Number(rawBucket0.atSec ?? nowAfter))
+    if (
+      adapter.R.isleIndex(at0) !== adapter.R.isleIndex(nowAfter) ||
+      adapter.R.worldDay(at0) !== adapter.R.worldDay(nowAfter)
+    ) {
+      return null
+    }
+
+    const domesticInvalidateAtSec = computeEarliestDomesticTransitionSec(adapter, worldAfter, null)
+    const invalidateAtSec = Math.min(domesticInvalidateAtSec, computeEarliestUpcomingUnlockSec(envelope))
+    if (nowAfter >= invalidateAtSec) {
+      return null
+    }
+
+    const stochasticProducedIds = new Set(
+      Array.isArray(plan._stochasticProducedIds) ? plan._stochasticProducedIds : []
+    )
+    if (worldBefore?.state) {
+      const newlyAugmented = detectStochasticAugmentedItemIds(
+        adapter,
+        worldBefore,
+        worldAfter,
+        compiled.domesticBatch
+      )
+      for (const id of newlyAugmented) stochasticProducedIds.add(id)
+    }
+
+    const continuedBucket0 = {
+      ...rawBucket0,
+      atSec: nowAfter,
+      plannedAtEnT: Number(worldAfter.state?.enT ?? nowAfter),
+      domesticActions: remainingDomestic,
+      visitActions: rawVisits0.map((v) => ({ ...v })),
+    }
+    const continuedPlan = {
+      ...plan,
+      serverNow: nowAfter,
+      rev: worldAfter.rev ?? plan.rev,
+      trunkBuckets: [continuedBucket0, ...(plan.trunkBuckets || []).slice(1)],
+      _isContinuation: true,
+      _stochasticProducedIds: [...stochasticProducedIds],
+    }
+
+    const nextCompiled = compileExecutablePrefix(adapter, worldAfter, continuedPlan)
+    if (nextCompiled.status !== 'ready') {
+      return null
+    }
+    if (
+      nextCompiled.nextTransactionKind === 'act' &&
+      batchTouchesStochasticLiquidationOrCraft(adapter, nextCompiled.domesticBatch, stochasticProducedIds)
+    ) {
+      return null
+    }
+
+    const continuedEnvelope = envelope
+      ? {
+          ...envelope,
+          observed: {
+            ...(envelope.observed || {}),
+            serverNow: nowAfter,
+            rev: worldAfter.rev ?? null,
+            world: worldAfter,
+          },
+        }
+      : null
+    const readyNeighborSig = buildNeighborSignature(neighborTargets, null)
+    this.invalidate(account)
+    return this.put({
+      adapter,
+      account,
+      worldBefore: worldAfter,
+      envelope: continuedEnvelope,
+      objectiveCfg,
+      neighborSig,
+      readyNeighborSig,
+      plan: continuedPlan,
+      horizonStability,
+      isContinuation: true,
+      createdAtMs,
+    })
   }
 
   invalidate(account) {
@@ -334,6 +527,7 @@ export class AsyncPlanManager {
               envelope: job.envelope,
               objectiveCfg: job.objCfg,
               neighborSig: job.neighborSig,
+              readyNeighborSig: job.readyNeighborSig,
               plan: msg.plan,
               horizonStability: {
                 prefixStable: null,
@@ -412,6 +606,7 @@ export class AsyncPlanManager {
     objCfg,
     neighborTargets = [],
     neighborSig = 'none',
+    readyNeighborSig = null,
     solverOptions = {},
     runStability = true,
     deadlineAtMs = Infinity,
@@ -460,6 +655,7 @@ export class AsyncPlanManager {
             envelope,
             objectiveCfg: objCfg,
             neighborSig,
+            readyNeighborSig,
             plan: val.plan,
             horizonStability: val.horizonStability,
           })
@@ -510,6 +706,7 @@ export class AsyncPlanManager {
       constraintsHash: envelope.constraintsHash,
       objectiveHash: objCfg.objectiveHash,
       neighborSig,
+      readyNeighborSig,
       invalidateAtSec: jobInvalidateAtSec,
       isBackground,
       checkpointPlan: null,
@@ -549,12 +746,14 @@ export class AsyncPlanManager {
     shouldPreemptFn = null,
     pollIntervalMs = 25,
     maxClockDriftSec = Infinity,
+    allowFutureMinGap = false,
     nowMsFn = Date.now,
   }) {
     const objCfg = objectiveCfg?.objectiveHash
       ? objectiveCfg
       : buildObjectiveConfig(objectiveCfg || {})
     const neighborSig = buildNeighborSignature(neighborTargets, envelope)
+    const readyNeighborSig = buildNeighborSignature(neighborTargets, null)
     const world = envelope.observed.world
 
     // 1. Fast-path PlanCache hit (< 1ms, zero worker overhead!)
@@ -565,7 +764,9 @@ export class AsyncPlanManager {
       constraintsHash: envelope.constraintsHash,
       objectiveHash: objCfg.objectiveHash,
       neighborSig,
+      readyNeighborSig,
       maxClockDriftSec,
+      allowFutureMinGap,
     })
     if (cached) {
       this.stats.cacheHits++
@@ -601,12 +802,21 @@ export class AsyncPlanManager {
       if (candJob.matchKey === matchKey && Number(world?.rev ?? -2) === candJob.rev) return true
       const nowW = Math.floor(Number(world?.now || 0))
       const drift = nowW - Number(candJob.atSec || 0)
+      const minAllowedDrift = candJob.isBackground ? -(adapter?.R?.WORLD?.minGap || 2) : 0
       if (candJob.account !== account) return false
-      if (drift < 0 || drift > maxClockDriftSec) return false
+      if (drift < minAllowedDrift || drift > maxClockDriftSec) return false
       if (nowW >= candJob.invalidateAtSec) return false
       if (candJob.constraintsHash !== envelope.constraintsHash) return false
       if (candJob.objectiveHash !== objCfg.objectiveHash) return false
       if (candJob.neighborSig !== neighborSig) return false
+      if (drift < 0) {
+        if (adapter && candJob.atSec >= computeEarliestDomesticTransitionSec(adapter, world, null)) {
+          return false
+        }
+        return isFarmDomainPassiveCompatible(adapter, world, candJob.worldBefore, {
+          isWaitPlan: false,
+        })
+      }
       if (
         !isFarmDomainPassiveCompatible(adapter, candJob.worldBefore, world, {
           isWaitPlan: false,
@@ -634,6 +844,7 @@ export class AsyncPlanManager {
         objCfg,
         neighborTargets,
         neighborSig,
+        readyNeighborSig,
         solverOptions,
         runStability,
         deadlineAtMs,
@@ -717,13 +928,24 @@ export class AsyncPlanManager {
         }
       }
       if (reusedInFlight && winner.res?.status === 'solved' && adapter) {
+        const nowW = Math.floor(Number(world?.now || 0))
+        const planAt0 = Math.floor(Number(winner.res.plan?.trunkBuckets?.[0]?.atSec ?? nowW))
+        const minGap = adapter.R?.WORLD?.minGap || 2
+        let validationWorld = world
+        if (planAt0 > nowW && (planAt0 - nowW) <= minGap) {
+          validationWorld = {
+            ...adapter.advanceTimeOnly(world, planAt0),
+            rev: world.rev,
+          }
+        }
         const revalidated = this.cache.getValid({
           adapter,
           account,
-          world,
+          world: validationWorld,
           constraintsHash: envelope.constraintsHash,
           objectiveHash: objCfg.objectiveHash,
           neighborSig,
+          readyNeighborSig,
           maxClockDriftSec,
         })
         if (revalidated) {
@@ -748,6 +970,7 @@ export class AsyncPlanManager {
           shouldPreemptFn,
           pollIntervalMs,
           maxClockDriftSec,
+          allowFutureMinGap,
           nowMsFn,
         })
       }
@@ -774,6 +997,7 @@ export class AsyncPlanManager {
       ? objectiveCfg
       : buildObjectiveConfig(objectiveCfg || {})
     const neighborSig = buildNeighborSignature(neighborTargets, envelope)
+    const readyNeighborSig = buildNeighborSignature(neighborTargets, null)
     const already = this.cache.getValid({
       adapter,
       account,
@@ -781,6 +1005,7 @@ export class AsyncPlanManager {
       constraintsHash: envelope.constraintsHash,
       objectiveHash: objCfg.objectiveHash,
       neighborSig,
+      readyNeighborSig,
       evictExpired: false,
     })
     if (already) return Promise.resolve({ status: 'cache-hit', plan: already.plan })
@@ -793,6 +1018,7 @@ export class AsyncPlanManager {
       objCfg,
       neighborTargets,
       neighborSig,
+      readyNeighborSig,
       solverOptions,
       runStability,
       deadlineAtMs,

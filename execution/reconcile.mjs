@@ -129,7 +129,18 @@ export function reconcileUnknownWithFreshWorld(
 ) {
   if (!freshWorld || typeof freshWorld !== 'object') return { reconciled: 0, remainingUnknown: 0 }
   adapter.syncClock(freshWorld.clockStart)
-  const { transactions } = journal.reconstructTransactions()
+  const unknownTxs = typeof journal.listUnknownTransactions === 'function'
+    ? journal.listUnknownTransactions()
+    : journal.reconstructTransactions().transactions.filter((tx) => tx.status === 'unknown' || tx.status === 'submitted')
+  if (unknownTxs.length === 0) {
+    return {
+      reconciled: 0,
+      remainingUnknown: 0,
+      remainingNonVisitUnknown: 0,
+      inFlightVisitEnergyReserved: 0,
+      inFlightVisitFineReserved: 0,
+    }
+  }
   const stateRef = journal.writeBlob(sanitizeWorldSnapshot(freshWorld))
   let reconciled = 0
   let remainingUnknown = 0
@@ -137,8 +148,7 @@ export function reconcileUnknownWithFreshWorld(
   let inFlightVisitEnergyReserved = 0
   let inFlightVisitFineReserved = 0
 
-  for (const tx of transactions) {
-    if (tx.status !== 'unknown' && tx.status !== 'submitted') continue
+  for (const tx of unknownTxs) {
 
     // 1) Explicit operation receipt evidence takes priority
     if (receiptsByOperation && Object.hasOwn(receiptsByOperation, tx.operation)) {

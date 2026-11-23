@@ -4,10 +4,19 @@ import path from 'node:path'
 import { sanitizeWorldSnapshot } from '../model/observations.mjs'
 
 export class ContentAddressedJournal {
-  constructor({ rootDir, account = 'main' }) {
+  constructor({
+    rootDir,
+    account = 'main',
+    compactRuntimeIndex = false,
+    maxRetainedWaitDecisions = 64,
+    retainSettledIsleWindow = 6,
+  }) {
     if (!rootDir) throw new Error('Journal rootDir is required')
     this.rootDir = path.resolve(rootDir)
     this.account = String(account || 'main')
+    this.compactRuntimeIndex = Boolean(compactRuntimeIndex)
+    this.maxRetainedWaitDecisions = Math.max(1, Number(maxRetainedWaitDecisions || 64))
+    this.retainSettledIsleWindow = Math.max(0, Number(retainSettledIsleWindow ?? 6))
     this.accountDir = path.join(this.rootDir, this.account)
     this.blobsDir = path.join(this.accountDir, 'blobs')
     this.rulesDir = path.join(this.rootDir, 'rules-archive')
@@ -21,6 +30,8 @@ export class ContentAddressedJournal {
     this._idxByteOffset = 0
     this._idxTxMap = new Map()
     this._idxWaitDecisions = []
+    this._idxUnresolvedOps = new Set()
+    this._maxSeenIsleIdx = -Infinity
     this._idxCorruptLines = 0
     this._idxTotalLines = 0
     this._idxStatusCounts = { confirmed: 0, rejected: 0, unknownOrSubmitted: 0 }
@@ -41,6 +52,9 @@ export class ContentAddressedJournal {
     if (!ev || typeof ev !== 'object') return
     if (ev.recordType === 'wait-decision') {
       this._idxWaitDecisions.push(ev)
+      if (this.compactRuntimeIndex && this._idxWaitDecisions.length > this.maxRetainedWaitDecisions * 2) {
+        this._idxWaitDecisions = this._idxWaitDecisions.slice(-this.maxRetainedWaitDecisions)
+      }
       return
     }
     if (!ev.operation) return
@@ -55,9 +69,20 @@ export class ContentAddressedJournal {
         status: 'planned',
         possibleIsleIndices: [],
         history: [],
+        _lastSeenMaxIsle: Number.isFinite(this._maxSeenIsleIdx) ? this._maxSeenIsleIdx : -Infinity,
       }
     }
-    prev.history.push(ev)
+    if (!this.compactRuntimeIndex) {
+      prev.history.push(ev)
+    } else if (
+      ev.status !== 'confirmed' &&
+      ev.status !== 'rejected' &&
+      ev.status !== 'aborted-before-send'
+    ) {
+      prev.history.push(ev)
+    } else if (prev.history.length > 0) {
+      prev.history = []
+    }
     if (ev.status) prev.status = ev.status
     if (ev.decisionId) prev.decisionId = ev.decisionId
     if (ev.kind) prev.kind = ev.kind
@@ -85,11 +110,32 @@ export class ContentAddressedJournal {
         const merged = new Set([...(prev.possibleIsleIndices || []), ...ev.possibleIsleIndices])
         prev.possibleIsleIndices = [...merged].sort((a, b) => a - b)
       }
+      for (let i = 0; i < prev.possibleIsleIndices.length; i++) {
+        const idxVal = Number(prev.possibleIsleIndices[i])
+        if (Number.isFinite(idxVal)) {
+          if (idxVal > this._maxSeenIsleIdx) this._maxSeenIsleIdx = idxVal
+          if (!Number.isFinite(prev._lastSeenMaxIsle) || idxVal > prev._lastSeenMaxIsle) {
+            prev._lastSeenMaxIsle = idxVal
+          }
+        }
+      }
+    }
+    if (this.compactRuntimeIndex && (
+      prev.status === 'confirmed' ||
+      prev.status === 'rejected' ||
+      prev.status === 'aborted-before-send'
+    )) {
+      prev.history = []
     }
     const newBucket = this._statusBucket(prev.status)
     if (newBucket !== oldBucket) {
       if (oldBucket) this._idxStatusCounts[oldBucket] -= 1
       if (newBucket) this._idxStatusCounts[newBucket] += 1
+    }
+    if (prev.status === 'unknown' || prev.status === 'submitted') {
+      this._idxUnresolvedOps.add(ev.operation)
+    } else {
+      this._idxUnresolvedOps.delete(ev.operation)
     }
     this._idxTxMap.set(ev.operation, prev)
     if (
@@ -99,6 +145,38 @@ export class ContentAddressedJournal {
       !this._idxSalesCountedOps.has(ev.operation)
     ) {
       this._idxPendingSaleOps.add(ev.operation)
+    }
+  }
+
+  _pruneCompactIndexIfNeeded() {
+    if (!this.compactRuntimeIndex) return
+    if (this._idxWaitDecisions.length > this.maxRetainedWaitDecisions) {
+      this._idxWaitDecisions = this._idxWaitDecisions.slice(-this.maxRetainedWaitDecisions)
+    }
+    if (!Number.isFinite(this._maxSeenIsleIdx) || this._idxTxMap.size === 0) return
+    const cutoffIsleIdx = this._maxSeenIsleIdx - this.retainSettledIsleWindow
+    for (const [op, tx] of this._idxTxMap) {
+      if (this._idxUnresolvedOps.has(op)) continue
+      if (
+        tx.status !== 'confirmed' &&
+        tx.status !== 'rejected' &&
+        tx.status !== 'aborted-before-send' &&
+        tx.status !== 'unknown-state-reanchored'
+      ) {
+        continue
+      }
+      let maxIsle = Number.isFinite(tx._lastSeenMaxIsle) ? tx._lastSeenMaxIsle : -Infinity
+      if (Array.isArray(tx.possibleIsleIndices)) {
+        for (let i = 0; i < tx.possibleIsleIndices.length; i++) {
+          const v = Number(tx.possibleIsleIndices[i])
+          if (Number.isFinite(v) && v > maxIsle) maxIsle = v
+        }
+      }
+      if (maxIsle < cutoffIsleIdx) {
+        this._idxTxMap.delete(op)
+        this._idxPendingSaleOps.delete(op)
+        this._idxSalesCountedOps.delete(op)
+      }
     }
   }
 
@@ -148,6 +226,7 @@ export class ContentAddressedJournal {
         this._idxCorruptLines++
       }
     }
+    this._pruneCompactIndexIfNeeded()
   }
 
   writeBlob(obj) {
@@ -239,6 +318,18 @@ export class ContentAddressedJournal {
     }
   }
 
+  listUnknownTransactions() {
+    this._syncIndexFromDisk()
+    const out = []
+    for (const op of this._idxUnresolvedOps) {
+      const tx = this._idxTxMap.get(op)
+      if (tx && (tx.status === 'unknown' || tx.status === 'submitted')) {
+        out.push(tx)
+      }
+    }
+    return out
+  }
+
   /**
    * Computes conservatively occupied budget for a given isleIndex:
    * counts both `confirmed` on that isleIndex AND any `submitted`/`unknown` transaction whose
@@ -308,6 +399,7 @@ export class ContentAddressedJournal {
       }
       this._idxPendingSaleOps.clear()
     }
+    this._pruneCompactIndexIfNeeded()
     const out = new Map()
     for (const [k, v] of this._idxSalesByIsle.entries()) {
       out.set(k, { ...v })

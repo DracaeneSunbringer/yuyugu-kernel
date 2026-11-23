@@ -502,7 +502,12 @@ test('Phase 12.4: Multi-tick runLiveAccountTick recovery loop — adaptive check
     assert.equal(tick1.controllerOut.status, 'confirmed')
     assert.equal(tick1.controllerOut.horizonStability, null, 'Adaptive recovery must skip extended horizon stability after prior plan-invalid')
     assert.equal(runtimeState.consecutivePlanInvalid, 0, 'Successful confirmation must reset consecutivePlanInvalid')
-    assert.equal(curWorld.state.plots[0], null, 'Plot 0 final harvest must clear plot 0')
+    assert.equal(
+      tick1.controllerOut.compiled.domesticBatch.some((a) => a.a === 'harvest' && a.i === 0),
+      true,
+      'Tick 1 must harvest plot 0'
+    )
+    assert.notEqual(curWorld.state.plots[0], null, 'Plot 0 final harvest + replant must complete atomically in Tick 1 (or by Tick 2)')
     assert.equal(tick1.nextWakeSec, t0 + 2, 'Stochastic harvest must schedule immediate +2s continuation tick')
     assert.equal(tick1.backgroundReport ?? null, null)
 

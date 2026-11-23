@@ -135,7 +135,38 @@ const STOCHASTIC_ACTIONS = new Set([
 ])
 
 export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceText = null } = {}) {
-  const R = rulesModule
+  const worldDayCache = new Map()
+  const isleDayCache = new Map()
+  const R = Object.assign(Object.create(null), rulesModule, {
+    worldDay(t) {
+      const n = Number(t)
+      if (!Number.isFinite(n)) return rulesModule.worldDay(t)
+      const dayBucket = Math.floor((n + 28800) / 86400)
+      let hit = worldDayCache.get(dayBucket)
+      if (hit === undefined) {
+        hit = rulesModule.worldDay(n)
+        if (worldDayCache.size >= 512) {
+          worldDayCache.delete(worldDayCache.keys().next().value)
+        }
+        worldDayCache.set(dayBucket, hit)
+      }
+      return hit
+    },
+    isleDay(t) {
+      const n = Number(t)
+      if (!Number.isFinite(n)) return rulesModule.isleDay(t)
+      const iIdx = rulesModule.isleIndex(n)
+      let hit = isleDayCache.get(iIdx)
+      if (hit === undefined) {
+        hit = rulesModule.isleDay(n)
+        if (isleDayCache.size >= 1024) {
+          isleDayCache.delete(isleDayCache.keys().next().value)
+        }
+        isleDayCache.set(iIdx, hit)
+      }
+      return hit
+    },
+  })
   const effectiveClockStart = Number.isSafeInteger(clockStart) && clockStart >= (R.ISLE_LAUNCH || 0)
     ? clockStart
     : (typeof R.b12ClockStart === 'function' ? R.b12ClockStart() : 0)
@@ -151,13 +182,21 @@ export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceTex
   }
   syncClock()
 
-  const rulesHash = computeRulesHash(R, rulesSourceText)
+  const rulesHash = computeRulesHash(rulesModule, rulesSourceText)
   const graph = buildCatalogGraph(R)
 
   function fastCloneJson(val) {
     if (val === null || typeof val !== 'object') return val
     if (Array.isArray(val)) {
       const len = val.length
+      if (
+        len === 3 &&
+        typeof val[0] === 'number' &&
+        typeof val[1] === 'number' &&
+        typeof val[2] === 'number'
+      ) {
+        return [val[0], val[1], val[2]]
+      }
       const arr = new Array(len)
       for (let i = 0; i < len; i++) {
         const el = val[i]
@@ -165,16 +204,16 @@ export function createRulesAdapter(rulesModule, { clockStart = 0, rulesSourceTex
       }
       return arr
     }
-    const proto = Object.getPrototypeOf(val)
-    if (proto !== Object.prototype && proto !== null) {
+    const ctor = val.constructor
+    if (ctor !== Object && ctor !== undefined) {
       return structuredClone(val)
     }
+    const keys = Object.keys(val)
     const out = {}
-    for (const k in val) {
-      if (Object.prototype.hasOwnProperty.call(val, k)) {
-        const v = val[k]
-        out[k] = v !== null && typeof v === 'object' ? fastCloneJson(v) : v
-      }
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i]
+      const v = val[k]
+      out[k] = v !== null && typeof v === 'object' ? fastCloneJson(v) : v
     }
     return out
   }

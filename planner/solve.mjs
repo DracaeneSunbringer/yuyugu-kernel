@@ -167,14 +167,14 @@ function getSlotScheduleItemMeta(R, slots, itemId, needNatDayTable = false) {
     if (!structMap) {
       structMap = new Map()
       byR.set(itemId, structMap)
-    } else if (structMap.size > 512) {
-      structMap.clear()
+    } else if (structMap.size >= 512) {
+      structMap.delete(structMap.keys().next().value)
     }
     let schedKey = `${slots.length}:${U}`
     for (let s = 0; s < slots.length; s++) {
       const sl = slots[s]
       if (!sl.allowSell) continue
-      schedKey += `|${s},${sl.availFromBucket},${sl.naturalDay},${Number(sl.prices?.[itemId] || 0)},${sl.disc * sl.netTaxFactor}`
+      schedKey += `|${s},${sl.availFromBucket},${sl.naturalDay},${Number(sl.prices?.[itemId] || 0)},${(sl.disc * sl.netTaxFactor).toFixed(9)}`
     }
     itemMeta = structMap.get(schedKey)
     if (!itemMeta) {
@@ -243,6 +243,50 @@ function getSlotScheduleItemMeta(R, slots, itemId, needNatDayTable = false) {
   }
 
   return { root, itemMeta }
+}
+
+const _spfaScratch = {
+  capN: 0,
+  capE: 0,
+  head: null,
+  dist: null,
+  parentNode: null,
+  parentEdge: null,
+  inQueue: null,
+  ringQueue: null,
+  edgeTo: null,
+  edgeNext: null,
+  edgeCap: null,
+  edgeCost: null,
+  edgeSlot: null,
+  edgeQ: null,
+}
+
+function getSpfaScratch(N, maxEdges, needEdgeMeta) {
+  if (N > _spfaScratch.capN) {
+    const capN = Math.max(N, 128)
+    _spfaScratch.capN = capN
+    _spfaScratch.head = new Int32Array(capN)
+    _spfaScratch.dist = new Float64Array(capN)
+    _spfaScratch.parentNode = new Int32Array(capN)
+    _spfaScratch.parentEdge = new Int32Array(capN)
+    _spfaScratch.inQueue = new Uint8Array(capN)
+    _spfaScratch.ringQueue = new Int32Array(capN + 1)
+  }
+  if (maxEdges > _spfaScratch.capE) {
+    const capE = Math.max(maxEdges, 1024)
+    _spfaScratch.capE = capE
+    _spfaScratch.edgeTo = new Int32Array(capE)
+    _spfaScratch.edgeNext = new Int32Array(capE)
+    _spfaScratch.edgeCap = new Int32Array(capE)
+    _spfaScratch.edgeCost = new Float64Array(capE)
+    _spfaScratch.edgeSlot = new Int32Array(capE)
+    _spfaScratch.edgeQ = new Int32Array(capE)
+  } else if (needEdgeMeta && !_spfaScratch.edgeSlot) {
+    _spfaScratch.edgeSlot = new Int32Array(_spfaScratch.capE)
+    _spfaScratch.edgeQ = new Int32Array(_spfaScratch.capE)
+  }
+  return _spfaScratch
 }
 
 function solveExactItemSaleSchedule(adapter, {
@@ -418,19 +462,72 @@ function solveExactItemSaleSchedule(adapter, {
     }
   }
 
+  const tierMults = [1.0, 0.85, 0.70]
+  if (P === 1) {
+    const u0 = grpRepU[0]
+    const q0 = grpQ[0]
+    const cnt0 = grpCnt[0]
+    const qual0 = R.QUALITY?.[q0] ?? 1
+    const opts = []
+    for (let dIdx = 0; dIdx < D; dIdx++) {
+      const bestSlotIdx = itemMeta.bestNdSlotIdx[dIdx * U * 3 + u0 * 3 + q0]
+      if (bestSlotIdx < 0) continue
+      const sl = slots[bestSlotIdx]
+      const rawUnit = Math.round(Number(sl.prices[itemId]) * qual0)
+      const baseFactor = rawUnit * sl.disc * sl.netTaxFactor
+      if (!(baseFactor > 0)) continue
+      const nd = natDays[dIdx]
+      const sc0 = nd === initialNatDay ? initialScCount : 0
+      const cap0 = Math.max(0, 150 - sc0)
+      const cap1 = Math.max(0, 400 - Math.max(150, sc0))
+      const maxReachableTier = cnt0 <= cap0 ? 0 : (cnt0 <= cap0 + cap1 ? 1 : 2)
+      if (cap0 > 0) opts.push({ gain: baseFactor, cap: cap0, dIdx, t: 0, slotIdx: bestSlotIdx })
+      if (maxReachableTier >= 1 && cap1 > 0) opts.push({ gain: baseFactor * 0.85, cap: cap1, dIdx, t: 1, slotIdx: bestSlotIdx })
+      if (maxReachableTier >= 2 && cnt0 > 0) opts.push({ gain: baseFactor * 0.70, cap: cnt0, dIdx, t: 2, slotIdx: bestSlotIdx })
+    }
+    opts.sort((a, b) => (b.gain - a.gain) || (a.dIdx - b.dIdx) || (a.t - b.t))
+    let rem = cnt0
+    let finalWeightedRev = 0
+    const sellsBySlot = revenueOnly ? null : slots.map(() => [0, 0, 0])
+    for (let k = 0; k < opts.length && rem > 0; k++) {
+      const opt = opts[k]
+      const take = Math.min(rem, opt.cap)
+      if (take > 0) {
+        finalWeightedRev += take * opt.gain
+        if (sellsBySlot) sellsBySlot[opt.slotIdx][q0] += take
+        rem -= take
+      }
+    }
+    if (itemMeta.flowRevCache.size < 8192) {
+      itemMeta.flowRevCache.set(flowKey, finalWeightedRev)
+    }
+    if (!revenueOnly && itemMeta.flowFullCache.size < 2048) {
+      itemMeta.flowFullCache.set(flowKey, {
+        sellsBySlot: sellsBySlot.map((r) => [r[0], r[1], r[2]]),
+        totalWeightedRevenue: finalWeightedRev,
+      })
+    }
+    return {
+      sellsBySlot,
+      totalWeightedRevenue: finalWeightedRev,
+    }
+  }
+
   // Flat typed-array Min-Cost Max-Flow (costs = -gain; reverse edge index = `e ^ 1`)
   // Nodes: 0 = SRC, 1..P = coalesced supply groups, P+1..P+3*D = (ndIdx, tier), last = SNK
   const SRC = 0
   const SNK = 1 + P + 3 * D
   const N = SNK + 1
   const maxEdges = 2 * (2 * P + 3 * D + P * 3 * D)
-  const head = new Int32Array(N).fill(-1)
-  const edgeTo = new Int32Array(maxEdges)
-  const edgeNext = new Int32Array(maxEdges)
-  const edgeCap = new Int32Array(maxEdges)
-  const edgeCost = new Float64Array(maxEdges)
-  const edgeSlot = revenueOnly ? null : new Int32Array(maxEdges).fill(-1)
-  const edgeQ = revenueOnly ? null : new Int32Array(maxEdges)
+  const spfa = getSpfaScratch(N, maxEdges, !revenueOnly)
+  const head = spfa.head
+  head.fill(-1, 0, N)
+  const edgeTo = spfa.edgeTo
+  const edgeNext = spfa.edgeNext
+  const edgeCap = spfa.edgeCap
+  const edgeCost = spfa.edgeCost
+  const edgeSlot = revenueOnly ? null : spfa.edgeSlot
+  const edgeQ = revenueOnly ? null : spfa.edgeQ
   let edgeCount = 0
 
   const addEdge = (from, to, cap, cost, slotIdx = -1, q = 0) => {
@@ -460,7 +557,6 @@ function solveExactItemSaleSchedule(adapter, {
     addEdge(1 + i, SNK, cnt, 0, -1, grpQ[i])
   }
 
-  const tierMults = [1.0, 0.85, 0.70]
   const maxTierByDay = new Int32Array(D)
   for (let dIdx = 0; dIdx < D; dIdx++) {
     const nd = natDays[dIdx]
@@ -495,18 +591,18 @@ function solveExactItemSaleSchedule(adapter, {
 
   // SPFA Successive Shortest Path with O(1) ring-buffer queue over flat typed arrays
   let totalCost = 0
-  const dist = new Float64Array(N)
-  const parentNode = new Int32Array(N)
-  const parentEdge = new Int32Array(N)
-  const inQueue = new Uint8Array(N)
+  const dist = spfa.dist
+  const parentNode = spfa.parentNode
+  const parentEdge = spfa.parentEdge
+  const inQueue = spfa.inQueue
   const qCap = N + 1
-  const ringQueue = new Int32Array(qCap)
+  const ringQueue = spfa.ringQueue
 
   while (true) {
-    dist.fill(Infinity)
-    parentNode.fill(-1)
-    parentEdge.fill(-1)
-    inQueue.fill(0)
+    dist.fill(Infinity, 0, N)
+    parentNode.fill(-1, 0, N)
+    parentEdge.fill(-1, 0, N)
+    inQueue.fill(0, 0, N)
     dist[SRC] = 0
     let qHead = 0
     let qTail = 1
@@ -8036,6 +8132,20 @@ function replayRecordedRaidTransitions(adapter, world, transitions, { atSec, pri
  * Single mathematical brain across farming, ranching, cargo, workshop chains, crop tiers,
  * stamina conversion (`eat`/`coffee`), mining/fishing/bombing, CapEx, and neighbor raid (`visit`)!
  */
+const SOLVER_IGNORED_STATE_KEYS = [
+  'vis', 'vis0', 'aff', 'freshness', 'realm', 'b15',
+  'xian', 'xs', 'help0', 'b9Rank', 'arc', 'whaleFriends', 'gift',
+]
+
+function stripSolverIgnoredStateKeys(world) {
+  const st = world?.state
+  if (!st || typeof st !== 'object') return
+  for (let i = 0; i < SOLVER_IGNORED_STATE_KEYS.length; i++) {
+    const k = SOLVER_IGNORED_STATE_KEYS[i]
+    if (k in st) delete st[k]
+  }
+}
+
 export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, options = {}) {
   const startMs = performance.now()
   const startCpu = typeof process?.cpuUsage === 'function' ? process.cpuUsage() : null
@@ -8062,6 +8172,8 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
     : buildObjectiveConfig(objectiveCfgInput)
 
   const world0 = adapter.cloneWorld(envelope.observed.world)
+  const sourceFarmDigest = computeStaticFarmStateDigest(world0)
+  stripSolverIgnoredStateKeys(world0)
   adapter.syncClock(world0.clockStart)
   const utilityTokens = discoverRuleUtilityTokens(adapter)
   const constraints = envelope.constraints
@@ -8675,7 +8787,8 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
       const nOut = (tr.distribution?.outcomes || []).filter((o) => o.prob > 1e-9).length || 1
       totalCombos *= nOut
     }
-    if (totalCombos > 16) {
+    const maxExactCombos = scenarios.length > 1 ? 6 : 16
+    if (totalCombos > maxExactCombos) {
       return { ok: false, value: baseCand.expectedValue, branchCount: 0 }
     }
 
@@ -10500,7 +10613,6 @@ export function solveUnifiedPlan(adapter, envelope, objectiveCfgInput = {}, opti
   const cpuMs = cpuDiff ? (cpuDiff.user + cpuDiff.system) / 1000 : elapsedMs
 
   const planId = crypto.randomUUID()
-  const sourceFarmDigest = computeStaticFarmStateDigest(world0)
   const raidSchedule = {
     planId,
     createdAtSec: world0.now,
@@ -10898,10 +11010,42 @@ export function evaluateMarginalRaidDelta(adapter, marginalCtx, {
     changedIds.some(canChangedItemTouchCraft)
   )
 
+  let maxIsle0Cap = 0
+  if (meta0) {
+    const isle0CraftBase = (craftCapByIsle.get(meta0.isleIndex0) || 0) * craftEnCost
+    for (let idx2 = 0; idx2 < seqBuckets.length; idx2++) {
+      if (seqBuckets[idx2].isleIndex === meta0.isleIndex0) {
+        const bc = Math.max(enAfterPreByU[idx2] || 0, isle0CraftBase)
+        if (bc > maxIsle0Cap) maxIsle0Cap = bc
+      }
+    }
+  }
+
   let invAndCraftDelta = 0
   let nextCraftEn0 = baseCraftEn0
+  const canUseInvCraftMemo = changedIds.length > 0 || craftEnTightened
+  let invCraftMemoKey = null
+  let invCraftMemoHit = null
+  if (canUseInvCraftMemo) {
+    const sortedIds = changedIds.length > 1 ? changedIds.slice().sort() : changedIds
+    let parts = ''
+    for (let i = 0; i < sortedIds.length; i++) {
+      const id = sortedIds[i]
+      const r = invDeltaById[id]
+      if (i > 0) parts += ';'
+      parts += Array.isArray(r) ? `${id}:${r[0] | 0},${r[1] | 0},${r[2] | 0}` : `${id}:${r}`
+    }
+    const enCapKey = (touchesCraft && meta0 && maxReachableIsle0En < maxIsle0Cap)
+      ? String(Math.max(0, maxReachableIsle0En))
+      : 'loose'
+    invCraftMemoKey = `${touchesCraft ? 1 : 0}|${enCapKey}|${parts}`
+    invCraftMemoHit = marginalCtx._invCraftMemo?.get(invCraftMemoKey) || null
+  }
 
-  if (touchesCraft) {
+  if (invCraftMemoHit) {
+    invAndCraftDelta = invCraftMemoHit.invAndCraftDelta
+    nextCraftEn0 = invCraftMemoHit.nextCraftEn0
+  } else if (touchesCraft) {
     let hasNegativeRecipeItem = false
     let totalAddedRecipeUnits = 0
     for (const id of changedIds) {
@@ -11161,6 +11305,14 @@ export function evaluateMarginalRaidDelta(adapter, marginalCtx, {
       initialCnt,
     })
     invAndCraftDelta = nextSaleTotal - jointCS.salePortfolio.totalValue
+  }
+
+  if (invCraftMemoKey !== null && !invCraftMemoHit) {
+    const memo = marginalCtx._invCraftMemo || (marginalCtx._invCraftMemo = new Map())
+    if (memo.size >= 2048) {
+      memo.delete(memo.keys().next().value)
+    }
+    memo.set(invCraftMemoKey, { invAndCraftDelta, nextCraftEn0 })
   }
 
   let staminaDelta = 0
@@ -11464,6 +11616,8 @@ export function createUnifiedRaidEvaluator(adapter, world, {
     ? objectiveCfgInput
     : buildObjectiveConfig(objectiveCfgInput)
   const world0 = adapter.cloneWorld(world)
+  const curStaticFarmDigest = computeStaticFarmStateDigest(world0)
+  stripSolverIgnoredStateKeys(world0)
   adapter.syncClock(world0.clockStart)
   const utilityTokens = discoverRuleUtilityTokens(adapter)
   const envelope = buildObservationEnvelope(adapter, {
@@ -11484,7 +11638,6 @@ export function createUnifiedRaidEvaluator(adapter, world, {
     'goal', 'visit', 'wait',
   ])
 
-  const curStaticFarmDigest = computeStaticFarmStateDigest(world0)
   let marginalCtx = precomputedMarginalContext
   if (
     marginalCtx &&

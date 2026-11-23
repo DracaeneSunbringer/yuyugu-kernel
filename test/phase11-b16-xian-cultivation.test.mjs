@@ -19,6 +19,7 @@ import {
   fromWireXsAction,
   normalizeXianOptions,
   planXianActions,
+  resolveSocialTargetNpcs,
   runXianCultivationSlice,
   selectOptimalFusionPair,
   xsDay,
@@ -755,6 +756,52 @@ test('Phase 11.9: Option 3 modules (autoSocial Master+Gift, deterministic autoEv
   const socialAfter = applyAuthoritativeXsBatch(makeBaseWorld(adapter, t0, xsSocial), socialPlan.actions).afterWorld.state.xs
   assert.equal(socialAfter.npc.castle[1], 1, 'castle should become Master (rel=1, +10% medBonus)')
   assert.equal(socialAfter.bag.binglian || 0, 0, 'one binglian gifted, one surplus sold')
+
+  // 1b) `autoSocial` at Lv5 with `peiyuan` full (`peiyuanBatches = 0`) and `bag.linglan === 1`:
+  //     immediately gifts `linglan` to `castle` AND plants `linglan` on an open plot to pre-stock tomorrow's gift!
+  const xsSocialSingleLinglan = makeHighLevelReadyXs()
+  xsSocialSingleLinglan.npc = { castle: [10, 0, 0, 0] }
+  xsSocialSingleLinglan.bag = { lingcao: 3, jingu: 1, linglan: 1 }
+  xsSocialSingleLinglan.seeds = { linglan: 2, lingcao: 4, leizhu: 5 }
+  xsSocialSingleLinglan.pills = { peiyuan: 9, huiling: 5 }
+  xsSocialSingleLinglan.brew = null
+  xsSocialSingleLinglan.plots[0] = { s: 'soil' }
+  const singleLinglanPlan = planXianActions(makeBaseWorld(adapter, t0, xsSocialSingleLinglan), t0, { enabled: true, autoSocial: true })
+  assert.deepEqual(
+    singleLinglanPlan.actions.find((a) => a.a === 'xsGift'),
+    { a: 'xsGift', el: 'castle', herb: 'linglan' },
+    'should immediately gift existing single linglan to castle when peiyuanBatches === 0'
+  )
+  assert.ok(
+    singleLinglanPlan.actions.some((a) => a.a === 'xsPlant' && (a.herb === 'linglan' || a.herb === 'lingcao')),
+    'should actively plant social gift herb for top chapter NPCs when bag is empty'
+  )
+
+  // 1c) `socialTarget` filter (`master` vs `sworn` vs `rel` vs explicit list vs `all`) + firewall enforcement
+  assert.deepEqual(resolveSocialTargetNpcs('master'), ['castle'])
+  assert.deepEqual(resolveSocialTargetNpcs('sworn'), ['flower', 'water'])
+  assert.deepEqual(resolveSocialTargetNpcs('rel'), ['castle', 'flower', 'water'])
+  assert.deepEqual(resolveSocialTargetNpcs('sup,castle'), ['sup', 'castle'])
+  assert.ok(resolveSocialTargetNpcs('all').length >= 10)
+  const masterOnlyPlan = planXianActions(makeBaseWorld(adapter, t0, xsSocialSingleLinglan), t0, {
+    enabled: true,
+    autoSocial: true,
+    socialTarget: 'master',
+  })
+  assert.deepEqual(
+    masterOnlyPlan.actions.filter((a) => a.a === 'xsGift'),
+    [{ a: 'xsGift', el: 'castle', herb: 'linglan' }],
+    'socialTarget=master must only gift castle and never gift flower or others'
+  )
+  assert.throws(
+    () =>
+      assertSafeXianBatch([{ a: 'xsGift', el: 'flower', herb: 'lingcao' }], null, {
+        enabled: true,
+        autoSocial: true,
+        socialTarget: 'master',
+      }),
+    /socialTarget='master'/
+  )
 
   // 2) `autoEvents`: deterministic `ev.cur.r` selects best option with zero mind loss, and `EV_GAP` wake schedules next roll
   const xsEvBadRoll = makeHighLevelReadyXs()

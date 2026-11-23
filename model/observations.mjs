@@ -118,13 +118,16 @@ export function quoteFutureItemUnderScenario(adapter, {
 }
 
 export function normalizeUserConstraints(raw = {}, account = 'main') {
-  const isDomesticSecondary = Boolean(raw.domesticOnly) || account === 'secondary'
-  const defaultAllowCapex = isDomesticSecondary
-  const defaultMaxSteals = isDomesticSecondary ? 0 : (raw.maxStealsPerIsleDay !== undefined ? raw.maxStealsPerIsleDay : null)
-  const defaultMinStealSpots = isDomesticSecondary
-    ? 999999
-    : (Number.isFinite(raw.minStealSpots) ? Math.max(0, Math.floor(raw.minStealSpots)) : 0)
-  const baseCapexTargets = isDomesticSecondary
+  const isSecondary = account === 'secondary'
+  const isDomesticDefault = raw.domesticOnly !== undefined ? Boolean(raw.domesticOnly) : isSecondary
+  const defaultAllowCapex = Boolean(raw.domesticOnly) || isSecondary
+  const defaultMaxSteals = raw.maxStealsPerIsleDay !== undefined
+    ? raw.maxStealsPerIsleDay
+    : (isDomesticDefault ? 0 : null)
+  const defaultMinStealSpots = Number.isFinite(raw.minStealSpots)
+    ? Math.max(0, Math.floor(raw.minStealSpots))
+    : (isDomesticDefault ? 999999 : 0)
+  const baseCapexTargets = isSecondary
     ? { plotsMax: 24, barnMax: 8, trapsMax: 4, houseMax: 0, toolsMax: { rod: 4, pick: 4, spr: 3 } }
     : { plotsMax: 0, barnMax: 0, trapsMax: 0, houseMax: 0, toolsMax: { rod: 0, pick: 0, spr: 0 } }
   const mergedCapexTargets = raw.capexTargets
@@ -144,7 +147,9 @@ export function normalizeUserConstraints(raw = {}, account = 'main') {
     maxCapexPaybackSec: Number.isFinite(raw.maxCapexPaybackSec) ? raw.maxCapexPaybackSec : 72 * 3600,
     maxStealsPerIsleDay: defaultMaxSteals,
     minStealSpots: defaultMinStealSpots,
-    allowThiefBuffPurchase: isDomesticSecondary ? false : (raw.allowThiefBuffPurchase !== false),
+    allowThiefBuffPurchase: raw.allowThiefBuffPurchase !== undefined
+      ? Boolean(raw.allowThiefBuffPurchase)
+      : !isDomesticDefault,
     allowGuardBuffPurchase: raw.allowGuardBuffPurchase !== undefined ? !!raw.allowGuardBuffPurchase : false,
     cashReserveFloor: Number.isFinite(raw.cashReserveFloor) ? Math.max(0, Math.floor(raw.cashReserveFloor)) : 0,
     staminaReserveFloor: Number.isFinite(raw.staminaReserveFloor) ? Math.max(0, Math.floor(raw.staminaReserveFloor)) : 0,
@@ -228,6 +233,94 @@ export function computeFarmDomainDigest(world, adapter = null) {
   return `${staticDigest}:${en}:${enT}:${enDay}`
 }
 
+export function isBenignWaitPlanRegen(adapter, baseWorld, liveWorld, plan = null) {
+  if (!adapter || !baseWorld || !liveWorld || !plan) return false
+  const b0 = plan.trunkBuckets?.[0]
+  if (!b0 || (b0.domesticActions?.length || 0) > 0 || (b0.visitActions?.length || 0) > 0) {
+    return false
+  }
+  if ((plan.raidSchedule?.committedRaids || []).some((r) => Boolean(r?.isImmediate))) {
+    return false
+  }
+  const baseNow = Math.floor(Number(baseWorld.now || 0))
+  const liveNow = Math.floor(Number(liveWorld.now || 0))
+  if (liveNow >= Number(plan.nextWakeSec ?? Infinity)) {
+    return false
+  }
+  const refBase = adapter.advanceTimeOnly(baseWorld, baseNow)
+  const refLive = adapter.advanceTimeOnly(liveWorld, liveNow)
+  const baseEn = Math.floor(Number(refBase.state?.en || 0))
+  const liveEn = Math.floor(Number(refLive.state?.en || 0))
+  if (liveEn <= baseEn) {
+    return true
+  }
+
+  const { R } = adapter
+  const rawCap = Number(R.energyMax?.(refLive.state) ?? 100)
+  const enMax = Number.isFinite(rawCap) && rawCap > 0 ? rawCap : 100
+  const st = refLive.state || {}
+  const iIdx = R.isleIndex(refLive.now)
+  const iq = st.iq?.d === iIdx ? st.iq : {}
+
+  const fishDone = Number(iq.fish || 0) >= (R.WORLD?.daily?.fish || 80)
+  const mineDone = Number(iq.mine || 0) >= (R.WORLD?.daily?.mine || 100)
+  const bombId = Object.keys(R.SHOP || {}).find((id) => R.WORLD?.daily?.[id] != null) || 'bomb'
+  const bombDone = Number(iq[bombId] || 0) >= (R.WORLD?.daily?.[bombId] ?? R.WORLD?.daily?.bomb ?? 10)
+  const craftNotBlocked = Number(iq.craft || 0) >= (R.WORLD?.daily?.craft || 80)
+    || baseEn >= (R.WORLD?.cost?.craft ?? 1)
+
+  if (fishDone && mineDone && bombDone && craftNotBlocked) {
+    const iDay = R.isleDay(refLive.now)
+    const weather = R.weatherOf(iDay)
+    let plotsAllGrowing = true
+    const plotN = Number(st.plotN || st.plots?.length || 0)
+    for (let i = 0; i < plotN; i++) {
+      const p = st.plots?.[i]
+      if (!p) {
+        plotsAllGrowing = false
+        break
+      }
+      const auto = R.sprinkled(st, i) || weather === 1
+      const cSt = R.cropStage(p, refLive.now, auto)
+      if (!(cSt.stage >= 0 && cSt.stage < 3) || (!auto && p.w <= cSt.stage)) {
+        plotsAllGrowing = false
+        break
+      }
+    }
+    if (plotsAllGrowing) {
+      let barnAllIdle = true
+      for (const pen of st.barn || []) {
+        if (!pen) continue
+        const age = R.b12AnimalStage(pen, refLive.now)
+        if (!age?.retired && refLive.now >= Number(pen.f || 0) + 86400) {
+          barnAllIdle = false
+          break
+        }
+      }
+      if (barnAllIdle) return true
+    }
+  }
+
+  const plannedFloor0 = Math.max(0, Math.floor(Number(b0.plannedPostBucketEnFloor || 0)))
+  const userFloor = (
+    Number(plan.constraints?.staminaReserveFloor || 0) > 0 &&
+    refLive.now < Number(plan.constraints?.staminaReserveUntilSec || 0)
+  )
+    ? Math.floor(Number(plan.constraints.staminaReserveFloor))
+    : 0
+  const maxSingleActCost = Math.max(
+    R.WORLD?.cost?.fish ?? 4,
+    R.WORLD?.cost?.mine ?? 3,
+    R.WORLD?.cost?.bomb ?? 5,
+    R.WORLD?.cost?.plant ?? 2,
+    5
+  )
+  if (plannedFloor0 === 0 && userFloor === 0 && baseEn >= maxSingleActCost * 2 && liveEn < enMax) {
+    return true
+  }
+  return false
+}
+
 /**
  * Verifies that `liveWorld` is passively compatible with `baseWorld` on the farm domain
  * (i.e. only time passed and/or isolated `state.xs` changed, with zero unmodeled farm mutations).
@@ -235,6 +328,7 @@ export function computeFarmDomainDigest(world, adapter = null) {
 export function isFarmDomainPassiveCompatible(adapter, baseWorld, liveWorld, {
   isWaitPlan = false,
   staticDigestBase = null,
+  plan = null,
 } = {}) {
   if (!adapter || !baseWorld || !liveWorld) return false
   const baseNow = Math.floor(Number(baseWorld.now || 0))
@@ -283,7 +377,9 @@ export function isFarmDomainPassiveCompatible(adapter, baseWorld, liveWorld, {
     return false
   }
   if (isWaitPlan && Number(liveRefreshed.state?.en || 0) > Number(baseAtBase.state?.en || 0)) {
-    return false
+    if (!plan || !isBenignWaitPlanRegen(adapter, baseWorld, liveWorld, plan)) {
+      return false
+    }
   }
   return true
 }

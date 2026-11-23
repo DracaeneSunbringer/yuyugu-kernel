@@ -35,13 +35,158 @@ import { executeTransaction, reconcileUnknownWithFreshWorld, withAccountLock } f
  *    - Conditional-independence loss handling: battle losses refresh opponent fighter snapshots (`recordBattleSnapshot` / `needsGuardLogSync`) without a dogmatic 2-loss 20-minute ban.
  */
 
+const _syncWaitArr = new Int32Array(new SharedArrayBuffer(4))
+
+function syncSleepMs(ms) {
+  if (ms > 0) Atomics.wait(_syncWaitArr, 0, 0, Math.ceil(ms))
+}
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return err?.code === 'EPERM'
+  }
+}
+
+function renameWithRetrySync(tmpPath, targetPath) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      fs.renameSync(tmpPath, targetPath)
+      return
+    } catch (err) {
+      if ((err?.code === 'EPERM' || err?.code === 'EACCES') && attempt < 2) {
+        syncSleepMs(10)
+        continue
+      }
+      throw err
+    }
+  }
+}
+
 function defaultScheduleData() {
   return {
     schemaVersion: 1,
     updatedAt: 0,
     discoveryCursor: null,
     lastMarkedSyncAtSec: 0,
+    lastHeadScanAtSec: 0,
     targets: {},
+  }
+}
+
+function defaultSharedScanData() {
+  return {
+    schemaVersion: 1,
+    updatedAt: 0,
+    discoveryCursor: null,
+    cursorLeaseUntilSec: 0,
+    cursorLeaseBy: null,
+    lastMarkedSyncAtSec: 0,
+    lastHeadScanAtSec: 0,
+    pendingDirItems: {},
+    islands: {},
+  }
+}
+
+function loadSharedScanSync(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return defaultSharedScanData()
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''))
+    if (parsed && typeof parsed === 'object') {
+      return {
+        ...defaultSharedScanData(),
+        ...parsed,
+        pendingDirItems: parsed.pendingDirItems && typeof parsed.pendingDirItems === 'object' ? parsed.pendingDirItems : {},
+        islands: parsed.islands && typeof parsed.islands === 'object' ? parsed.islands : {},
+      }
+    }
+  } catch {}
+  return defaultSharedScanData()
+}
+
+function mutateSharedScanSync(filePath, mutatorFn, { timeoutMs = 5000, retryMs = 15 } = {}) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  const lockFile = `${filePath}.lock`
+  const gateFile = `${lockFile}.gate`
+  const deadline = Date.now() + timeoutMs
+  let acquired = false
+
+  while (Date.now() < deadline) {
+    try {
+      const fd = fs.openSync(lockFile, 'wx')
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }))
+      fs.closeSync(fd)
+      acquired = true
+      break
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err
+      try {
+        const gfd = fs.openSync(gateFile, 'wx')
+        try {
+          const raw = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
+          if (raw && !isPidAlive(raw.pid)) {
+            fs.unlinkSync(lockFile)
+          }
+        } catch {} finally {
+          fs.closeSync(gfd)
+          try { fs.unlinkSync(gateFile) } catch {}
+        }
+      } catch {}
+      syncSleepMs(retryMs)
+    }
+  }
+
+  if (!acquired) {
+    throw new Error(`Failed to acquire shared scan lock for ${filePath} within ${timeoutMs}ms`)
+  }
+
+  try {
+    const shared = loadSharedScanSync(filePath)
+    const out = mutatorFn(shared)
+    const shouldSave = out?.save !== false
+    if (shouldSave) {
+      const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 8)}`
+      fs.writeFileSync(tmp, JSON.stringify(shared, null, 2), 'utf8')
+      renameWithRetrySync(tmp, filePath)
+    }
+    return out?.result !== undefined ? out.result : shared
+  } finally {
+    try { fs.unlinkSync(lockFile) } catch {}
+  }
+}
+
+function compactVisitSnapshot(visitData, owner, nowSec, fallbackClockStart = 0) {
+  if (!visitData?.isle) return null
+  return {
+    now: Number.isFinite(Number(visitData.now)) && Number(visitData.now) > 0
+      ? Math.floor(Number(visitData.now))
+      : nowSec,
+    clockStart: Number(visitData.clockStart || fallbackClockStart || 0),
+    owner: {
+      id: Number(owner?.id ?? visitData.owner?.id ?? 0),
+      name: owner?.name || visitData.owner?.name || '',
+      level: Number(owner?.level ?? visitData.owner?.level ?? 1),
+      guard: Boolean(owner?.guard ?? visitData.owner?.guard),
+      newbie: Boolean(owner?.newbie ?? visitData.owner?.newbie),
+      boost: Number(owner?.boost ?? visitData.owner?.boost ?? 0),
+      spr: owner?.spr ?? visitData.owner?.spr ?? null,
+    },
+    rules: visitData.rules ? { ...visitData.rules } : { protect: 1800, perPlot: 2, perPen: 2 },
+    isle: {
+      plots: Array.isArray(visitData.isle?.plots) ? visitData.isle.plots : [],
+      barn: Array.isArray(visitData.isle?.barn) ? visitData.isle.barn : [],
+      plotN: visitData.isle?.plotN,
+      barnN: visitData.isle?.barnN,
+    },
+    state: {
+      tools: visitData.state?.tools ? { spr: Number(visitData.state.tools.spr || 0) } : undefined,
+      plots: Array.isArray(visitData.state?.plots) ? visitData.state.plots : [],
+      barn: Array.isArray(visitData.state?.barn) ? visitData.state.barn : [],
+      b12: visitData.state?.b12?.effects ? { effects: visitData.state.b12.effects } : undefined,
+    },
   }
 }
 
@@ -49,10 +194,11 @@ export class SnipeScheduler {
   constructor({
     accountKey = 'main',
     scheduleFilePath = null,
+    sharedScanFilePath = null,
     profileStorePath = null,
     gearLockRoot = null,
     selfIds = [],
-    domesticOnly = false,
+    domesticOnly = undefined,
     minStealSpots = 1,
     controllerHorizonSec = 3600,
     maxUpcomingTargets = 10,
@@ -60,10 +206,11 @@ export class SnipeScheduler {
   } = {}) {
     this.accountKey = accountKey
     this.scheduleFilePath = scheduleFilePath
+    this.sharedScanFilePath = sharedScanFilePath
     this.profileStorePath = profileStorePath
     this.gearLockRoot = gearLockRoot
     this.selfIds = new Set((selfIds || []).map(Number).filter((n) => Number.isFinite(n) && n > 0))
-    this.domesticOnly = Boolean(domesticOnly) || accountKey === 'secondary'
+    this.domesticOnly = domesticOnly !== undefined ? Boolean(domesticOnly) : (accountKey === 'secondary')
     this.minStealSpots = this.domesticOnly ? 999999 : Math.max(1, Number(minStealSpots || 1))
     this.controllerHorizonSec = Math.max(60, Number(controllerHorizonSec || 3600))
     this.maxUpcomingTargets = Math.max(1, Number(maxUpcomingTargets || 10))
@@ -73,6 +220,9 @@ export class SnipeScheduler {
     this._liveVisitBundles = new Map()
     this._evaluatorCache = { key: null, evaluator: null }
     this.activeRaidSchedule = null
+    this._lastSharedScanMtimeMs = -1
+    this._lastSharedScanSize = -1
+    this._lastVisitorWorld = null
   }
 
   syncCommittedRaidSchedule(plan, world = null) {
@@ -160,16 +310,30 @@ export class SnipeScheduler {
   }
 
   _makeEvaluatorCacheKey(adapter, visitorWorld, constraints) {
-    const now = Number(visitorWorld?.now || 0)
+    const rawNow = visitorWorld?.now
+    const now = rawNow != null && Number.isFinite(Number(rawNow)) ? Number(rawNow) : null
+    if (visitorWorld?.clockStart != null && adapter?.syncClock) {
+      adapter.syncClock(visitorWorld.clockStart)
+    }
     const staticDigest = computeStaticFarmStateDigest(visitorWorld)
     const prices = visitorWorld?.prices || {}
     const priceSig = Object.keys(prices).sort().map((k) => `${k}:${prices[k]}`).join(',')
+    let isleIdxStr = '0'
+    let worldDayStr = ''
+    if (now !== null && adapter?.R) {
+      try {
+        if (adapter.R.isleIndex) isleIdxStr = String(adapter.R.isleIndex(now))
+        if (adapter.R.worldDay) worldDayStr = String(adapter.R.worldDay(now))
+      } catch {}
+    }
     return [
       adapter?.rulesHash || '',
       staticDigest,
-      adapter?.R?.isleIndex ? adapter.R.isleIndex(now) : 0,
-      adapter?.R?.worldDay ? adapter.R.worldDay(now) : '',
+      isleIdxStr,
+      worldDayStr,
       priceSig,
+      Boolean(constraints?.domesticOnly),
+      Number(constraints?.maxStealsPerIsleDay ?? 999999),
       Boolean(constraints?.allowThiefBuffPurchase ?? true),
       Number(constraints?.cashReserveFloor ?? 10),
     ].join('|')
@@ -177,6 +341,14 @@ export class SnipeScheduler {
 
   invalidateUnifiedBaseline() {
     this._evaluatorCache = { key: null, evaluator: null }
+  }
+
+  _normalizeSchedulerConstraints(userConstraints = {}) {
+    return normalizeUserConstraints({
+      domesticOnly: this.domesticOnly,
+      minStealSpots: this.domesticOnly ? 999999 : 0,
+      ...userConstraints,
+    }, this.accountKey)
   }
 
   primeUnifiedBaseline(adapter, visitorWorld, marginalContext, userConstraints = {}) {
@@ -196,7 +368,10 @@ export class SnipeScheduler {
       this.invalidateUnifiedBaseline()
       return null
     }
-    const constraints = normalizeUserConstraints(userConstraints, this.accountKey)
+    if (visitorWorld?.state && Number.isFinite(Number(visitorWorld?.now))) {
+      this._lastVisitorWorld = visitorWorld
+    }
+    const constraints = this._normalizeSchedulerConstraints(userConstraints)
     const key = this._makeEvaluatorCacheKey(adapter, visitorWorld, constraints)
     const evaluator = createUnifiedRaidEvaluator(adapter, visitorWorld, {
       account: this.accountKey,
@@ -208,17 +383,78 @@ export class SnipeScheduler {
   }
 
   getUnifiedEvaluator(adapter, visitorWorld, { userConstraints = {} } = {}) {
-    const constraints = normalizeUserConstraints(userConstraints, this.accountKey)
-    const key = this._makeEvaluatorCacheKey(adapter, visitorWorld, constraints)
+    const effWorld = (
+      visitorWorld?.state && Number.isFinite(Number(visitorWorld?.now))
+        ? visitorWorld
+        : (this._lastVisitorWorld?.state && Number.isFinite(Number(this._lastVisitorWorld?.now))
+            ? this._lastVisitorWorld
+            : visitorWorld)
+    )
+    if (!effWorld?.state || !Number.isFinite(Number(effWorld?.now))) {
+      return null
+    }
+    if (effWorld.clockStart != null && adapter?.syncClock) {
+      adapter.syncClock(effWorld.clockStart)
+    }
+    const constraints = this._normalizeSchedulerConstraints(userConstraints)
+    const key = this._makeEvaluatorCacheKey(adapter, effWorld, constraints)
     if (this._evaluatorCache.key === key && this._evaluatorCache.evaluator) {
       return this._evaluatorCache.evaluator
     }
-    const evaluator = createUnifiedRaidEvaluator(adapter, visitorWorld, {
+    const evaluator = createUnifiedRaidEvaluator(adapter, effWorld, {
       account: this.accountKey,
       userConstraints: constraints,
     })
     this._evaluatorCache = { key, evaluator }
     return evaluator
+  }
+
+  _pruneLiveVisitBundles(protectedId = null) {
+    const maxTotal = 160
+    const maxGearData = 32
+    const committedIds = this.activeRaidSchedule?.committedByTargetId
+    if (this._liveVisitBundles.size > maxTotal) {
+      for (const id of this._liveVisitBundles.keys()) {
+        if (this._liveVisitBundles.size <= maxTotal) break
+        if (id === protectedId || committedIds?.has(id)) continue
+        this._liveVisitBundles.delete(id)
+      }
+      if (this._liveVisitBundles.size > maxTotal) {
+        for (const id of this._liveVisitBundles.keys()) {
+          if (this._liveVisitBundles.size <= maxTotal) break
+          if (id === protectedId) continue
+          this._liveVisitBundles.delete(id)
+        }
+      }
+    }
+    if (this._liveVisitBundles.size > maxGearData) {
+      let withGear = 0
+      for (const rec of this._liveVisitBundles.values()) {
+        if (rec?.gearData || rec?.observedPanels) withGear++
+      }
+      if (withGear > maxGearData) {
+        for (const [id, rec] of this._liveVisitBundles.entries()) {
+          if (withGear <= maxGearData) break
+          if (id === protectedId || committedIds?.has(id)) continue
+          if (rec?.gearData || rec?.observedPanels) {
+            rec.gearData = null
+            rec.observedPanels = null
+            withGear--
+          }
+        }
+        if (withGear > maxGearData) {
+          for (const [id, rec] of this._liveVisitBundles.entries()) {
+            if (withGear <= maxGearData) break
+            if (id === protectedId) continue
+            if (rec?.gearData || rec?.observedPanels) {
+              rec.gearData = null
+              rec.observedPanels = null
+              withGear--
+            }
+          }
+        }
+      }
+    }
   }
 
   computePhysicalPrepLeadSec(entry, adapter = null, httpClient = null) {
@@ -248,6 +484,14 @@ export class SnipeScheduler {
 
   isStealEnabled() {
     return !this.domesticOnly && this.minStealSpots < 999999
+  }
+
+  _isEntryQuiescent(entry) {
+    if (!entry) return true
+    if (entry.readyEligible || entry.upcomingEligible) return false
+    if (Number(entry.stealableCount || 0) > 0 || Number(entry.upcomingSpots || 0) > 0) return false
+    if (entry.quiescentEmpty !== undefined) return Boolean(entry.quiescentEmpty)
+    return Object.keys(entry.plotUnlockAt || {}).length === 0
   }
 
   _load() {
@@ -324,10 +568,16 @@ export class SnipeScheduler {
     observedPanels = null,
     allowThiefBuffPurchase = true,
     cashReserveFloor = 10,
+    directoryActiveAt = 0,
+    fromSharedScan = false,
+    skipSave = false,
   } = {}) {
     if (!this.isStealEnabled() || !visitData?.isle) return null
     const idNum = Number(targetId)
     if (!Number.isFinite(idNum) || this.selfIds.has(idNum)) return null
+    if (visitorWorld?.state && Number.isFinite(Number(visitorWorld?.now))) {
+      this._lastVisitorWorld = visitorWorld
+    }
 
     const nowSec = Number.isFinite(visitData.now) && visitData.now > 0
       ? Math.floor(visitData.now)
@@ -355,7 +605,7 @@ export class SnipeScheduler {
     const protectSec = Number.isFinite(visitData.rules?.protect) ? visitData.rules.protect : 1800
     const perPlotCap = Number.isFinite(visitData.rules?.perPlot) ? visitData.rules.perPlot : 2
     const perPenCap = Number.isFinite(visitData.rules?.perPen) ? visitData.rules.perPen : 2
-    const ownerLeft = Number(visitData.left?.owner ?? 999)
+    const ownerLeft = Number(visitData.left?.owner ?? prev?.ownerLeft ?? 999)
     const ownerCanBeStolen = ownerLeft > 0 && !owner.newbie
     const sprCover = Number(adapter.R.WORLD?.sprCover?.[visitData.state?.tools?.spr ?? owner.spr ?? 0] || 0)
 
@@ -373,7 +623,11 @@ export class SnipeScheduler {
 
     const evaluator = ownerCanBeStolen
       ? this.getUnifiedEvaluator(adapter, visitorWorld, {
-          userConstraints: { allowThiefBuffPurchase, cashReserveFloor },
+          userConstraints: {
+            domesticOnly: this.domesticOnly,
+            allowThiefBuffPurchase,
+            cashReserveFloor,
+          },
         })
       : null
 
@@ -609,7 +863,55 @@ export class SnipeScheduler {
       blockedReason = 'owner-daily-cap'
     }
 
-    let nextProbeAt = nowSec + 900
+    const hasAnyLiveCropPlot = (visitData.isle?.plots || []).some((p) => {
+      if (!p || !p.c || p.stage < 0) return false
+      if (p.steal || p.stage < 3) return true
+      return Number(p.stolen || 0) === 0
+    })
+    const hasAnyLiveBarnPen = stealableNow > 0 || futurePens.length > 0 || (visitData.isle?.barn || []).some((p, bIdx) => {
+      if (!p || !p.k) return false
+      if (p.steal) return true
+      if (Number(p.stolen || 0) >= perPenCap) return false
+      const def = adapter.graph?.animalsById?.get(p.k)
+      if (!def || def.cap < 2) return false
+      const rawPen = visitData.state?.barn?.[bIdx]
+      if (!rawPen) return false
+      const bt = adapter.exactBarnTimings(rawPen, nowSec, visitData.clockStart || visitorWorld?.clockStart, { protectSec })
+      return bt ? (!bt.retired && bt.fed) : false
+    })
+    const quiescentEmpty = !readyEligible && !upcomingEligible && allUnlocks.length === 0 && !hasAnyLiveCropPlot && !hasAnyLiveBarnPen
+    const emptyStreak = quiescentEmpty
+      ? ((prev && this._isEntryQuiescent(prev)) ? Math.min(8, Number(prev.emptyStreak || 1) + 1) : 1)
+      : 0
+    const lastKnownOwnerActiveAt = Math.max(
+      Number(directoryActiveAt || 0),
+      Number(prev?.lastKnownOwnerActiveAt || 0)
+    )
+
+    const baseIsleSpan = Number(adapter?.R?.ISLE_SPAN || 14400)
+    const nxtIsle = typeof adapter?.nextIsleBoundary === 'function' ? adapter.nextIsleBoundary(nowSec) : -1
+    let objectiveNextProbeAt = nowSec + 900
+    if (stealableNow > 0) {
+      objectiveNextProbeAt = nowSec + 60
+    } else if (allUnlocks.length > 0) {
+      const u0 = allUnlocks[0].unlockAt
+      if (earliestMatureAt && earliestMatureAt > nowSec + 30 && earliestMatureAt < u0 - 60) {
+        objectiveNextProbeAt = earliestMatureAt + 5
+      } else if (u0 - nowSec <= 45) {
+        objectiveNextProbeAt = u0
+      } else {
+        objectiveNextProbeAt = Math.max(nowSec + 60, u0 - 35)
+      }
+    } else if (quiescentEmpty) {
+      const backoffSec = Math.min(baseIsleSpan * 3, 1800 * Math.pow(2, Math.min(5, emptyStreak - 1)))
+      objectiveNextProbeAt = nowSec + backoffSec
+    } else {
+      objectiveNextProbeAt = nxtIsle > nowSec
+        ? Math.min(nowSec + 900, Math.max(nowSec + 120, nxtIsle + 5))
+        : (nowSec + 900)
+    }
+
+    let nextProbeAt = objectiveNextProbeAt
     if (blockedUntil > nowSec) {
       nextProbeAt = blockedUntil + 5
     } else if (readyEligible) {
@@ -652,6 +954,10 @@ export class SnipeScheduler {
       needsGuardLogSync: Boolean(prev?.needsGuardLogSync),
       overdueCount: sawOverdue ? prevOverdueCount + 1 : 0,
       earlyRetryCount: 0,
+      quiescentEmpty,
+      emptyStreak,
+      lastKnownOwnerActiveAt,
+      lastIngestedScanAtSec: Math.max(nowSec, Number(prev?.lastIngestedScanAtSec || 0)),
       plotFirstRipeAt,
       plotUnlockAt,
       plannedPrepActs: chosenEval?.prepActs || [],
@@ -666,16 +972,31 @@ export class SnipeScheduler {
     }
 
     this.data.targets[key] = entry
-    this._liveVisitBundles.set(idNum, {
-      atSec: nowSec,
-      bundle: { id: idNum, owner, isle: visitData.isle, state: visitData.state, posterior },
-      waveBundle: chosenWaveBundle,
-      upcomingWaveBundle,
-      waveBundlesByUnlock,
-      tacticalDecision: chosenEval?.tacticalDecision || posterior?.decision || null,
-      gearData: effGearCtx.gearData || null,
-      observedPanels: effGearCtx.observedPanels || null,
-    })
+    if (!entry.readyEligible && !entry.upcomingEligible) {
+      this._liveVisitBundles.delete(idNum)
+    } else {
+      const rawState = visitData.state
+      const compactState = rawState
+        ? {
+            tools: rawState.tools ? { spr: Number(rawState.tools.spr || 0) } : undefined,
+            plots: Array.isArray(rawState.plots) ? rawState.plots : [],
+            barn: Array.isArray(rawState.barn) ? rawState.barn : [],
+            b12: rawState.b12?.effects ? { effects: rawState.b12.effects } : undefined,
+          }
+        : undefined
+      this._liveVisitBundles.delete(idNum)
+      this._liveVisitBundles.set(idNum, {
+        atSec: nowSec,
+        bundle: { id: idNum, owner, isle: visitData.isle, state: compactState, posterior },
+        waveBundle: chosenWaveBundle,
+        upcomingWaveBundle,
+        waveBundlesByUnlock,
+        tacticalDecision: chosenEval?.tacticalDecision || posterior?.decision || null,
+        gearData: effGearCtx.gearData || null,
+        observedPanels: effGearCtx.observedPanels || null,
+      })
+      this._pruneLiveVisitBundles(idNum)
+    }
 
     if (this.activeRaidSchedule) {
       const comm = this.activeRaidSchedule.committedByTargetId.get(idNum)
@@ -696,8 +1017,200 @@ export class SnipeScheduler {
       }
     }
 
-    this.save(nowSec)
+    if (!fromSharedScan && this.sharedScanFilePath) {
+      const snap = quiescentEmpty
+        ? null
+        : compactVisitSnapshot(visitData, owner, nowSec, visitorWorld?.clockStart)
+      const earliestUnlockAt = allUnlocks.length > 0 ? allUnlocks[0].unlockAt : null
+      const latestUnlockAt = allUnlocks.length > 0 ? allUnlocks[allUnlocks.length - 1].unlockAt : null
+      mutateSharedScanSync(this.sharedScanFilePath, (shared) => {
+        const prevShared = shared.islands[key]
+        if (!prevShared || nowSec >= Number(prevShared.observedAtSec || 0)) {
+          shared.islands[key] = {
+            id: idNum,
+            owner: {
+              id: idNum,
+              name: owner.name || String(idNum),
+              level: Number(owner.level || 1),
+              guard: Boolean(owner.guard),
+              newbie: Boolean(owner.newbie),
+            },
+            observedAtSec: nowSec,
+            observedBy: this.accountKey,
+            quiescentEmpty,
+            emptyStreak,
+            lastKnownOwnerActiveAt: Math.max(lastKnownOwnerActiveAt, Number(prevShared?.lastKnownOwnerActiveAt || 0)),
+            hasLiveSteal: stealableNow > 0,
+            earliestUnlockAt,
+            latestUnlockAt,
+            sharedNextProbeAt: objectiveNextProbeAt,
+            probeLeaseUntilSec: 0,
+            probeLeaseBy: null,
+            snapshot: snap,
+          }
+          shared.updatedAt = Math.max(Number(shared.updatedAt || 0), nowSec)
+        } else if (prevShared?.probeLeaseBy === this.accountKey) {
+          prevShared.probeLeaseUntilSec = 0
+          prevShared.probeLeaseBy = null
+        }
+        delete shared.pendingDirItems[key]
+      })
+    }
+
+    if (!skipSave) {
+      this.save(nowSec)
+    }
     return entry
+  }
+
+  ingestSharedScanUpdates(adapter, visitorWorld = null, userConstraints = {}) {
+    if (!this.isStealEnabled() || !this.sharedScanFilePath || !adapter || !fs.existsSync(this.sharedScanFilePath)) {
+      return 0
+    }
+    if (visitorWorld?.state && Number.isFinite(Number(visitorWorld?.now))) {
+      this._lastVisitorWorld = visitorWorld
+    }
+    const effWorld = (visitorWorld?.state ? visitorWorld : null) || this._lastVisitorWorld
+    if (!effWorld) return 0
+
+    let st
+    try {
+      st = fs.statSync(this.sharedScanFilePath)
+    } catch {
+      return 0
+    }
+    if (st.mtimeMs === this._lastSharedScanMtimeMs && st.size === this._lastSharedScanSize) {
+      return 0
+    }
+
+    const shared = loadSharedScanSync(this.sharedScanFilePath)
+    const nowWorldSec = Number(effWorld.now || Math.floor(Date.now() / 1000))
+    const allowThiefBuffPurchase = userConstraints.allowThiefBuffPurchase !== false
+    const cashReserveFloor = Number(userConstraints.cashReserveFloor ?? 10)
+    let updatedCount = 0
+    let dirty = false
+
+    for (const [idKey, sRec] of Object.entries(shared.islands || {})) {
+      if (!sRec) continue
+      const idNum = Number(sRec.id ?? idKey)
+      if (!Number.isFinite(idNum) || idNum <= 0 || this.selfIds.has(idNum)) continue
+
+      const obsAt = Number(sRec.observedAtSec || 0)
+      const prev = this.data.targets[idKey] || null
+      const alreadyAt = Math.max(Number(prev?.lastIngestedScanAtSec || 0), Number(prev?.updatedAt || 0))
+
+      if (obsAt <= alreadyAt) {
+        if (
+          prev &&
+          this._isEntryQuiescent(prev) &&
+          sRec.quiescentEmpty &&
+          Number(sRec.sharedNextProbeAt || 0) > Number(prev.nextProbeAt || 0)
+        ) {
+          prev.nextProbeAt = Number(sRec.sharedNextProbeAt)
+          prev.lastKnownOwnerActiveAt = Math.max(
+            Number(prev.lastKnownOwnerActiveAt || 0),
+            Number(sRec.lastKnownOwnerActiveAt || 0)
+          )
+          dirty = true
+        }
+        continue
+      }
+
+      if (sRec.quiescentEmpty || !sRec.snapshot) {
+        const sOwner = sRec.owner || {}
+        const blockedUntil = prev?.blockedUntil > nowWorldSec ? prev.blockedUntil : 0
+        const nextProbe = blockedUntil > nowWorldSec
+          ? blockedUntil + 5
+          : Math.max(obsAt + 1800, Number(sRec.sharedNextProbeAt || 0))
+        this.data.targets[idKey] = {
+          id: idNum,
+          name: sOwner.name || prev?.name || String(idNum),
+          level: Number(sOwner.level || prev?.level || 1),
+          guard: Boolean(sOwner.guard ?? prev?.guard),
+          newbie: Boolean(sOwner.newbie ?? prev?.newbie),
+          ownerLeft: Number(prev?.ownerLeft ?? 999),
+          readyEligible: false,
+          stealableCount: 0,
+          upcomingEligible: false,
+          upcomingSpots: 0,
+          expectedUnlockAt: null,
+          exactUnlockKnown: false,
+          upcomingWaves: [],
+          earliestMatureAt: null,
+          nextProbeAt: nextProbe,
+          blockedUntil,
+          blockedReason: blockedUntil > nowWorldSec ? (prev?.blockedReason || null) : null,
+          cooldownUntil: prev?.cooldownUntil > nowWorldSec ? prev.cooldownUntil : 0,
+          lossCount: Number(prev?.lossCount || 0),
+          lastLossAtSec: Number(prev?.lastLossAtSec || 0),
+          needsGuardLogSync: Boolean(prev?.needsGuardLogSync),
+          overdueCount: 0,
+          earlyRetryCount: 0,
+          quiescentEmpty: true,
+          emptyStreak: Number(sRec.emptyStreak || 1),
+          lastKnownOwnerActiveAt: Math.max(
+            Number(sRec.lastKnownOwnerActiveAt || 0),
+            Number(prev?.lastKnownOwnerActiveAt || 0)
+          ),
+          lastIngestedScanAtSec: obsAt,
+          plotFirstRipeAt: {},
+          plotUnlockAt: {},
+          plannedPrepActs: [],
+          plannedBuffActs: [],
+          plannedStaminaPrepActs: [],
+          optimalLoadout: prev?.optimalLoadout || null,
+          numGearChanges: Number(prev?.numGearChanges || 0),
+          upcomingBeliefSummary: null,
+          projectedScore: 0,
+          projectedEnergyCost: 0,
+          updatedAt: obsAt,
+        }
+        this._liveVisitBundles.delete(idNum)
+        if (this.activeRaidSchedule?.committedByTargetId?.has(idNum)) {
+          const comm = this.activeRaidSchedule.committedByTargetId.get(idNum)
+          if (comm && !comm.isImmediate) {
+            this.activeRaidSchedule.needsRefresh = true
+            this.activeRaidSchedule.refreshReason = `committed-target-drifted:${idNum}`
+          }
+        }
+        dirty = true
+        updatedCount++
+        continue
+      }
+
+      if (!sRec.hasLiveSteal && Number(sRec.latestUnlockAt || 0) > 0 && Number(sRec.latestUnlockAt) < nowWorldSec - 60) {
+        if (prev) {
+          prev.nextProbeAt = Math.max(nowWorldSec, Number(prev.nextProbeAt || 0))
+          prev.lastIngestedScanAtSec = obsAt
+          prev.lastKnownOwnerActiveAt = Math.max(
+            Number(prev.lastKnownOwnerActiveAt || 0),
+            Number(sRec.lastKnownOwnerActiveAt || 0)
+          )
+          dirty = true
+        }
+        continue
+      }
+
+      const ent = this.recordVisitSnapshot(adapter, effWorld, idNum, sRec.snapshot, {
+        allowThiefBuffPurchase,
+        cashReserveFloor,
+        directoryActiveAt: Number(sRec.lastKnownOwnerActiveAt || 0),
+        fromSharedScan: true,
+        skipSave: true,
+      })
+      if (ent) {
+        ent.lastIngestedScanAtSec = obsAt
+        dirty = true
+        updatedCount++
+      }
+    }
+
+    this._lastSharedScanMtimeMs = st.mtimeMs
+    this._lastSharedScanSize = st.size
+    if (dirty) {
+      this.save(nowWorldSec)
+    }
+    return updatedCount
   }
 
   _advanceEntryToNextWave(entry, idNum, nowSec, { decOwnerLeft = false, completedUnlockAt = null } = {}) {
@@ -877,6 +1390,8 @@ export class SnipeScheduler {
         completedUnlockAt: completedUnlock != null && completedUnlock <= nowSec + 15 ? completedUnlock : nowSec,
       })
       if (!hasMoreWaves) {
+        entry.quiescentEmpty = false
+        entry.emptyStreak = 0
         entry.nextProbeAt = nowSec + 300
         this._liveVisitBundles.delete(idNum)
       }
@@ -892,7 +1407,13 @@ export class SnipeScheduler {
     if (body?.isle && visitorWorld && outcome !== 'lose') {
       return this.recordVisitSnapshot(adapter, visitorWorld, idNum, {
         ...body,
-        owner: body.owner || { id: idNum, name: entry.name, level: entry.level, guard: entry.guard },
+        owner: body.owner || {
+          id: idNum,
+          name: entry.name,
+          level: entry.level,
+          guard: entry.guard,
+          newbie: Boolean(entry.newbie),
+        },
         now: nowSec,
       })
     }
@@ -923,6 +1444,8 @@ export class SnipeScheduler {
     } else if (status === 'confirmed') {
       entry.readyEligible = false
       entry.stealableCount = 0
+      entry.quiescentEmpty = false
+      entry.emptyStreak = 0
       entry.nextProbeAt = nowSec + 180
       this._liveVisitBundles.delete(idNum)
     }
@@ -1006,6 +1529,51 @@ export class SnipeScheduler {
       }
     }
     return Number.isFinite(earliestEntrySec) ? earliestEntrySec : null
+  }
+
+  /**
+   * Returns earliest wake timestamp (<= nowSec + ...) to refresh a committed upcoming target
+   * ~75s before unlock if it hasn't been probed within `[unlockAt - 90, unlockAt]`.
+   */
+  nextCommittedProbeWakeSec(nowSec) {
+    if (!this.isStealEnabled() || !this.activeRaidSchedule?.committedByTargetId) return null
+    let earliestSec = Infinity
+    for (const [idNum, comm] of this.activeRaidSchedule.committedByTargetId.entries()) {
+      if (!comm || comm.isImmediate) continue
+      const entry = this.data.targets?.[String(idNum)]
+      if (!entry || this.isTargetBlocked(entry, nowSec)) continue
+      const unlockAt = Number(entry.expectedUnlockAt ?? comm.unlockAtSec ?? 0)
+      if (!Number.isFinite(unlockAt) || unlockAt <= nowSec + 15) continue
+      const lastProbeSec = Math.max(Number(entry.updatedAt || 0), Number(entry.lastProbeAttemptAtSec || 0))
+      if (lastProbeSec >= unlockAt - 90) continue
+      const nextProbe = Number(entry.nextProbeAt || Infinity)
+      const desiredProbe = unlockAt - 75
+      const wakeCandidate = Math.max(
+        nowSec + 1,
+        lastProbeSec + 15,
+        Math.min(Number.isFinite(nextProbe) ? nextProbe : desiredProbe, desiredProbe)
+      )
+      if (wakeCandidate < unlockAt - 15 && wakeCandidate < earliestSec) {
+        earliestSec = wakeCandidate
+      }
+    }
+    return Number.isFinite(earliestSec) ? Math.ceil(earliestSec) : null
+  }
+
+  _isCommittedImminentProbeDue(entry, nowSec) {
+    const comm = this.activeRaidSchedule?.committedByTargetId?.get(Number(entry?.id))
+    if (!comm || comm.isImmediate) return false
+    const unlockAt = Number(entry?.expectedUnlockAt ?? comm.unlockAtSec ?? 0)
+    const lead = unlockAt - nowSec
+    const lastProbeSec = Math.max(Number(entry?.updatedAt || 0), Number(entry?.lastProbeAttemptAtSec || 0))
+    return lead > 15 && lead <= 90 && lastProbeSec < unlockAt - 90
+  }
+
+  _candidatePriorityForEntry(entry, nowSec) {
+    const comm = this.activeRaidSchedule?.committedByTargetId?.get(Number(entry?.id))
+    const unlockAt = Number(entry?.expectedUnlockAt ?? comm?.unlockAtSec ?? 0)
+    if (comm && !comm.isImmediate && (unlockAt - nowSec) <= 90) return 220
+    return this._isEntryQuiescent(entry) ? 12 : (85 + (entry.upcomingEligible ? 20 : 0))
   }
 
   nextExactUnlockInfo(nowSec) {
@@ -1145,6 +1713,9 @@ export class SnipeScheduler {
     maxUpcomingTargets = 10,
   } = {}) {
     if (!this.isStealEnabled() || !visitorWorld) return []
+    if (adapter && visitorWorld?.state) {
+      this.ingestSharedScanUpdates(adapter, visitorWorld)
+    }
     const nowSec = Number(visitorWorld.now || 0)
     const candidates = []
     for (const e of Object.values(this.data.targets || {})) {
@@ -1208,6 +1779,12 @@ export class SnipeScheduler {
     cashReserveFloor = 10,
   } = {}) {
     if (!this.isStealEnabled()) return []
+    if (adapter && visitorWorld?.state) {
+      this.ingestSharedScanUpdates(adapter, visitorWorld, {
+        allowThiefBuffPurchase,
+        cashReserveFloor,
+      })
+    }
     const nowSec = Number(visitorWorld?.now || httpClient.estimatedServerNowSec())
     const dueReady = Object.values(this.data.targets || {})
       .filter((e) => e && !this.isTargetBlocked(e, nowSec) && (
@@ -1283,7 +1860,7 @@ export class SnipeScheduler {
       ? 'imminent-unplanned-discovery-reselect'
       : (this.activeRaidSchedule && !committedRaid ? 'unscheduled-fallback' : null)
     let prepFallbackReason = null
-    const constraints = normalizeUserConstraints(userConstraints, this.accountKey)
+    const constraints = this._normalizeSchedulerConstraints(userConstraints)
 
     // 1) Guard-log freshness check if target had a prior un-synced loss
     if (rawEntry.needsGuardLogSync && this.profileStorePath) {
@@ -1321,6 +1898,9 @@ export class SnipeScheduler {
       }
 
       let liveWorld = await fetchWorldFn()
+      if (!liveWorld || !Number.isFinite(Number(liveWorld.now))) {
+        return { status: 'fetch-world-failed', targetId }
+      }
       adapter.syncClock(liveWorld.clockStart)
       if (journal) {
         reconcileUnknownWithFreshWorld(journal, adapter, liveWorld, {
@@ -1650,10 +2230,431 @@ export class SnipeScheduler {
     })
   }
 
+  async _runSharedDiscoverySlice(adapter, httpClient, visitorWorld, {
+    maxPages = 2,
+    maxProbes = 4,
+    preemptWindowSec = 50,
+    markedSyncIntervalSec = 180,
+    headSyncIntervalSec = 45,
+    allowThiefBuffPurchase = true,
+    cashReserveFloor = 10,
+  } = {}) {
+    const shouldAbortNow = () => this.shouldBlockBackgroundWork(httpClient.estimatedServerNowSec(), preemptWindowSec)
+    const baseIsleSpan = Number(adapter?.R?.ISLE_SPAN || 14400)
+
+    this.ingestSharedScanUpdates(adapter, visitorWorld, {
+      allowThiefBuffPurchase,
+      cashReserveFloor,
+    })
+
+    const claim = mutateSharedScanSync(this.sharedScanFilePath, (shared) => {
+      const t = httpClient.estimatedServerNowSec()
+      const doMarkedSync = (t - Number(shared.lastMarkedSyncAtSec || 0)) >= markedSyncIntervalSec
+      if (doMarkedSync) shared.lastMarkedSyncAtSec = t
+      const leaseBusy = Number(shared.cursorLeaseUntilSec || 0) > t && shared.cursorLeaseBy && shared.cursorLeaseBy !== this.accountKey
+      const claimCursor = !leaseBusy
+      const claimedCursor = shared.discoveryCursor || null
+      const doHeadScan = Boolean(claimedCursor && maxPages >= 2 && (t - Number(shared.lastHeadScanAtSec || 0)) >= headSyncIntervalSec)
+      if (doHeadScan) shared.lastHeadScanAtSec = t
+      if (claimCursor) {
+        shared.cursorLeaseUntilSec = t + 12
+        shared.cursorLeaseBy = this.accountKey
+      }
+      return {
+        save: doMarkedSync || doHeadScan || claimCursor,
+        result: { doMarkedSync, doHeadScan, claimCursor, claimedCursor },
+      }
+    })
+
+    let pagesScanned = 0
+    const fetchedItems = []
+    let cursorNext = claim.claimedCursor
+    let cursorFetched = false
+    let cursorReset = false
+    let scannedHeadAt = 0
+    let abortedBeforeProbes = false
+
+    if (claim.doMarkedSync) {
+      if (shouldAbortNow()) {
+        abortedBeforeProbes = true
+      } else {
+        try {
+          const markedResp = await httpClient.getJson('/api/pet/world/neighbors/marked?limit=20&q=')
+          for (const it of markedResp?.neighbors || []) fetchedItems.push({ item: it, pageAsOf: markedResp?.asOf })
+        } catch {}
+      }
+    }
+
+    if (!abortedBeforeProbes && claim.doHeadScan) {
+      if (shouldAbortNow()) {
+        abortedBeforeProbes = true
+      } else {
+        try {
+          const headResp = await httpClient.getJson('/api/pet/world/neighbors?limit=20&q=')
+          pagesScanned++
+          scannedHeadAt = Math.max(scannedHeadAt, httpClient.estimatedServerNowSec())
+          for (const it of headResp?.neighbors || []) fetchedItems.push({ item: it, pageAsOf: headResp?.asOf })
+        } catch {}
+      }
+    }
+
+    if (!abortedBeforeProbes && claim.claimCursor) {
+      while (pagesScanned < maxPages) {
+        if (shouldAbortNow()) {
+          abortedBeforeProbes = true
+          break
+        }
+        const q = new URLSearchParams({ limit: '20', q: '' })
+        const scannedHead = !cursorNext
+        if (cursorNext) q.set('cursor', cursorNext)
+        try {
+          const dirResp = await httpClient.getJson(`/api/pet/world/neighbors?${q.toString()}`)
+          pagesScanned++
+          cursorFetched = true
+          if (scannedHead) {
+            scannedHeadAt = Math.max(scannedHeadAt, httpClient.estimatedServerNowSec())
+          }
+          for (const it of dirResp?.neighbors || []) fetchedItems.push({ item: it, pageAsOf: dirResp?.asOf })
+          cursorNext = dirResp?.nextCursor || null
+          if (!cursorNext) break
+        } catch (err) {
+          if (/列表已更新/.test(String(err?.message || ''))) {
+            cursorNext = null
+            cursorReset = true
+          }
+          break
+        }
+      }
+    }
+
+    const foldOut = mutateSharedScanSync(this.sharedScanFilePath, (shared) => {
+      const foldNowSec = httpClient.estimatedServerNowSec()
+      if (claim.claimCursor && shared.cursorLeaseBy === this.accountKey) {
+        shared.cursorLeaseUntilSec = 0
+        shared.cursorLeaseBy = null
+      }
+      if (cursorFetched || cursorReset) {
+        shared.discoveryCursor = cursorNext
+      }
+      if (scannedHeadAt > 0) {
+        shared.lastHeadScanAtSec = Math.max(Number(shared.lastHeadScanAtSec || 0), scannedHeadAt)
+      }
+
+      for (const { item, pageAsOf } of fetchedItems) {
+        if (!item || item.id == null) continue
+        const id = Number(item.id)
+        if (!Number.isFinite(id) || this.selfIds.has(id)) continue
+        if (item.newbie) continue
+
+        const idKey = String(id)
+        const refNowSec = Number.isFinite(Number(pageAsOf)) && Number(pageAsOf) > 0
+          ? Math.floor(Number(pageAsOf))
+          : foldNowSec
+        const activeAt = Number(item.active || 0)
+        const level = Number(item.level || 1)
+        const dirSpots = Number(item.plots || 0) + Number(item.pens || 0)
+        const hasLiveSteal = Boolean(item.canSteal) || dirSpots >= this.minStealSpots
+        const sRec = shared.islands[idKey]
+        const prevPending = shared.pendingDirItems[idKey]
+
+        if (sRec) {
+          const knownActiveAt = Math.max(Number(sRec.lastKnownOwnerActiveAt || 0), Number(sRec.observedAtSec || 0))
+          const ownerActedSinceProbe = activeAt > knownActiveAt
+          if (sRec.quiescentEmpty && ownerActedSinceProbe) {
+            sRec.quiescentEmpty = false
+            sRec.emptyStreak = 0
+            sRec.lastKnownOwnerActiveAt = activeAt
+            sRec.sharedNextProbeAt = foldNowSec
+            shared.pendingDirItems[idKey] = {
+              id,
+              level,
+              dirSpots,
+              hasLiveSteal,
+              activeAt,
+              refNowSec,
+              priorityBoost: 'awakened',
+              queuedAt: foldNowSec,
+              probeLeaseUntilSec: Number(prevPending?.probeLeaseUntilSec || 0),
+              probeLeaseBy: prevPending?.probeLeaseBy || null,
+            }
+          } else if (sRec.quiescentEmpty && activeAt > 0 && activeAt <= knownActiveAt && !hasLiveSteal) {
+            sRec.lastKnownOwnerActiveAt = Math.max(Number(sRec.lastKnownOwnerActiveAt || 0), activeAt)
+            sRec.sharedNextProbeAt = Math.max(Number(sRec.sharedNextProbeAt || 0), foldNowSec + baseIsleSpan)
+            delete shared.pendingDirItems[idKey]
+          } else {
+            sRec.lastKnownOwnerActiveAt = Math.max(Number(sRec.lastKnownOwnerActiveAt || 0), activeAt)
+            if (hasLiveSteal || Number(sRec.sharedNextProbeAt || 0) <= foldNowSec) {
+              shared.pendingDirItems[idKey] = {
+                id,
+                level,
+                dirSpots,
+                hasLiveSteal,
+                activeAt,
+                refNowSec,
+                priorityBoost: ownerActedSinceProbe ? 'acted' : (prevPending?.priorityBoost || null),
+                queuedAt: foldNowSec,
+                probeLeaseUntilSec: Number(prevPending?.probeLeaseUntilSec || 0),
+                probeLeaseBy: prevPending?.probeLeaseBy || null,
+              }
+            }
+          }
+        } else {
+          shared.pendingDirItems[idKey] = {
+            id,
+            level,
+            dirSpots,
+            hasLiveSteal,
+            activeAt,
+            refNowSec,
+            queuedAt: foldNowSec,
+            probeLeaseUntilSec: Number(prevPending?.probeLeaseUntilSec || 0),
+            probeLeaseBy: prevPending?.probeLeaseBy || null,
+          }
+        }
+      }
+
+      const pendingKeys = Object.keys(shared.pendingDirItems)
+      if (pendingKeys.length > 500) {
+        const sortedOld = pendingKeys
+          .map((k) => ({ k, item: shared.pendingDirItems[k] }))
+          .filter((x) => x.item && !x.item.hasLiveSteal)
+          .sort((a, b) => Number(a.item.queuedAt || 0) - Number(b.item.queuedAt || 0))
+        for (const rm of sortedOld.slice(0, pendingKeys.length - 500)) {
+          delete shared.pendingDirItems[rm.k]
+        }
+      }
+
+      if (abortedBeforeProbes) {
+        shared.updatedAt = Math.max(Number(shared.updatedAt || 0), foldNowSec)
+        return {
+          save: true,
+          result: {
+            aborted: true,
+            chosen: [],
+            nextCursor: shared.discoveryCursor,
+            lastMarked: shared.lastMarkedSyncAtSec,
+            lastHead: shared.lastHeadScanAtSec,
+          },
+        }
+      }
+
+      const candidates = []
+      const seenSharedIds = new Set()
+
+      for (const [idKey, pItem] of Object.entries(shared.pendingDirItems)) {
+        if (!pItem) continue
+        const id = Number(pItem.id ?? idKey)
+        if (!Number.isFinite(id) || this.selfIds.has(id) || seenSharedIds.has(id)) continue
+        seenSharedIds.add(id)
+
+        const myEntry = this.data.targets[idKey]
+        if (myEntry && this.isTargetBlocked(myEntry, foldNowSec)) continue
+        const sRec = shared.islands[idKey]
+        const leaseActive = (Number(pItem.probeLeaseUntilSec || 0) > foldNowSec && pItem.probeLeaseBy && pItem.probeLeaseBy !== this.accountKey)
+          || (sRec && Number(sRec.probeLeaseUntilSec || 0) > foldNowSec && sRec.probeLeaseBy && sRec.probeLeaseBy !== this.accountKey)
+        if (leaseActive) continue
+
+        const dirSpots = Number(pItem.dirSpots || 0)
+        const level = Number(pItem.level || 1)
+        const activeAt = Number(pItem.activeAt || 0)
+        const hasLiveSteal = Boolean(pItem.hasLiveSteal)
+
+        const committedDue = Boolean(myEntry && this._isCommittedImminentProbeDue(myEntry, foldNowSec))
+        if (!hasLiveSteal && !committedDue && sRec && Number(sRec.sharedNextProbeAt || 0) > foldNowSec && !pItem.priorityBoost) {
+          delete shared.pendingDirItems[idKey]
+          continue
+        }
+
+        let priority
+        if (myEntry && this._candidatePriorityForEntry(myEntry, foldNowSec) === 220) {
+          priority = 220
+        } else if (hasLiveSteal) {
+          priority = 150 + Math.min(30, dirSpots)
+        } else if (sRec) {
+          const ownerActed = activeAt > Number(sRec.observedAtSec || 0)
+          if (pItem.priorityBoost === 'awakened' || (ownerActed && !sRec.quiescentEmpty && !(Number(sRec.latestUnlockAt || 0) > foldNowSec))) {
+            priority = 95 + Math.min(15, level)
+          } else {
+            priority = sRec.quiescentEmpty ? 12 : (85 + (Number(sRec.latestUnlockAt || 0) > foldNowSec ? 20 : 0))
+          }
+        } else {
+          const activeAgeSec = activeAt > 0 ? Math.max(0, Number(pItem.refNowSec || foldNowSec) - activeAt) : Infinity
+          priority = activeAgeSec <= 86400 ? (60 + Math.min(20, level)) : (25 + Math.min(10, level))
+        }
+
+        candidates.push({
+          id,
+          dirSpots,
+          level,
+          directoryActiveAt: activeAt,
+          priority,
+          nextProbeAt: sRec ? Number(sRec.sharedNextProbeAt || 0) : 0,
+        })
+      }
+
+      for (const [idKey, sRec] of Object.entries(shared.islands)) {
+        if (!sRec) continue
+        const id = Number(sRec.id ?? idKey)
+        if (!Number.isFinite(id) || this.selfIds.has(id) || seenSharedIds.has(id)) continue
+        const myEntry = this.data.targets[idKey]
+        if (myEntry && this.isTargetBlocked(myEntry, foldNowSec)) continue
+        const committedDue = Boolean(myEntry && this._isCommittedImminentProbeDue(myEntry, foldNowSec))
+        if (Number(sRec.sharedNextProbeAt || 0) > foldNowSec && !committedDue) continue
+        if (Number(sRec.probeLeaseUntilSec || 0) > foldNowSec && sRec.probeLeaseBy && sRec.probeLeaseBy !== this.accountKey) {
+          continue
+        }
+        seenSharedIds.add(id)
+        const priority = (myEntry && this._candidatePriorityForEntry(myEntry, foldNowSec) === 220)
+          ? 220
+          : (sRec.quiescentEmpty ? 12 : (85 + (Number(sRec.latestUnlockAt || 0) > foldNowSec ? 20 : 0)))
+        candidates.push({
+          id,
+          dirSpots: sRec.hasLiveSteal ? 1 : 0,
+          level: Number(sRec.owner?.level || 1),
+          directoryActiveAt: Number(sRec.lastKnownOwnerActiveAt || 0),
+          priority,
+          nextProbeAt: Number(sRec.sharedNextProbeAt || 0),
+        })
+      }
+
+      if (this.activeRaidSchedule?.committedByTargetId) {
+        for (const [idNum] of this.activeRaidSchedule.committedByTargetId.entries()) {
+          if (seenSharedIds.has(idNum) || this.selfIds.has(idNum)) continue
+          const myEntry = this.data.targets[String(idNum)]
+          if (!myEntry || this.isTargetBlocked(myEntry, foldNowSec)) continue
+          if (!this._isCommittedImminentProbeDue(myEntry, foldNowSec)) continue
+          seenSharedIds.add(idNum)
+          candidates.push({
+            id: idNum,
+            dirSpots: Number(myEntry.stealableCount || 0) + Number(myEntry.upcomingSpots || 0),
+            level: Number(myEntry.level || 1),
+            directoryActiveAt: Number(myEntry.lastKnownOwnerActiveAt || 0),
+            priority: 220,
+            nextProbeAt: myEntry.nextProbeAt || 0,
+          })
+        }
+      }
+
+      candidates.sort(
+        (a, b) =>
+          (b.priority - a.priority) ||
+          (b.dirSpots - a.dirSpots) ||
+          ((b.level || 0) - (a.level || 0)) ||
+          ((b.directoryActiveAt || 0) - (a.directoryActiveAt || 0)) ||
+          (a.nextProbeAt - b.nextProbeAt)
+      )
+      const chosen = candidates.slice(0, maxProbes)
+      for (const cand of chosen) {
+        const k = String(cand.id)
+        if (shared.pendingDirItems[k]) {
+          shared.pendingDirItems[k].probeLeaseUntilSec = foldNowSec + 20
+          shared.pendingDirItems[k].probeLeaseBy = this.accountKey
+        }
+        if (shared.islands[k]) {
+          shared.islands[k].probeLeaseUntilSec = foldNowSec + 20
+          shared.islands[k].probeLeaseBy = this.accountKey
+        }
+      }
+      shared.updatedAt = Math.max(Number(shared.updatedAt || 0), foldNowSec)
+      return {
+        save: true,
+        result: {
+          aborted: false,
+          chosen,
+          nextCursor: shared.discoveryCursor,
+          lastMarked: shared.lastMarkedSyncAtSec,
+          lastHead: shared.lastHeadScanAtSec,
+        },
+      }
+    })
+
+    this.data.discoveryCursor = foldOut.nextCursor
+    this.data.lastMarkedSyncAtSec = foldOut.lastMarked
+    this.data.lastHeadScanAtSec = foldOut.lastHead
+
+    if (foldOut.aborted) {
+      this.save(httpClient.estimatedServerNowSec())
+      return { status: 'preempted-by-snipe', pagesScanned, islandsProbed: 0 }
+    }
+
+    const leasedKeys = new Set(foldOut.chosen.map((c) => String(c.id)))
+    const releaseLeftoverLeases = () => {
+      if (leasedKeys.size === 0) return
+      mutateSharedScanSync(this.sharedScanFilePath, (shared) => {
+        let dirty = false
+        for (const k of leasedKeys) {
+          if (shared.pendingDirItems[k]?.probeLeaseBy === this.accountKey) {
+            shared.pendingDirItems[k].probeLeaseUntilSec = 0
+            shared.pendingDirItems[k].probeLeaseBy = null
+            dirty = true
+          }
+          if (shared.islands[k]?.probeLeaseBy === this.accountKey) {
+            shared.islands[k].probeLeaseUntilSec = 0
+            shared.islands[k].probeLeaseBy = null
+            dirty = true
+          }
+        }
+        return { save: dirty }
+      })
+    }
+
+    let islandsProbed = 0
+    for (const cand of foldOut.chosen) {
+      if (shouldAbortNow()) {
+        releaseLeftoverLeases()
+        this.save(httpClient.estimatedServerNowSec())
+        return { status: 'preempted-by-snipe', pagesScanned, islandsProbed }
+      }
+      try {
+        const v = await httpClient.getJson(`/api/pet/world/visit/${cand.id}`)
+        islandsProbed++
+        const updated = this.recordVisitSnapshot(adapter, visitorWorld, cand.id, v, {
+          allowThiefBuffPurchase,
+          cashReserveFloor,
+          directoryActiveAt: cand.directoryActiveAt || 0,
+        })
+        if (updated) {
+          leasedKeys.delete(String(cand.id))
+        }
+        if (updated?.readyEligible) {
+          releaseLeftoverLeases()
+          this.save(httpClient.estimatedServerNowSec())
+          return {
+            status: 'ready-target-found',
+            readyTargetId: cand.id,
+            pagesScanned,
+            islandsProbed,
+            nextCursor: this.data.discoveryCursor,
+          }
+        }
+      } catch {
+        const failNow = httpClient.estimatedServerNowSec()
+        const curEntry = this.data.targets?.[String(cand.id)]
+        if (curEntry) {
+          curEntry.lastProbeAttemptAtSec = failNow
+          curEntry.nextProbeAt = Math.max(Number(curEntry.nextProbeAt || 0), failNow + 60)
+        }
+      }
+    }
+
+    releaseLeftoverLeases()
+    this.ingestSharedScanUpdates(adapter, visitorWorld, {
+      allowThiefBuffPurchase,
+      cashReserveFloor,
+    })
+    this.save(httpClient.estimatedServerNowSec())
+    return {
+      status: 'slice-complete',
+      pagesScanned,
+      islandsProbed,
+      nextCursor: this.data.discoveryCursor,
+    }
+  }
+
   /**
    * Non-blocking incremental full-server island discovery slice:
-   * - Sweeps `marked` islands + up to `maxPages` (`2`) of `/api/pet/world/neighbors` cursor;
-   * - Probes up to `maxProbes` (`4`) due/unindexed multi-spot islands (`plots + pens >= minStealSpots`);
+   * - Sweeps `marked` islands + periodic Page-1 head scan + rolling `/api/pet/world/neighbors` cursor;
+   * - Uses server `active` timestamps & `quiescentEmpty` backoff so dead islands never starve unindexed active farmers;
    * - Aborts IMMEDIATELY before any HTTP request if `shouldBlockBackgroundWork(nowSec, preemptWindowSec)` becomes true!
    */
   async runIncrementalDiscoverySlice(adapter, httpClient, visitorWorld, {
@@ -1661,6 +2662,7 @@ export class SnipeScheduler {
     maxProbes = 4,
     preemptWindowSec = 50,
     markedSyncIntervalSec = 180,
+    headSyncIntervalSec = 45,
     allowThiefBuffPurchase = true,
     cashReserveFloor = 10,
   } = {}) {
@@ -1673,43 +2675,110 @@ export class SnipeScheduler {
       return { status: 'preempted-by-snipe', pagesScanned: 0, islandsProbed: 0 }
     }
 
+    if (this.sharedScanFilePath) {
+      return this._runSharedDiscoverySlice(adapter, httpClient, visitorWorld, {
+        maxPages,
+        maxProbes,
+        preemptWindowSec,
+        markedSyncIntervalSec,
+        headSyncIntervalSec,
+        allowThiefBuffPurchase,
+        cashReserveFloor,
+      })
+    }
+
+    const startNow = httpClient.estimatedServerNowSec()
+    const baseIsleSpan = Number(adapter?.R?.ISLE_SPAN || 14400)
     const candidates = []
     const seenIds = new Set()
-    const pushDirItem = (item) => {
+    const pushDirItem = (item, pageAsOf = null) => {
       if (!item || item.id == null) return
       const id = Number(item.id)
       if (!Number.isFinite(id) || this.selfIds.has(id) || seenIds.has(id)) return
       seenIds.add(id)
       if (item.newbie) return
-      const existing = this.data.targets[String(id)]
+
       const nowSec = httpClient.estimatedServerNowSec()
-      if (existing && this.isTargetBlocked(existing, nowSec)) return
+      const refNowSec = Number.isFinite(Number(pageAsOf)) && Number(pageAsOf) > 0
+        ? Math.floor(Number(pageAsOf))
+        : nowSec
+      const activeAt = Number(item.active || 0)
+      const activeAgeSec = activeAt > 0 ? Math.max(0, refNowSec - activeAt) : Infinity
+      const level = Number(item.level || 1)
       const dirSpots = Number(item.plots || 0) + Number(item.pens || 0)
-      const isDueKnown = existing && Number(existing.nextProbeAt || 0) <= nowSec
-      // Always probe unindexed active islands (`!existing`) to map growing crops before maturity, OR islands with `dirSpots >= minStealSpots`, OR due scheduled targets!
-      if (!existing || dirSpots >= this.minStealSpots || isDueKnown) {
+      const hasLiveSteal = Boolean(item.canSteal) || dirSpots >= this.minStealSpots
+      const existing = this.data.targets[String(id)]
+      if (existing && this.isTargetBlocked(existing, nowSec)) return
+
+      // Tier 1: live stealable spots exposed directly in directory
+      if (hasLiveSteal) {
         candidates.push({
           id,
           dirSpots,
-          priority: (dirSpots >= this.minStealSpots ? 100 : 0) + (!existing ? 30 : 0) + (isDueKnown ? 20 : 0),
+          level,
+          directoryActiveAt: activeAt,
+          priority: 150 + Math.min(30, dirSpots),
           nextProbeAt: existing?.nextProbeAt || 0,
         })
+        return
       }
-    }
 
-    // Also include already-indexed targets whose `nextProbeAt <= nowSec` even before directory scan
-    const startNow = httpClient.estimatedServerNowSec()
-    for (const e of Object.values(this.data.targets || {})) {
-      if (!e || this.selfIds.has(e.id) || this.isTargetBlocked(e, startNow)) continue
-      if (Number(e.nextProbeAt || 0) <= startNow) {
-        seenIds.add(e.id)
-        candidates.push({
-          id: e.id,
-          dirSpots: Number(e.stealableCount || 0) + Number(e.upcomingSpots || 0),
-          priority: 50 + (e.upcomingEligible ? 40 : 0),
-          nextProbeAt: e.nextProbeAt || 0,
-        })
+      if (existing) {
+        const knownActiveAt = Math.max(
+          Number(existing.lastKnownOwnerActiveAt || 0),
+          Number(existing.updatedAt || 0)
+        )
+        const wasQuiescent = this._isEntryQuiescent(existing)
+        const ownerActedSinceProbe = activeAt > knownActiveAt
+        if (ownerActedSinceProbe && (wasQuiescent || !existing.upcomingEligible)) {
+          existing.quiescentEmpty = false
+          existing.emptyStreak = 0
+          existing.lastKnownOwnerActiveAt = activeAt
+          existing.nextProbeAt = nowSec
+          candidates.push({
+            id,
+            dirSpots,
+            level,
+            directoryActiveAt: activeAt,
+            priority: 95 + Math.min(15, level),
+            nextProbeAt: nowSec,
+          })
+          return
+        }
+
+        if (wasQuiescent && activeAt > 0 && activeAt <= knownActiveAt) {
+          existing.lastKnownOwnerActiveAt = Math.max(Number(existing.lastKnownOwnerActiveAt || 0), activeAt)
+          existing.nextProbeAt = Math.max(Number(existing.nextProbeAt || 0), nowSec + baseIsleSpan)
+          return
+        }
+
+        if (ownerActedSinceProbe) {
+          existing.lastKnownOwnerActiveAt = activeAt
+        }
+
+        if (Number(existing.nextProbeAt || 0) <= nowSec || this._isCommittedImminentProbeDue(existing, nowSec)) {
+          candidates.push({
+            id,
+            dirSpots: Math.max(dirSpots, Number(existing.stealableCount || 0) + Number(existing.upcomingSpots || 0)),
+            level: Math.max(level, Number(existing.level || 1)),
+            directoryActiveAt: activeAt,
+            priority: this._candidatePriorityForEntry(existing, nowSec),
+            nextProbeAt: existing.nextProbeAt || 0,
+          })
+        }
+        return
       }
+
+      // Tier 3 (recently active <= 24h) vs Tier 4 (stale tail)
+      const isRecentlyActive = activeAgeSec <= 86400
+      candidates.push({
+        id,
+        dirSpots,
+        level,
+        directoryActiveAt: activeAt,
+        priority: isRecentlyActive ? (60 + Math.min(20, level)) : (25 + Math.min(10, level)),
+        nextProbeAt: 0,
+      })
     }
 
     let pagesScanned = 0
@@ -1718,21 +2787,43 @@ export class SnipeScheduler {
       try {
         const markedResp = await httpClient.getJson('/api/pet/world/neighbors/marked?limit=20&q=')
         this.data.lastMarkedSyncAtSec = httpClient.estimatedServerNowSec()
-        for (const it of markedResp?.neighbors || []) pushDirItem(it)
+        for (const it of markedResp?.neighbors || []) pushDirItem(it, markedResp?.asOf)
       } catch {}
     }
 
-    for (let page = 0; page < maxPages; page++) {
+    // Periodic Page-1 head scan catches newly active high-level farmers without resetting rolling `discoveryCursor`
+    if (
+      this.data.discoveryCursor &&
+      maxPages >= 2 &&
+      startNow - Number(this.data.lastHeadScanAtSec || 0) >= headSyncIntervalSec
+    ) {
+      if (shouldAbortNow()) {
+        this.save(httpClient.estimatedServerNowSec())
+        return { status: 'preempted-by-snipe', pagesScanned, islandsProbed: 0 }
+      }
+      try {
+        const headResp = await httpClient.getJson('/api/pet/world/neighbors?limit=20&q=')
+        pagesScanned++
+        this.data.lastHeadScanAtSec = httpClient.estimatedServerNowSec()
+        for (const it of headResp?.neighbors || []) pushDirItem(it, headResp?.asOf)
+      } catch {}
+    }
+
+    while (pagesScanned < maxPages) {
       if (shouldAbortNow()) {
         this.save(httpClient.estimatedServerNowSec())
         return { status: 'preempted-by-snipe', pagesScanned, islandsProbed: 0 }
       }
       const q = new URLSearchParams({ limit: '20', q: '' })
+      const scannedHead = !this.data.discoveryCursor
       if (this.data.discoveryCursor) q.set('cursor', this.data.discoveryCursor)
       try {
         const dirResp = await httpClient.getJson(`/api/pet/world/neighbors?${q.toString()}`)
         pagesScanned++
-        for (const it of dirResp?.neighbors || []) pushDirItem(it)
+        if (scannedHead) {
+          this.data.lastHeadScanAtSec = httpClient.estimatedServerNowSec()
+        }
+        for (const it of dirResp?.neighbors || []) pushDirItem(it, dirResp?.asOf)
         this.data.discoveryCursor = dirResp?.nextCursor || null
         if (!this.data.discoveryCursor) break
       } catch (err) {
@@ -1743,7 +2834,31 @@ export class SnipeScheduler {
       }
     }
 
-    candidates.sort((a, b) => (b.priority - a.priority) || (b.dirSpots - a.dirSpots) || (a.nextProbeAt - b.nextProbeAt))
+    // Include remaining due indexed targets not already seen/processed on scanned directory pages
+    const afterDirNow = httpClient.estimatedServerNowSec()
+    for (const e of Object.values(this.data.targets || {})) {
+      if (!e || seenIds.has(e.id) || this.selfIds.has(e.id) || this.isTargetBlocked(e, afterDirNow)) continue
+      if (Number(e.nextProbeAt || 0) <= afterDirNow || this._isCommittedImminentProbeDue(e, afterDirNow)) {
+        seenIds.add(e.id)
+        candidates.push({
+          id: e.id,
+          dirSpots: Number(e.stealableCount || 0) + Number(e.upcomingSpots || 0),
+          level: Number(e.level || 1),
+          directoryActiveAt: Number(e.lastKnownOwnerActiveAt || 0),
+          priority: this._candidatePriorityForEntry(e, afterDirNow),
+          nextProbeAt: e.nextProbeAt || 0,
+        })
+      }
+    }
+
+    candidates.sort(
+      (a, b) =>
+        (b.priority - a.priority) ||
+        (b.dirSpots - a.dirSpots) ||
+        ((b.level || 0) - (a.level || 0)) ||
+        ((b.directoryActiveAt || 0) - (a.directoryActiveAt || 0)) ||
+        (a.nextProbeAt - b.nextProbeAt)
+    )
     const toProbe = candidates.slice(0, maxProbes)
     let islandsProbed = 0
 
@@ -1758,6 +2873,7 @@ export class SnipeScheduler {
         const updated = this.recordVisitSnapshot(adapter, visitorWorld, cand.id, v, {
           allowThiefBuffPurchase,
           cashReserveFloor,
+          directoryActiveAt: cand.directoryActiveAt || 0,
         })
         // Immediately break out of discovery when a live unlocked high-EV target is spotted so controller raids in <1s!
         if (updated?.readyEligible) {
@@ -1770,7 +2886,14 @@ export class SnipeScheduler {
             nextCursor: this.data.discoveryCursor,
           }
         }
-      } catch {}
+      } catch {
+        const failNow = httpClient.estimatedServerNowSec()
+        const curEntry = this.data.targets?.[String(cand.id)]
+        if (curEntry) {
+          curEntry.lastProbeAttemptAtSec = failNow
+          curEntry.nextProbeAt = Math.max(Number(curEntry.nextProbeAt || 0), failNow + 60)
+        }
+      }
     }
 
     this.save(httpClient.estimatedServerNowSec())

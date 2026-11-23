@@ -755,8 +755,8 @@ test('Phase 13.3 (Acceptance 3 — Live High-Inventory Execution Continuity): Co
       })
     }
 
-    // Verify all 4 ripe plots (0, 1, 2, 3) were harvested in Batch 0!
-    assert.ok(committedBatches.length >= 2, `Expected harvest+clear batch followed by +2s replant batch, got ${committedBatches.length}`)
+    // Verify all 4 ripe plots (0, 1, 2, 3) were harvested in Batch 0 (with immediate atomic or +2s replant)!
+    assert.ok(committedBatches.length >= 1, `Expected atomic harvest+clear+replant batch (or +2s continuation), got ${committedBatches.length}`)
     const batch0 = committedBatches[0].actions
     const harvestedIn0 = batch0.filter((a) => a.a === 'harvest').map((a) => a.i).sort((a, b) => a - b)
     assert.deepEqual(harvestedIn0, [0, 1, 2, 3], 'All 4 ripe plots must be harvested immediately in Tick 0')
