@@ -10,7 +10,7 @@ import { runControllerStep } from '../cli/controller.mjs'
 import { runLiveAccountTick } from '../cli/live-daemon.mjs'
 import { AsyncPlanManager } from '../execution/async-planner.mjs'
 import { KernelHttpClient } from '../execution/http-client.mjs'
-import { reconcileUnknownWithFreshWorld } from '../execution/reconcile.mjs'
+import { executeTransaction, reconcileUnknownWithFreshWorld } from '../execution/reconcile.mjs'
 import { SnipeScheduler } from '../execution/snipe-scheduler.mjs'
 import { buildObjectiveConfig } from '../model/objective.mjs'
 import {
@@ -950,6 +950,171 @@ test('Phase 19.6: Zero-Yield Lower-Bound Sandbox compiles interleaved eat+harves
       worldAfter: hAfter,
     })
     assert.equal(sellCont, null, 'Suffix selling stochastically harvested crop MUST invalidate continuation and trigger fresh optimal liquidation solve')
+  } finally {
+    await planner.close()
+  }
+})
+
+test('Phase 19.7: executeTransaction inherits omitted /act metadata for PlanCache hits & re-anchors cleanly on server rev rollback', async () => {
+  const adapter = await loadRulesAdapterFromFile(RULES_PATH, { clockStart: CLOCK_START })
+  const t0 = findSummerMidDaySec(adapter)
+  const tmpDir = makeTempDir('kernel-p19-rollback-')
+  const lockRoot = path.join(tmpDir, 'locks')
+  const journal = new ContentAddressedJournal({ rootDir: path.join(tmpDir, 'journal'), account: 'main', compactRuntimeIndex: true })
+  const planner = new AsyncPlanManager({ rulesPath: RULES_PATH })
+
+  try {
+    // 1) Partial POST /act body omitting `clockStart` and `prices` still keeps PlanCache continuation valid across steps!
+    let simNow = t0
+    const worldFish = makeActionableWorld(adapter, t0, 40)
+    worldFish.coins = 500000
+    worldFish.rev = 17235
+    worldFish.state.plots = Array.from({ length: 8 }, () => ({ c: 'corn', t: t0 - 60, g: 0, w: 3, h: 0 }))
+    worldFish.state.iq = { d: adapter.R.isleIndex(t0), craft: 80, mine: 100, fish: 0, bomb: 10, steal: 0 }
+    let serverWorld = structuredClone(worldFish)
+
+    const fishCommon = {
+      adapter,
+      journal,
+      lockRootDir: lockRoot,
+      account: 'main',
+      fetchWorldFn: async () => {
+        const w = adapter.advanceTimeOnly(serverWorld, simNow)
+        w.rev = serverWorld.rev
+        return w
+      },
+      sendActFn: async ({ actions, worldBefore }) => {
+        const sim = adapter.simulateBatch(worldBefore, actions, { t: simNow, prices: worldBefore.prices })
+        serverWorld = sim.afterWorld
+        serverWorld.rev = Number(worldBefore.rev) + 1
+        serverWorld.now = simNow
+        // Simulate real server response omitting top-level `clockStart`, `prices`, `nextIsleAt`, `rumors`
+        return {
+          ok: true,
+          status: 200,
+          networkError: false,
+          body: {
+            ok: true,
+            rev: serverWorld.rev,
+            now: serverWorld.now,
+            coins: serverWorld.coins,
+            state: structuredClone(serverWorld.state),
+            out: sim.result.out,
+          },
+        }
+      },
+      userConstraints: { domesticOnly: true, allowCapex: false },
+      objectiveCfg: { horizonSec: 3600 },
+      solverOptions: {
+        allowedActionTypes: ['fish', 'wait'],
+        scenarios: [{ id: 'baseline', weight: 1.0, externalSupplyFactor: 0.96 }],
+        checkHorizonStability: false,
+      },
+      asyncPlanner: planner,
+      rulesPath: RULES_PATH,
+    }
+
+    const s1 = await runControllerStep(fishCommon)
+    assert.equal(s1.status, 'confirmed')
+    assert.equal(s1.planSource, 'solved')
+    assert.equal(planner.stats.workerSolves, 1)
+
+    simNow = t0 + 2
+    const s2 = await runControllerStep(fishCommon)
+    assert.equal(s2.status, 'confirmed')
+    assert.equal(s2.planSource, 'cache-hit', 'Partial /act response omitting clockStart/prices MUST still hit PlanCache continuation on Step 2')
+    assert.equal(planner.stats.workerSolves, 1)
+
+    // 2) Server rev rollback (`rev 17239 -> 17237` at later serverNow): re-anchors and confirms without deadlocking,
+    //    while preserving same-timestamp stale-caller rejection!
+    const rbJournal = new ContentAddressedJournal({ rootDir: path.join(tmpDir, 'journal-rb'), account: 'secondary', compactRuntimeIndex: true })
+    let wPre = makeActionableWorld(adapter, t0, 20)
+    wPre.rev = 17237
+    wPre.coins = 100000
+    // Record historical settled txs from before VPS restore reaching rev=17239 at t0
+    for (let r = 17237; r <= 17238; r++) {
+      const res = await executeTransaction({
+        journal: rbJournal,
+        adapter,
+        lockRootDir: lockRoot,
+        account: 'secondary',
+        operation: `old-op-${r}`,
+        decisionId: `old-dec-${r}`,
+        kind: 'act',
+        worldBefore: { ...wPre, rev: r, now: t0 },
+        requestPayload: { actions: [{ a: 'coffee' }] },
+        sendFn: async () => ({
+          status: 200,
+          body: { ok: true, rev: r + 1, now: t0, coins: 85000, state: wPre.state, out: [{ ok: true }] },
+        }),
+      })
+      assert.equal(res.status, 'confirmed')
+    }
+
+    // Same timestamp + same rev WITHOUT later server advancement must still fail closed (`stale-prestate-aborted`)
+    const sameSecStale = await executeTransaction({
+      journal: rbJournal,
+      adapter,
+      lockRootDir: lockRoot,
+      account: 'secondary',
+      operation: 'stale-same-sec',
+      decisionId: 'dec-stale',
+      kind: 'act',
+      worldBefore: { ...wPre, rev: 17237, now: t0 },
+      requestPayload: { actions: [{ a: 'coffee' }] },
+      fetchAfterWorldFn: async () => ({ ...wPre, rev: 17237, now: t0 }),
+      sendFn: async () => { throw new Error('must not send') },
+    })
+    assert.equal(sameSecStale.status, 'stale-prestate-aborted')
+
+    // Later server timestamp (t0 + 1800) with rolled-back live server rev=17237 MUST re-anchor and confirm cleanly!
+    const rolledBackWorld = { ...structuredClone(wPre), rev: 17237, now: t0 + 1800 }
+    let sentAfterRollback = 0
+    const recoveredTx = await executeTransaction({
+      journal: rbJournal,
+      adapter,
+      lockRootDir: lockRoot,
+      account: 'secondary',
+      operation: 'op-post-rollback',
+      decisionId: 'dec-post-rollback',
+      kind: 'act',
+      worldBefore: rolledBackWorld,
+      requestPayload: { actions: [{ a: 'coffee' }] },
+      fetchAfterWorldFn: async () => structuredClone(rolledBackWorld),
+      sendFn: async ({ operation }) => {
+        sentAfterRollback++
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            operation,
+            rev: 17238,
+            now: t0 + 1800,
+            coins: rolledBackWorld.coins - 15000,
+            state: rolledBackWorld.state,
+            out: [{ ok: true }],
+          },
+        }
+      },
+    })
+    assert.equal(sentAfterRollback, 1)
+    assert.equal(recoveredTx.status, 'confirmed')
+
+    // Subsequent call trying stale rev=17238 MUST still abort once rev advanced to 17239, proving safety lock remains active
+    const staleAfterReanchor = await executeTransaction({
+      journal: rbJournal,
+      adapter,
+      lockRootDir: lockRoot,
+      account: 'secondary',
+      operation: 'op-stale-after-reanchor',
+      decisionId: 'dec-stale-after',
+      kind: 'act',
+      worldBefore: { ...rolledBackWorld, rev: 17237, now: t0 + 1800 },
+      requestPayload: { actions: [{ a: 'coffee' }] },
+      fetchAfterWorldFn: async () => ({ ...rolledBackWorld, rev: 17238, now: t0 + 1800 }),
+      sendFn: async () => { throw new Error('must not send on rev=17237 when server is at 17238') },
+    })
+    assert.equal(staleAfterReanchor.status, 'stale-prestate-aborted')
   } finally {
     await planner.close()
   }

@@ -382,6 +382,32 @@ export function reconcileUnknownWithFreshWorld(
   }
 }
 
+function inheritOmittedWorldMetadata(afterSnap, worldBefore, adapter) {
+  if (!afterSnap || !worldBefore) return afterSnap
+  const out = { ...afterSnap }
+  if (out.clockStart === undefined && worldBefore.clockStart !== undefined) {
+    out.clockStart = worldBefore.clockStart
+  }
+  const sameIsle = (
+    out.now != null &&
+    worldBefore.now != null &&
+    typeof adapter?.R?.isleIndex === 'function' &&
+    adapter.R.isleIndex(out.now) === adapter.R.isleIndex(worldBefore.now)
+  )
+  if (sameIsle) {
+    if (out.nextIsleAt === undefined && worldBefore.nextIsleAt !== undefined) {
+      out.nextIsleAt = worldBefore.nextIsleAt
+    }
+    if (out.prices === undefined && worldBefore.prices !== undefined) {
+      out.prices = structuredClone(worldBefore.prices)
+    }
+    if (out.rumors === undefined && worldBefore.rumors !== undefined) {
+      out.rumors = structuredClone(worldBefore.rumors)
+    }
+  }
+  return out
+}
+
 function worldPrestateMatches(plannedWorld, liveWorld) {
   if (!plannedWorld || !liveWorld) return false
   if (plannedWorld.rev != null && liveWorld.rev != null && Number(plannedWorld.rev) !== Number(liveWorld.rev)) {
@@ -496,13 +522,21 @@ export async function executeTransaction({
 
     // Authoritative In-Lock Pre-State Check #1: Journal causal version & mutation history!
     // If another transaction already confirmed or advanced `revAfter` past `worldBefore.rev` (or executed a side-effect
-    // against the same `revBefore`), abort pre-send immediately before spending any coins/stamina!
+    // against the same `revBefore`), abort pre-send immediately before spending any coins/stamina — unless
+    // authoritative live server verification confirms a monotonic server-side `rev` rollback (e.g. VPS DB restore).
     if (!existing) {
       let maxKnownRev = -Infinity
+      let maxKnownRevServerNow = -Infinity
       let priorConfirmedOnSameRev = false
       for (const priorTx of reconstructed.transactions) {
         if (priorTx.status === 'rejected' || priorTx.status === 'aborted-before-send') continue
-        if (priorTx.revAfter != null) maxKnownRev = Math.max(maxKnownRev, Number(priorTx.revAfter))
+        if (priorTx.supersededByServerRollback) continue
+        if (priorTx.revAfter != null) {
+          maxKnownRev = Math.max(maxKnownRev, Number(priorTx.revAfter))
+          if (priorTx.serverNow != null) {
+            maxKnownRevServerNow = Math.max(maxKnownRevServerNow, Number(priorTx.serverNow))
+          }
+        }
         if (
           worldBefore?.rev != null &&
           priorTx.revBefore != null &&
@@ -511,26 +545,58 @@ export async function executeTransaction({
           priorTx.status === 'confirmed'
         ) {
           priorConfirmedOnSameRev = true
+          if (priorTx.serverNow != null) {
+            maxKnownRevServerNow = Math.max(maxKnownRevServerNow, Number(priorTx.serverNow))
+          }
         }
       }
       if ((worldBefore?.rev != null && maxKnownRev > Number(worldBefore.rev)) || priorConfirmedOnSameRev) {
-        journal.appendEvent({
-          recordType: 'tx-transition',
-          operation,
-          decisionId,
-          kind,
-          status: 'aborted-before-send',
-          reason: 'stale-prestate-journal-rev-advanced',
-          revBefore: worldBefore?.rev ?? null,
-          latestKnownRev: Number.isFinite(maxKnownRev) ? maxKnownRev : null,
-        })
-        return {
-          status: 'stale-prestate-aborted',
-          reason: 'journal-rev-advanced',
-          operation,
-          decisionId,
-          plannedRev: worldBefore?.rev ?? null,
-          latestKnownRev: Number.isFinite(maxKnownRev) ? maxKnownRev : null,
+        let reanchoredOnServerRollback = false
+        const liveProbeFn = typeof verifyLiveWorldFn === 'function'
+          ? verifyLiveWorldFn
+          : (typeof fetchAfterWorldFn === 'function' ? fetchAfterWorldFn : null)
+        if (pendingSummary.activeUnknown === 0 && liveProbeFn) {
+          let liveCheck = null
+          try {
+            const rawLive = await liveProbeFn()
+            liveCheck = rawLive ? inheritOmittedWorldMetadata(sanitizeWorldSnapshot(rawLive), worldBefore, adapter) : null
+          } catch {}
+          if (
+            liveCheck &&
+            worldBefore?.rev != null &&
+            Number(liveCheck.rev) === Number(worldBefore.rev) &&
+            worldPrestateMatches(worldBefore, liveCheck) &&
+            Number(liveCheck.now || 0) > maxKnownRevServerNow
+          ) {
+            journal.appendEvent({
+              recordType: 'rev-reanchor',
+              reason: 'authoritative-server-rev-rollback',
+              previousMaxRev: Number.isFinite(maxKnownRev) ? maxKnownRev : null,
+              reanchoredRev: Number(liveCheck.rev),
+              serverNow: Number(liveCheck.now),
+            })
+            reanchoredOnServerRollback = true
+          }
+        }
+        if (!reanchoredOnServerRollback) {
+          journal.appendEvent({
+            recordType: 'tx-transition',
+            operation,
+            decisionId,
+            kind,
+            status: 'aborted-before-send',
+            reason: 'stale-prestate-journal-rev-advanced',
+            revBefore: worldBefore?.rev ?? null,
+            latestKnownRev: Number.isFinite(maxKnownRev) ? maxKnownRev : null,
+          })
+          return {
+            status: 'stale-prestate-aborted',
+            reason: 'journal-rev-advanced',
+            operation,
+            decisionId,
+            plannedRev: worldBefore?.rev ?? null,
+            latestKnownRev: Number.isFinite(maxKnownRev) ? maxKnownRev : null,
+          }
         }
       }
     }
@@ -677,9 +743,10 @@ export async function executeTransaction({
 
     // Persist HTTP receipt (`responseRef` + `finalStatus`) to journal FIRST, strictly BEFORE
     // `onReceiptFn` or `fetchAfterWorldFn` can throw, hang, or time out!
-    const embeddedWorld = (body.world && body.world.state)
+    const rawEmbeddedWorld = (body.world && body.world.state)
       ? sanitizeWorldSnapshot(body.world)
       : ((body.state && body.now != null) ? sanitizeWorldSnapshot(body) : null)
+    const embeddedWorld = inheritOmittedWorldMetadata(rawEmbeddedWorld, worldBefore, adapter)
     const responseRef = journal.writeBlob({ status: transportRes.status, body })
     const initialStateAfterRef = embeddedWorld ? journal.writeBlob(embeddedWorld) : null
     const initialIsleIdx = embeddedWorld?.now ? adapter.R.isleIndex(embeddedWorld.now) : curIsleIdx

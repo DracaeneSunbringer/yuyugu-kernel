@@ -57,6 +57,26 @@ export class ContentAddressedJournal {
       }
       return
     }
+    if (ev.recordType === 'rev-reanchor') {
+      const reanchoredRev = Number(ev.reanchoredRev)
+      if (Number.isFinite(reanchoredRev)) {
+        for (const tx of this._idxTxMap.values()) {
+          if (
+            tx.status === 'confirmed' ||
+            tx.status === 'rejected' ||
+            tx.status === 'aborted-before-send'
+          ) {
+            if (
+              (tx.revAfter != null && Number(tx.revAfter) > reanchoredRev) ||
+              (tx.revBefore != null && Number(tx.revBefore) >= reanchoredRev)
+            ) {
+              tx.supersededByServerRollback = true
+            }
+          }
+        }
+      }
+      return
+    }
     if (!ev.operation) return
     let prev = this._idxTxMap.get(ev.operation)
     const oldBucket = prev ? this._statusBucket(prev.status) : null

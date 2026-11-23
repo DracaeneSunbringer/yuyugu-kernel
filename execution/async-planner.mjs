@@ -347,7 +347,26 @@ export class PlanCache {
       return null
     }
 
-    const domesticInvalidateAtSec = computeEarliestDomesticTransitionSec(adapter, worldAfter, null)
+    const effectiveWorldAfter = { ...worldAfter }
+    if (effectiveWorldAfter.clockStart === undefined && worldBefore?.clockStart !== undefined) {
+      effectiveWorldAfter.clockStart = worldBefore.clockStart
+    }
+    if (
+      worldBefore?.now != null &&
+      adapter.R.isleIndex(nowAfter) === adapter.R.isleIndex(worldBefore.now)
+    ) {
+      if (effectiveWorldAfter.nextIsleAt === undefined && worldBefore.nextIsleAt !== undefined) {
+        effectiveWorldAfter.nextIsleAt = worldBefore.nextIsleAt
+      }
+      if (effectiveWorldAfter.prices === undefined && worldBefore.prices !== undefined) {
+        effectiveWorldAfter.prices = structuredClone(worldBefore.prices)
+      }
+      if (effectiveWorldAfter.rumors === undefined && worldBefore.rumors !== undefined) {
+        effectiveWorldAfter.rumors = structuredClone(worldBefore.rumors)
+      }
+    }
+
+    const domesticInvalidateAtSec = computeEarliestDomesticTransitionSec(adapter, effectiveWorldAfter, null)
     const invalidateAtSec = Math.min(domesticInvalidateAtSec, computeEarliestUpcomingUnlockSec(envelope))
     if (nowAfter >= invalidateAtSec) {
       return null
@@ -360,7 +379,7 @@ export class PlanCache {
       const newlyAugmented = detectStochasticAugmentedItemIds(
         adapter,
         worldBefore,
-        worldAfter,
+        effectiveWorldAfter,
         compiled.domesticBatch
       )
       for (const id of newlyAugmented) stochasticProducedIds.add(id)
@@ -369,20 +388,20 @@ export class PlanCache {
     const continuedBucket0 = {
       ...rawBucket0,
       atSec: nowAfter,
-      plannedAtEnT: Number(worldAfter.state?.enT ?? nowAfter),
+      plannedAtEnT: Number(effectiveWorldAfter.state?.enT ?? nowAfter),
       domesticActions: remainingDomestic,
       visitActions: rawVisits0.map((v) => ({ ...v })),
     }
     const continuedPlan = {
       ...plan,
       serverNow: nowAfter,
-      rev: worldAfter.rev ?? plan.rev,
+      rev: effectiveWorldAfter.rev ?? plan.rev,
       trunkBuckets: [continuedBucket0, ...(plan.trunkBuckets || []).slice(1)],
       _isContinuation: true,
       _stochasticProducedIds: [...stochasticProducedIds],
     }
 
-    const nextCompiled = compileExecutablePrefix(adapter, worldAfter, continuedPlan)
+    const nextCompiled = compileExecutablePrefix(adapter, effectiveWorldAfter, continuedPlan)
     if (nextCompiled.status !== 'ready') {
       return null
     }
@@ -399,8 +418,8 @@ export class PlanCache {
           observed: {
             ...(envelope.observed || {}),
             serverNow: nowAfter,
-            rev: worldAfter.rev ?? null,
-            world: worldAfter,
+            rev: effectiveWorldAfter.rev ?? null,
+            world: effectiveWorldAfter,
           },
         }
       : null
@@ -409,7 +428,7 @@ export class PlanCache {
     return this.put({
       adapter,
       account,
-      worldBefore: worldAfter,
+      worldBefore: effectiveWorldAfter,
       envelope: continuedEnvelope,
       objectiveCfg,
       neighborSig,
