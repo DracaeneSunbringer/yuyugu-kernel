@@ -12,6 +12,7 @@ import { AsyncPlanManager } from '../execution/async-planner.mjs'
 import { KernelHttpClient } from '../execution/http-client.mjs'
 import { executeWithTacticalLoadout, readAccountGearState } from '../execution/combat-engine.mjs'
 import {
+  executeAuthorizedRespec,
   runHuancaiDailyCheck,
   runSingleArenaBout,
   syncBattleProfilesAndPreparation,
@@ -786,6 +787,19 @@ if (isDirectMain) {
       enabled: arcadeStandbyEnabled,
       ttlSec: Number.isFinite(arcadeStandbyTtlRaw) && arcadeStandbyTtlRaw >= 10 ? arcadeStandbyTtlRaw : 180,
     }
+    const enableAutoRelogin = hasFlag('--enable-auto-relogin') || process.env.MEME_ENABLE_AUTO_RELOGIN === '1'
+    const defaultCredentialsName = account === 'main' ? '.credentials.json' : `.credentials.${account}.json`
+    const credentialsPath = getArg('--credentials', process.env.MEME_CREDENTIALS_FILE || path.join(sessionDir, defaultCredentialsName))
+    const respecOnce = hasFlag('--respec-once')
+    const respecPointsRaw = getArg('--respec-points', '')
+    let respecTargetPoints = null
+    if (respecPointsRaw) {
+      const nums = String(respecPointsRaw).split(',').map((s) => Number(s.trim()))
+      if (nums.length !== 4 || nums.some((n) => !Number.isInteger(n) || n < 0)) {
+        throw new Error(`Invalid --respec-points "${respecPointsRaw}" (expected "str,vit,agi,spd")`)
+      }
+      respecTargetPoints = { str: nums[0], vit: nums[1], agi: nums[2], spd: nums[3] }
+    }
     const xianOptions = normalizeXianOptions({
       enabled: enableXian,
       breakMode: xianBreakMode,
@@ -827,10 +841,27 @@ if (isDirectMain) {
       baseUrl,
       sessionFilePath: sessionPath,
       dryRun,
+      autoRelogin: {
+        enabled: enableAutoRelogin,
+        credentialsFilePath: enableAutoRelogin ? credentialsPath : null,
+      },
     })
     const partnerHttpClient = fs.existsSync(partnerSessionPath)
       ? new KernelHttpClient({ baseUrl, sessionFilePath: partnerSessionPath, dryRun: true })
       : null
+
+    if (respecOnce) {
+      const respecOut = await executeAuthorizedRespec(httpClient, {
+        accountKey: account,
+        lockRoot: lockRootDir,
+        cashReserveFloor: 10,
+        targetPoints: respecTargetPoints,
+        dryRun,
+      })
+      console.log(JSON.stringify({ account, dryRun, ...respecOut }, null, 2))
+      process.exitCode = respecOut.ok ? 0 : 1
+      return
+    }
 
     const adapter = await loadRulesAdapterFromFile(rulesPath)
     const journal = dryRun ? null : new ContentAddressedJournal({
@@ -959,7 +990,7 @@ if (isDirectMain) {
     const xianBootTag = xianOptions.enabled
       ? `on(break=${xianOptions.breakMode},fuse=${xianOptions.autoFuse ? xianOptions.fuseTarget : 'off'}${xianOpt3Tags.length ? `,opt3=${xianOpt3Tags.join('+')}` : ''})`
       : 'off'
-    console.log(`[${new Date().toISOString()}] [LIVE:${account}] kernel=v${updateNotifier.localVersion} steal=${domesticOnly ? 'off' : 'on'} xian=${xianBootTag}${battleTrainOptions.enabled ? ' train=on' : ''} started pid=${process.pid}`)
+    console.log(`[${new Date().toISOString()}] [LIVE:${account}] kernel=v${updateNotifier.localVersion} steal=${domesticOnly ? 'off' : 'on'} xian=${xianBootTag}${battleTrainOptions.enabled ? ' train=on' : ''}${enableAutoRelogin ? ' relogin=on' : ''} started pid=${process.pid}`)
     updateNotifier.maybeCheckInBackground()
 
     try {

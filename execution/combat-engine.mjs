@@ -309,13 +309,12 @@ export function recordObservedPanel(st, g) {
   }
 }
 
-export function buildCandidateLoadoutInterval(gearData, loadout = {}, { assistLevel = null, observedPanels = null } = {}) {
-  const byId = new Map((gearData.catalog || []).map((c) => [c.id, c]))
-  const ownedMap = new Map((gearData.items || []).map((it) => [it.id, it.enh || 0]))
-  const realLv = gearData.level || 10
-  const pts = gearData.points || {}
-  const bd = gearData.breakdown || {}
-  const curFloat = calcSlotGearFloat(byId, gearData.gear)
+export function inferInnateBaseBounds(gearData, observedPanels = null) {
+  const byId = new Map((gearData?.catalog || []).map((c) => [c.id, c]))
+  const realLv = gearData?.level || 10
+  const pts = gearData?.points || {}
+  const bd = gearData?.breakdown || {}
+  const curFloat = calcSlotGearFloat(byId, gearData?.gear)
 
   const baseBounds = {}
   for (const k of ['hp', 'atk', 'def', 'agi', 'spd']) {
@@ -367,6 +366,17 @@ export function buildCandidateLoadoutInterval(gearData, loadout = {}, { assistLe
       }
     }
   }
+
+  const baseMid = {}
+  for (const k of ['hp', 'atk', 'def', 'agi', 'spd']) {
+    baseMid[k] = (baseBounds[k].lo + baseBounds[k].hi) / 2
+  }
+  return { byId, realLv, pts, bd, curFloat, baseBounds, baseMid }
+}
+
+export function buildCandidateLoadoutInterval(gearData, loadout = {}, { assistLevel = null, observedPanels = null } = {}) {
+  const { byId, realLv, pts, bd, baseBounds } = inferInnateBaseBounds(gearData, observedPanels)
+  const ownedMap = new Map((gearData.items || []).map((it) => [it.id, it.enh || 0]))
 
   const resolveSlot = (slot, overrideId) => {
     const id = overrideId !== undefined ? overrideId : (gearData.gear?.[slot]?.id || null)
@@ -471,13 +481,9 @@ export function scoreGearItem(catItem, enh = 0) {
   return Math.round((statScore + pasBonus + rarityAndSkill) * 100) / 100
 }
 
-/**
- * Computes optimal resting defense gear and stat-point breakpoint allocation.
- * Dynamically identifies zero-speed guaranteed-crit legendary weapons from `WEAPON_SKILLS` + `catalog.stats`.
- */
-export function planGearAndPoints(gearData) {
-  const byId = new Map((gearData.catalog || []).map((c) => [c.id, c]))
-  const owned = (gearData.items || []).map((it) => ({ id: it.id, enh: it.enh || 0 }))
+export function scoreBestRestingGear(gearData) {
+  const byId = new Map((gearData?.catalog || []).map((c) => [c.id, c]))
+  const owned = (gearData?.items || []).map((it) => ({ id: it.id, enh: it.enh || 0 }))
   const equip = []
   const detail = {}
   for (const slot of SLOTS) {
@@ -488,132 +494,346 @@ export function planGearAndPoints(gearData) {
       const score = scoreGearItem(cat, o.enh)
       if (!best || score > best.score) best = { slot, item: o.id, name: cat.name, score, enh: o.enh }
     }
-    const cur = gearData.gear?.[slot]?.id ?? null
+    const cur = gearData?.gear?.[slot]?.id ?? null
     detail[slot] = { best: best?.item ?? null, current: cur, score: best?.score ?? 0, name: best?.name }
     if (best && cur !== best.item) equip.push({ slot, item: best.item, name: best.name, score: best.score })
   }
+  return { byId, owned, equip, detail }
+}
 
-  const curPoints = gearData.points || {}
-  const points = {
-    str: curPoints.str || 0,
-    vit: curPoints.vit || 0,
-    agi: curPoints.agi || 0,
-    spd: curPoints.spd || 0,
+function buildFighterFromAllocation(byId, baseMid, level, equipMod, pts) {
+  const fl = calcSlotGearFloat(byId, equipMod)
+  const charmId = equipMod?.charm?.id || null
+  const charmEnh = equipMod?.charm?.enh || 0
+  const charmCat = charmId ? byId.get(charmId) : null
+  const passive = {}
+  if (charmCat?.passive?.kind) {
+    const kind = charmCat.passive.kind
+    passive[kind] = kind === 'first' ? 1 : charmCat.passive.value * (1 + 0.03 * charmEnh)
   }
-  const free = gearData.free || 0
+  const wId = equipMod?.weapon?.id || null
+  return {
+    level,
+    hp: Math.max(1, Math.round(baseMid.hp + (pts.vit || 0) * POINT_MULT.hp + fl.hp)),
+    atk: Math.max(1, Math.round(baseMid.atk + (pts.str || 0) * POINT_MULT.atk + fl.atk)),
+    def: Math.max(0, Math.round(fl.def)),
+    agi: Math.max(1, Math.round(baseMid.agi + (pts.agi || 0) * POINT_MULT.agi + fl.agi)),
+    spd: Math.max(1, Math.round(baseMid.spd + (pts.spd || 0) * POINT_MULT.spd + fl.spd)),
+    wskill: wId ? 'w-' + wId : null,
+    passive,
+  }
+}
 
-  if (free > 0) {
-    let rem = free
-    const bestWeaponId = detail.weapon?.best || gearData.gear?.weapon?.id || null
-    const bestWeaponCat = bestWeaponId ? byId.get(bestWeaponId) : null
-    const bestWeaponSkill = bestWeaponId ? WEAPON_SKILLS['w-' + bestWeaponId] : null
-    const isZeroSpdCritWeapon = Boolean(bestWeaponSkill?.kind === 'crit' && !(bestWeaponCat?.stats?.spd > 0))
-    const wearingBestCritWeapon = isZeroSpdCritWeapon && gearData.gear?.weapon?.id === bestWeaponId
-    const curSpdPts = points.spd || 0
-    const wornSpdTotal = wearingBestCritWeapon ? gearData.breakdown?.spd?.total : null
-    const wornAtkTotal = wearingBestCritWeapon ? gearData.breakdown?.atk?.total : null
+/**
+ * Generates 9 stationary same-level peer archetypes solely from `rules/pet-battle-rules.json`
+ * (`LEVEL_GROWTH`, `POINT_MULT`, `WEAPON_SKILLS`) and `gearData.catalog` — zero dependency on
+ * mutable isle-day `opponent-profiles.json` or hardcoded catalog IDs.
+ */
+export function buildStationaryLevelArchetypes(gearData) {
+  const lv = Math.max(1, Number(gearData?.level || 10))
+  const budget = Math.max(0, (lv - 1) * 3)
+  const catalog = Array.isArray(gearData?.catalog) ? gearData.catalog : []
+  const byId = new Map(catalog.map((c) => [c.id, c]))
+  const maxOwnedEnh = (gearData?.items || []).reduce((m, it) => Math.max(m, Number(it?.enh || 0)), 0)
+  const peerEnh = Math.min(10, Math.max(0, Math.round(maxOwnedEnh * 0.9)))
 
-    let minSpdPts = 3
-    let reserveForSpdObs = 0
-    if (isZeroSpdCritWeapon) {
-      if (!wearingBestCritWeapon || wornSpdTotal == null || curSpdPts < 4) {
-        minSpdPts = 4
-        const afterReach4 = Math.max(0, rem - Math.max(0, 4 - curSpdPts))
-        reserveForSpdObs = afterReach4 >= 2 ? 2 : 0
-      } else if (wornSpdTotal < 19) {
-        minSpdPts = Math.min(6, curSpdPts + 1)
-        const afterNextSpd = Math.max(0, rem - Math.max(0, minSpdPts - curSpdPts))
-        reserveForSpdObs = (minSpdPts < 6 && afterNextSpd >= 1) ? 1 : 0
-      } else {
-        minSpdPts = curSpdPts
-        reserveForSpdObs = 0
-      }
-    }
+  const rankedBySlot = (slot) => catalog
+    .filter((c) => c && c.slot === slot)
+    .map((c) => ({ c, score: scoreGearItem(c, peerEnh) }))
+    .sort((a, b) => b.score - a.score)
+    .map((x) => x.c)
 
-    while (rem > 0 && (points.spd || 0) < minSpdPts) {
-      points.spd = (points.spd || 0) + 1
-      rem--
-    }
-
-    let spendableRem = Math.max(0, rem - reserveForSpdObs)
-    const isLv13Balanced = isZeroSpdCritWeapon && (gearData.level || 0) >= 13
-
-    if (isLv13Balanced) {
-      const LV13_EARLY_STR_BPS = [2, 4, 7, 9, 12, 14, 17, 19, 22, 24]
-      const LV14_PLUS_STR_BPS = [26, 29, 32, 34, 37, 39, 42, 44]
-      while (spendableRem > 0 && (points.str || 0) < 24) {
-        const curStr = points.str || 0
-        const nextBp = LV13_EARLY_STR_BPS.find((bp) => bp > curStr) || 24
-        const need = nextBp - curStr
-        if (need <= spendableRem) {
-          points.str = curStr + need
-          spendableRem -= need
-        } else if (reserveForSpdObs > 0) {
-          break
-        } else {
-          points.vit = (points.vit || 0) + spendableRem
-          spendableRem = 0
-        }
-      }
-      if (spendableRem > 0 && (points.str || 0) >= 24 && (points.vit || 0) < 8) {
-        const addVit = Math.min(spendableRem, 8 - (points.vit || 0))
-        points.vit = (points.vit || 0) + addVit
-        spendableRem -= addVit
-      }
-      while (spendableRem > 0 && reserveForSpdObs === 0) {
-        const curStr = points.str || 0
-        const nextBp = LV14_PLUS_STR_BPS.find((bp) => bp > curStr)
-        const need = nextBp ? nextBp - curStr : 999
-        if (need <= spendableRem) {
-          points.str = curStr + need
-          spendableRem -= need
-        } else {
-          points.vit = (points.vit || 0) + spendableRem
-          spendableRem = 0
-        }
-      }
-    } else {
-      const STR_BREAKPOINTS = isZeroSpdCritWeapon
-        ? (reserveForSpdObs > 0
-            ? [2, 4, 7, 9, 12, 14, 17, 19, 22, 24, 26]
-            : [2, 4, 7, 9, 12, 14, 17, 19, 22, 24, 26, 29, 32, 34, 37, 39, 42, 44])
-        : [3, 5, 8, 10, 13, 15, 18, 20, 23, 25, 28, 30, 33, 35, 38, 40, 43, 45]
-
-      if (
-        isZeroSpdCritWeapon &&
-        wearingBestCritWeapon &&
-        reserveForSpdObs === 0 &&
-        (points.str || 0) === 26 &&
-        wornAtkTotal != null &&
-        wornAtkTotal < 43 &&
-        spendableRem >= 1
-      ) {
-        points.str = 27
-        spendableRem -= 1
-      }
-
-      while (spendableRem > 0) {
-        const curStr = points.str || 0
-        const nextBp = STR_BREAKPOINTS.find((bp) => bp > curStr)
-        const need = nextBp ? nextBp - curStr : 999
-        if (need <= spendableRem) {
-          points.str = curStr + need
-          spendableRem -= need
-        } else if (reserveForSpdObs > 0) {
-          break
-        } else {
-          points.vit = (points.vit || 0) + spendableRem
-          spendableRem = 0
-        }
-      }
+  const allWeapons = rankedBySlot('weapon')
+  const weapons = []
+  const seenWKind = new Set()
+  for (const w of allWeapons) {
+    const kind = WEAPON_SKILLS['w-' + w.id]?.kind || 'basic'
+    if (!seenWKind.has(kind)) {
+      seenWKind.add(kind)
+      weapons.push(w)
+      if (weapons.length >= 3) break
     }
   }
+  for (const w of allWeapons) {
+    if (weapons.length >= 3) break
+    if (!weapons.includes(w)) weapons.push(w)
+  }
+  if (weapons.length === 0) weapons.push(null)
 
+  const armors = rankedBySlot('armor')
+  const topArmor = armors[0] || null
+
+  const allCharms = rankedBySlot('charm')
+  const charms = []
+  const seenCKind = new Set()
+  for (const ch of allCharms) {
+    const kind = ch.passive?.kind || 'none'
+    if (kind !== 'none' && !seenCKind.has(kind)) {
+      seenCKind.add(kind)
+      charms.push(ch)
+      if (charms.length >= 2) break
+    }
+  }
+  for (const ch of allCharms) {
+    if (charms.length >= 2) break
+    if (!charms.includes(ch)) charms.push(ch)
+  }
+  if (charms.length === 0) charms.push(null)
+
+  const rolls = [
+    { hp: 262, atk: 22.0, agi: 10.0, spd: 9.6 },
+    { hp: 280, atk: 20.5, agi: 10.0, spd: 10.6 },
+    { hp: 244, atk: 24.0, agi: 10.0, spd: 9.0 },
+  ]
+  const ratios = [
+    [0.65, 0.25, 0.10], // Heavy ATK
+    [0.48, 0.36, 0.16], // Balanced
+    [0.38, 0.38, 0.24], // Speed/Tank
+  ]
+
+  const out = []
+  for (let j = 0; j < 9; j++) {
+    const r = rolls[j % rolls.length]
+    const [rStr, rVit] = ratios[Math.floor(j / 3)]
+    const pStr = Math.round(budget * rStr)
+    const pVit = Math.round(budget * rVit)
+    const pSpd = Math.max(0, budget - pStr - pVit)
+    const wCat = weapons[j % weapons.length]
+    const cCat = charms[j % charms.length]
+    const baseAtLv = {
+      hp: r.hp + (lv - 1) * LEVEL_GROWTH.hp,
+      atk: r.atk + (lv - 1) * LEVEL_GROWTH.atk,
+      def: 0,
+      agi: r.agi + (lv - 1) * LEVEL_GROWTH.agi,
+      spd: r.spd + (lv - 1) * LEVEL_GROWTH.spd,
+    }
+    const eqMod = {
+      weapon: wCat ? { id: wCat.id, enh: peerEnh } : null,
+      armor: topArmor ? { id: topArmor.id, enh: peerEnh } : null,
+      charm: cCat ? { id: cCat.id, enh: peerEnh } : null,
+    }
+    out.push(buildFighterFromAllocation(byId, baseAtLv, lv, eqMod, { str: pStr, vit: pVit, agi: 0, spd: pSpd }))
+  }
+  return out
+}
+
+/**
+ * Intrinsic stationary stat-point optimizer:
+ * Eliminates `Math.round` quantization dead-zone points using exact inferred base floats
+ * and evaluates valid step breakpoints via paired CRN Monte Carlo against stationary peer archetypes.
+ */
+export function computeOptimalStatAllocation(gearData, {
+  observedPanels = null,
+  minPoints = null,
+  trials = null,
+} = {}) {
+  const { byId, owned, equip, detail } = scoreBestRestingGear(gearData)
+  const ownedEnh = new Map(owned.map((it) => [it.id, it.enh]))
+  const realLv = Math.max(1, Number(gearData?.level || 10))
+  const curPtsRaw = gearData?.points || {}
+  const free = Math.max(0, Math.floor(Number(gearData?.free || 0)))
+  const totalPts =
+    Math.max(0, Math.floor(Number(curPtsRaw.str || 0))) +
+    Math.max(0, Math.floor(Number(curPtsRaw.vit || 0))) +
+    Math.max(0, Math.floor(Number(curPtsRaw.agi || 0))) +
+    Math.max(0, Math.floor(Number(curPtsRaw.spd || 0))) +
+    free
+
+  const resolveOwnedSlot = (slot) => {
+    const id = detail[slot]?.best || gearData?.gear?.[slot]?.id || null
+    if (!id) return null
+    const enh = ownedEnh.get(id) ?? (gearData?.gear?.[slot]?.id === id ? Number(gearData.gear[slot].enh || 0) : 0)
+    return { id, enh }
+  }
+  const restEquip = {
+    weapon: resolveOwnedSlot('weapon'),
+    armor: resolveOwnedSlot('armor'),
+    charm: resolveOwnedSlot('charm'),
+  }
+
+  if (totalPts <= 0) {
+    return {
+      points: { str: 0, vit: 0, agi: 0, spd: 0 },
+      panel: null,
+      offWinPct: 0,
+      defHoldPct: 0,
+      combinedPct: 0,
+      candidatesEvaluated: 0,
+      detail,
+      equip,
+    }
+  }
+
+  const { baseMid } = inferInnateBaseBounds(gearData, observedPanels)
+  const restFloat = calcSlotGearFloat(byId, restEquip)
+
+  const floor = {
+    str: Math.max(0, Math.floor(Number(minPoints?.str || 0))),
+    vit: Math.max(0, Math.floor(Number(minPoints?.vit || 0))),
+    agi: Math.max(0, Math.floor(Number(minPoints?.agi || 0))),
+    spd: Math.max(0, Math.floor(Number(minPoints?.spd || 0))),
+  }
+  const floorSum = floor.str + floor.vit + floor.agi + floor.spd
+  const remBudget = Math.max(0, totalPts - floorSum)
+
+  if (remBudget === 0 && minPoints) {
+    const fRest = buildFighterFromAllocation(byId, baseMid, realLv, restEquip, floor)
+    return {
+      points: { ...floor },
+      panel: { hp: fRest.hp, atk: fRest.atk, def: fRest.def, agi: fRest.agi, spd: fRest.spd },
+      offWinPct: 0,
+      defHoldPct: 0,
+      combinedPct: 0,
+      candidatesEvaluated: 1,
+      detail,
+      equip,
+    }
+  }
+
+  // Up to 2 distinct weapon-skill tactical options + resting weapon for offense eval
+  const tacticalWeapons = []
+  if (restEquip.weapon) tacticalWeapons.push(restEquip.weapon)
+  const seenWKind = new Set(restEquip.weapon ? [WEAPON_SKILLS['w-' + restEquip.weapon.id]?.kind || 'basic'] : [])
+  const ownedWeaponsSorted = owned
+    .map((o) => ({ id: o.id, enh: o.enh, cat: byId.get(o.id) }))
+    .filter((x) => x.cat && x.cat.slot === 'weapon')
+    .sort((a, b) => scoreGearItem(b.cat, b.enh) - scoreGearItem(a.cat, a.enh))
+  for (const w of ownedWeaponsSorted) {
+    const kind = WEAPON_SKILLS['w-' + w.id]?.kind || 'basic'
+    if (!seenWKind.has(kind)) {
+      seenWKind.add(kind)
+      tacticalWeapons.push({ id: w.id, enh: w.enh })
+      if (tacticalWeapons.length >= 2) break
+    }
+  }
+  if (tacticalWeapons.length === 0) tacticalWeapons.push(null)
+
+  const spdMaxAllowed = minPoints
+    ? floor.spd + remBudget
+    : Math.min(totalPts - floor.vit - floor.agi - floor.str, Math.max(24, Math.floor(totalPts * 0.36)))
+
+  const spdSteps = [floor.spd]
+  for (let p = floor.spd + 1; p <= spdMaxAllowed; p++) {
+    const curR = Math.round(baseMid.spd + p * POINT_MULT.spd + restFloat.spd)
+    const prevR = Math.round(baseMid.spd + (p - 1) * POINT_MULT.spd + restFloat.spd)
+    if (curR > prevR) spdSteps.push(p)
+  }
+
+  const cands = []
+  const seenKeys = new Set()
+  const agiFixed = floor.agi
+  for (const spd of spdSteps) {
+    const maxStrHere = totalPts - floor.vit - agiFixed - spd
+    if (maxStrHere < floor.str) continue
+    let strSteps = [floor.str]
+    for (let s = floor.str + 1; s <= maxStrHere; s++) {
+      const curR = Math.round(baseMid.atk + s * POINT_MULT.atk + restFloat.atk)
+      const prevR = Math.round(baseMid.atk + (s - 1) * POINT_MULT.atk + restFloat.atk)
+      if (curR > prevR) strSteps.push(s)
+    }
+    if (!minPoints && strSteps.length > 20) {
+      const loBand = Math.floor(totalPts * 0.20)
+      const hiBand = Math.ceil(totalPts * 0.90)
+      const focused = strSteps.filter((s) => s >= loBand && s <= hiBand)
+      if (focused.length >= 4) strSteps = focused
+    }
+    for (const str of strSteps) {
+      const vit = totalPts - str - agiFixed - spd
+      if (vit < floor.vit) continue
+      const k = `${str},${vit},${agiFixed},${spd}`
+      if (seenKeys.has(k)) continue
+      seenKeys.add(k)
+      cands.push({ str, vit, agi: agiFixed, spd })
+    }
+  }
+
+  if (cands.length === 0) {
+    cands.push({ ...floor, vit: floor.vit + remBudget })
+  }
+
+  const archetypes = buildStationaryLevelArchetypes(gearData)
+  const nTrials = Math.max(20, Math.floor(Number(trials || 60)))
+
+  let best = null
+  for (const pts of cands) {
+    const meRest = buildFighterFromAllocation(byId, baseMid, realLv, restEquip, pts)
+    const meTacList = tacticalWeapons.map((w) => (
+      w?.id === restEquip.weapon?.id
+        ? meRest
+        : buildFighterFromAllocation(byId, baseMid, realLv, { ...restEquip, weapon: w }, pts)
+    ))
+
+    let offSum = 0
+    let defSum = 0
+    for (let j = 0; j < archetypes.length; j++) {
+      const arch = archetypes[j]
+      let bestOff = 0
+      for (const meOff of meTacList) {
+        const mOff = simulateMatchup(meOff, arch, { trials: nTrials, seed: 7000 + j * 97, mode: 'guard' })
+        if (mOff.winRate > bestOff) bestOff = mOff.winRate
+      }
+      offSum += bestOff
+      const mDef = simulateMatchup(arch, meRest, { trials: nTrials, seed: 9000 + j * 97, mode: 'guard' })
+      defSum += mDef.lossRate
+    }
+
+    const offMean = offSum / archetypes.length
+    const defMean = defSum / archetypes.length
+    const score = 0.5 * offMean + 0.5 * defMean
+    const tie = meRest.atk * 1.2 + meRest.spd * 1.0 + meRest.hp * 0.1
+    if (!best || score > best.score + 1e-9 || (Math.abs(score - best.score) <= 1e-9 && tie > best.tie)) {
+      best = {
+        pts,
+        panel: { hp: meRest.hp, atk: meRest.atk, def: meRest.def, agi: meRest.agi, spd: meRest.spd },
+        offWinPct: Number((offMean * 100).toFixed(2)),
+        defHoldPct: Number((defMean * 100).toFixed(2)),
+        combinedPct: Number((score * 100).toFixed(2)),
+        score,
+        tie,
+      }
+    }
+  }
+
+  return {
+    points: best.pts,
+    panel: best.panel,
+    offWinPct: best.offWinPct,
+    defHoldPct: best.defHoldPct,
+    combinedPct: best.combinedPct,
+    candidatesEvaluated: cands.length,
+    detail,
+    equip,
+  }
+}
+
+/**
+ * Computes optimal resting defense gear and dynamic zero-dead-zone stat-point allocation.
+ * Incremental (`free > 0`) allocation runs monotonically (`>= curPoints`) without auto-respec.
+ */
+export function planGearAndPoints(gearData, { observedPanels = null } = {}) {
+  const { equip, detail } = scoreBestRestingGear(gearData)
+  const curPoints = gearData?.points || {}
+  const basePts = {
+    str: Math.max(0, Math.floor(Number(curPoints.str || 0))),
+    vit: Math.max(0, Math.floor(Number(curPoints.vit || 0))),
+    agi: Math.max(0, Math.floor(Number(curPoints.agi || 0))),
+    spd: Math.max(0, Math.floor(Number(curPoints.spd || 0))),
+  }
+  const free = Math.max(0, Math.floor(Number(gearData?.free || 0)))
+  if (free <= 0) {
+    return { equip, detail, points: basePts, free: 0, allocate: false }
+  }
+
+  const opt = computeOptimalStatAllocation(gearData, {
+    observedPanels,
+    minPoints: basePts,
+  })
+  const points = opt.points
   const pointsChanged =
-    points.str !== (curPoints.str || 0) ||
-    points.vit !== (curPoints.vit || 0) ||
-    points.agi !== (curPoints.agi || 0) ||
-    points.spd !== (curPoints.spd || 0)
+    points.str !== basePts.str ||
+    points.vit !== basePts.vit ||
+    points.agi !== basePts.agi ||
+    points.spd !== basePts.spd
   return { equip, detail, points, free, allocate: free > 0 && pointsChanged }
 }
 

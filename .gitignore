@@ -4,10 +4,13 @@ logs/
 *.out
 *.pid
 
-# Session cookies & private credentials (NEVER commit real cookies)
+# Session cookies & private credentials (NEVER commit real cookies or passwords)
 .session.json
 .session.*.json
 !.session.example.json
+.credentials.json
+.credentials.*.json
+*.relogin.lock
 .env
 .env.*
 

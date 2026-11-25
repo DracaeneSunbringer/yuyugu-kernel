@@ -1,4 +1,6 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs'
+import path from 'node:path'
 
 /**
  * Hardened Idempotency-Aware HTTP Session & Bucket Rate-Limiter (`execution/http-client.mjs`)
@@ -109,6 +111,81 @@ export function parseSessionCookieHeader(sessionFilePath) {
   throw new Error(`Unrecognized session format in ${sessionFilePath}`)
 }
 
+export function parseCredentialsFile(credentialsFilePath) {
+  if (!credentialsFilePath) {
+    throw new Error('Credentials file path is required')
+  }
+  const raw = JSON.parse(fs.readFileSync(credentialsFilePath, 'utf8').replace(/^\uFEFF/, ''))
+  const login = String(raw?.login ?? raw?.username ?? '').trim()
+  const password = typeof raw?.password === 'string' ? raw.password : ''
+  if (!login || !password) {
+    throw new Error(`Invalid credentials format in ${credentialsFilePath} (expected { login, password })`)
+  }
+  return { login, password }
+}
+
+export function extractCookiesFromSetCookieHeaders(headers) {
+  let list = []
+  if (headers && typeof headers.getSetCookie === 'function') {
+    list = headers.getSetCookie()
+  } else if (Array.isArray(headers)) {
+    list = headers
+  } else if (headers && typeof headers.get === 'function') {
+    const single = headers.get('set-cookie')
+    if (single) list = [single]
+  } else if (headers && typeof headers === 'object' && headers['set-cookie']) {
+    const v = headers['set-cookie']
+    list = Array.isArray(v) ? v : [v]
+  }
+  const out = {}
+  for (const entry of list) {
+    const firstSeg = String(entry || '').split(';')[0].trim()
+    const eqIdx = firstSeg.indexOf('=')
+    if (eqIdx <= 0) continue
+    const name = firstSeg.slice(0, eqIdx).trim()
+    const val = firstSeg.slice(eqIdx + 1).trim()
+    if (!name || !val) continue
+    out[name] = val
+  }
+  return out
+}
+
+export function atomicUpdateSessionCookies(sessionFilePath, newCookies, meta = {}) {
+  if (!sessionFilePath) {
+    throw new Error('sessionFilePath is required to update cookies')
+  }
+  let existing = {}
+  try {
+    if (fs.existsSync(sessionFilePath)) {
+      const parsed = JSON.parse(fs.readFileSync(sessionFilePath, 'utf8').replace(/^\uFEFF/, ''))
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        existing = parsed
+      }
+    }
+  } catch {}
+  const mergedCookies = (existing.cookies && typeof existing.cookies === 'object' && !Array.isArray(existing.cookies))
+    ? { ...existing.cookies }
+    : {}
+  for (const [k, v] of Object.entries(newCookies || {})) {
+    if (v != null && String(v).trim() !== '') {
+      mergedCookies[k] = String(v).trim()
+    }
+  }
+  const nextObj = { ...existing }
+  delete nextObj.cookie
+  delete nextObj.cookieHeader
+  delete nextObj.sid
+  nextObj.cookies = mergedCookies
+  nextObj.extracted_at = meta.nowMs ?? Date.now()
+  nextObj.how = meta.how || 'password-login'
+  fs.mkdirSync(path.dirname(sessionFilePath), { recursive: true })
+  const tmpPath = `${sessionFilePath}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(3).toString('hex')}`
+  fs.writeFileSync(tmpPath, JSON.stringify(nextObj, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 })
+  try { fs.chmodSync(tmpPath, 0o600) } catch {}
+  fs.renameSync(tmpPath, sessionFilePath)
+  return nextObj
+}
+
 export function classifyBucket(method, apiPath) {
   const cleanPath = String(apiPath || '').split('?')[0]
   if (method === 'GET') return { bucket: 'get', minGapMs: 50, isWrite: false }
@@ -140,6 +217,7 @@ export class KernelHttpClient {
     maxIdempotentRetries = 2,
     maxRateLimitRetries = 2,
     crossWriteMinGapMs = 120,
+    autoRelogin = null,
     fetchImpl = globalThis.fetch,
     nowMsFn = Date.now,
     sleepMsFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -153,6 +231,19 @@ export class KernelHttpClient {
     this.maxIdempotentRetries = maxIdempotentRetries
     this.maxRateLimitRetries = maxRateLimitRetries
     this.crossWriteMinGapMs = crossWriteMinGapMs
+    this._autoRelogin = {
+      enabled: Boolean(autoRelogin?.enabled),
+      credentialsFilePath: autoRelogin?.credentialsFilePath || null,
+      cooldownMs: Number.isFinite(autoRelogin?.cooldownMs) ? Math.max(0, autoRelogin.cooldownMs) : 600_000,
+      maxAttemptsPerHour: Number.isFinite(autoRelogin?.maxAttemptsPerHour)
+        ? Math.max(1, Math.floor(autoRelogin.maxAttemptsPerHour))
+        : 2,
+      lockStaleMs: 30_000,
+    }
+    this._reloginCircuitBroken = false
+    this._reloginCircuitReason = null
+    this._reloginAttemptAtMs = []
+    this._reloginInFlight = null
     this.fetchImpl = fetchImpl
     this.nowMsFn = nowMsFn
     this.sleepMsFn = sleepMsFn
@@ -173,13 +264,203 @@ export class KernelHttpClient {
       retryCount: 0,
       rateLimitCount: 0,
       networkErrorCount: 0,
+      reloginCount: 0,
+      reloginFailCount: 0,
     }
   }
 
   getCookieHeader() {
     if (this._staticCookieHeader) return normalizeCookieHeaderString(this._staticCookieHeader, 'cookieHeader')
-    if (this.sessionFilePath) return parseSessionCookieHeader(this.sessionFilePath)
+    if (this.sessionFilePath) {
+      if (
+        !fs.existsSync(this.sessionFilePath) &&
+        this._autoRelogin.enabled &&
+        !this._reloginCircuitBroken &&
+        !this.dryRun
+      ) {
+        return ''
+      }
+      return parseSessionCookieHeader(this.sessionFilePath)
+    }
     throw new Error('KernelHttpClient requires cookieHeader or sessionFilePath')
+  }
+
+  _isAuthExpired(status, parsedBody) {
+    if (status === 401) return true
+    if (status === 403) {
+      const msg = String(parsedBody?.error || parsedBody?.msg || '')
+      return /请先登录|未登录|login required|unauthorized/i.test(msg)
+    }
+    return false
+  }
+
+  async _withReloginLock(fn) {
+    if (!this.sessionFilePath) return await fn()
+    const lockPath = `${this.sessionFilePath}.relogin.lock`
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true })
+    const token = `${process.pid}:${Date.now()}:${crypto.randomBytes(3).toString('hex')}`
+    const deadline = Date.now() + 10_000
+    let acquired = false
+    while (Date.now() < deadline) {
+      try {
+        const fd = fs.openSync(lockPath, 'wx')
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token, at: Date.now() }))
+        fs.closeSync(fd)
+        acquired = true
+        break
+      } catch (err) {
+        if (err?.code !== 'EEXIST') throw err
+        try {
+          const st = fs.statSync(lockPath)
+          if (st.mtimeMs + this._autoRelogin.lockStaleMs < Date.now()) {
+            fs.unlinkSync(lockPath)
+          }
+        } catch {}
+        await this.sleepMsFn(40)
+      }
+    }
+    if (!acquired) return false
+    try {
+      return await fn()
+    } finally {
+      try {
+        const raw = JSON.parse(fs.readFileSync(lockPath, 'utf8'))
+        if (raw?.token === token) fs.unlinkSync(lockPath)
+      } catch {}
+    }
+  }
+
+  async _rawAuthFetch(apiPath, { method = 'GET', body = undefined, refererPath = '/account-password.html' } = {}) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs)
+    try {
+      const originUrl = new URL(this.baseUrl).origin
+      const url = new URL(apiPath, this.baseUrl).toString()
+      const headers = {
+        accept: 'application/json',
+        origin: originUrl,
+        referer: `${originUrl}${refererPath}`,
+        'sec-fetch-site': 'same-origin',
+        'user-agent': this.userAgent,
+      }
+      let payload = undefined
+      if (body !== undefined && method !== 'GET' && method !== 'HEAD') {
+        headers['content-type'] = 'application/json'
+        payload = JSON.stringify(body)
+      }
+      const res = await this.fetchImpl(url, {
+        method,
+        headers,
+        body: payload,
+        redirect: 'manual',
+        signal: controller.signal,
+      })
+      let parsed = {}
+      try {
+        const txt = await res.text()
+        parsed = txt ? JSON.parse(txt) : {}
+      } catch {}
+      return { ok: res.status >= 200 && res.status < 300, status: res.status, headers: res.headers, body: parsed }
+    } catch (err) {
+      return { ok: false, status: null, headers: null, body: null, error: err?.message || String(err) }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  async _reloginSingleFlight(failedCookieHeader) {
+    if (!this._autoRelogin.enabled || this._reloginCircuitBroken || this.dryRun) return false
+    if (this._reloginInFlight) return this._reloginInFlight
+    this._reloginInFlight = (async () => {
+      return await this._withReloginLock(async () => {
+        if (!this._autoRelogin.enabled || this._reloginCircuitBroken || this.dryRun) return false
+
+        // Another process/request may already have updated the on-disk session while we waited
+        if (this.sessionFilePath && fs.existsSync(this.sessionFilePath)) {
+          try {
+            const diskCookie = parseSessionCookieHeader(this.sessionFilePath)
+            if (diskCookie && diskCookie !== failedCookieHeader) {
+              return true
+            }
+          } catch {}
+        }
+
+        const now = this.nowMsFn()
+        this._reloginAttemptAtMs = this._reloginAttemptAtMs.filter((t) => now - t < 3_600_000)
+        if (this._reloginAttemptAtMs.length >= this._autoRelogin.maxAttemptsPerHour) {
+          return false
+        }
+        if (
+          this._reloginAttemptAtMs.length > 0 &&
+          (now - this._reloginAttemptAtMs[this._reloginAttemptAtMs.length - 1]) < this._autoRelogin.cooldownMs
+        ) {
+          return false
+        }
+
+        let creds
+        try {
+          creds = parseCredentialsFile(this._autoRelogin.credentialsFilePath)
+        } catch (err) {
+          this._reloginCircuitBroken = true
+          this._reloginCircuitReason = 'missing-or-invalid-credentials'
+          this.stats.reloginFailCount++
+          console.error(`[${new Date().toISOString()}] [AUTH] Auto-relogin circuit-broken: ${err?.message || 'invalid credentials'}`)
+          return false
+        }
+
+        const cfgRes = await this._rawAuthFetch('/api/auth/config', { method: 'GET', refererPath: '/login' })
+        if (cfgRes.ok && cfgRes.body && cfgRes.body.password_login === false) {
+          this._reloginCircuitBroken = true
+          this._reloginCircuitReason = 'password-login-disabled'
+          this.stats.reloginFailCount++
+          console.error(`[${new Date().toISOString()}] [AUTH] Auto-relogin circuit-broken: site disabled password_login`)
+          return false
+        }
+        if (!cfgRes.ok && cfgRes.status == null) {
+          this.stats.reloginFailCount++
+          return false
+        }
+
+        this._reloginAttemptAtMs.push(this.nowMsFn())
+        const loginRes = await this._rawAuthFetch('/api/auth/password-login', {
+          method: 'POST',
+          body: { login: creds.login, password: creds.password, next: '/pets' },
+          refererPath: '/account-password.html',
+        })
+        if (loginRes.status === 400 || loginRes.status === 401 || loginRes.status === 403) {
+          this._reloginCircuitBroken = true
+          this._reloginCircuitReason = `auth-rejected:${loginRes.status}`
+          this.stats.reloginFailCount++
+          console.error(`[${new Date().toISOString()}] [AUTH] Auto-relogin circuit-broken: HTTP ${loginRes.status} (${loginRes.body?.error || 'rejected'})`)
+          return false
+        }
+        if (!loginRes.ok) {
+          this.stats.reloginFailCount++
+          return false
+        }
+
+        const cookies = extractCookiesFromSetCookieHeaders(loginRes.headers)
+        if (Object.keys(cookies).length === 0) {
+          this.stats.reloginFailCount++
+          return false
+        }
+
+        if (this.sessionFilePath) {
+          atomicUpdateSessionCookies(this.sessionFilePath, cookies, { nowMs: this.nowMsFn(), how: 'password-login' })
+        }
+        if (this._staticCookieHeader || !this.sessionFilePath) {
+          this._staticCookieHeader = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; ')
+        }
+        this.stats.reloginCount++
+        console.log(`[${new Date().toISOString()}] [AUTH] Session cookie refreshed via password-login for ${this.sessionFilePath || 'memory-client'}`)
+        return true
+      })
+    })()
+    try {
+      return await this._reloginInFlight
+    } finally {
+      this._reloginInFlight = null
+    }
   }
 
   observeServerTimestampSec(serverSec, reqStartLocalMs = null) {
@@ -293,6 +574,7 @@ export class KernelHttpClient {
     const idempotent = isRequestIdempotent(upper, apiPath, body)
     const maxNetworkAttempts = idempotent ? (1 + Math.max(0, this.maxIdempotentRetries)) : 1
     let rateLimitRetriesUsed = 0
+    let reloginRetried = false
     let networkAttempt = 0
 
     while (true) {
@@ -313,6 +595,7 @@ export class KernelHttpClient {
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), timeoutMs)
       const url = new URL(apiPath, this.baseUrl).toString()
+      const usedCookie = this.getCookieHeader()
 
       let res = null
       try {
@@ -320,7 +603,7 @@ export class KernelHttpClient {
         const defaultRefPath = String(apiPath || '').startsWith('/api/huancai') ? '/huancai' : '/pets'
         const headers = {
           accept: 'application/json',
-          cookie: this.getCookieHeader(),
+          cookie: usedCookie,
           origin: originUrl,
           referer: `${originUrl}${defaultRefPath}`,
           'sec-fetch-site': 'same-origin',
@@ -384,6 +667,23 @@ export class KernelHttpClient {
         this.observeServerTimestampSec(Number(parsedBody.now), reqStartMs)
       } else if (Number.isFinite(parsedBody?.world?.now)) {
         this.observeServerTimestampSec(Number(parsedBody.world.now), reqStartMs)
+      }
+
+      // Expired session cookie (401 or explicit login-required 403) -> optional default-OFF password relogin
+      if (
+        !reloginRetried &&
+        !this.dryRun &&
+        this._autoRelogin.enabled &&
+        !this._reloginCircuitBroken &&
+        !String(apiPath || '').startsWith('/api/auth/') &&
+        this._isAuthExpired(res.status, parsedBody)
+      ) {
+        const refreshed = await this._reloginSingleFlight(usedCookie)
+        if (refreshed) {
+          reloginRetried = true
+          networkAttempt = Math.max(0, networkAttempt - 1)
+          continue
+        }
       }
 
       // HTTP 429: rate-limited BEFORE handler execution -> safe bounded backoff even for non-idempotent POST

@@ -103,6 +103,10 @@ Start-Process node `
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--session <path>` | `./.session.json` | 指定 Cookie 文件路径 |
+| `--enable-auto-relogin` | **关** | 开启 `401` 会话过期后自动使用账号密码（`POST /api/auth/password-login`）无感刷新 Cookie 并重放当前请求（也可设 `MEME_ENABLE_AUTO_RELOGIN=1`，**默认关闭**；带文件锁单飞防并发、每小时最多 2 次、账密错误或站点关闭时立即熔断） |
+| `--credentials <path>` | 跟随 `--session` 同目录 `.credentials[.account].json` | 开启 `--enable-auto-relogin` 时读取的账密 JSON 路径（格式 `{"login":"...","password":"..."}`，建议权限 `0600`，也可设 `MEME_CREDENTIALS_FILE`） |
+| `--respec-once` | 关 | **人工显式单次洗点命令**（退出前执行一次原子 `respec -> points` 并打印面板对照后退出；常驻守护绝不自动洗点）；配合 `--dry-run` 可先预览拟配点而不实际扣款 |
+| `--respec-points <s,v,a,p>` | 空 | 配合 `--respec-once` 显式指定目标点数（`str,vit,agi,spd`）；不传时按本等级规则步长与固有底子自动求取零废点最优配点 |
 | `--self-ids <id>` | 空 | 自身数字 UID，巡检出访时自动跳过 |
 | `--domestic-only` | 关 | 纯内政模式，不拉取邻居列表、不执行出访 |
 | `--allow-capex` | 关 | 回本周期合理时自动买地与升级建筑、工具 |

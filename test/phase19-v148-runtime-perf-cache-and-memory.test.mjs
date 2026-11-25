@@ -9,8 +9,17 @@ import { ContentAddressedJournal } from '../audit/journal.mjs'
 import { runControllerStep } from '../cli/controller.mjs'
 import { runLiveAccountTick } from '../cli/live-daemon.mjs'
 import { AsyncPlanManager } from '../execution/async-planner.mjs'
-import { KernelHttpClient } from '../execution/http-client.mjs'
-import { computeBattleTrainCost, planBattleTrainSteps } from '../execution/pet-and-battle.mjs'
+import {
+  computeOptimalStatAllocation,
+  planGearAndPoints,
+  readAccountGearState,
+} from '../execution/combat-engine.mjs'
+import { KernelHttpClient, parseSessionCookieHeader } from '../execution/http-client.mjs'
+import {
+  computeBattleTrainCost,
+  executeAuthorizedRespec,
+  planBattleTrainSteps,
+} from '../execution/pet-and-battle.mjs'
 import { executeTransaction, reconcileUnknownWithFreshWorld } from '../execution/reconcile.mjs'
 import { SnipeScheduler } from '../execution/snipe-scheduler.mjs'
 import { buildObjectiveConfig } from '../model/objective.mjs'
@@ -1311,4 +1320,292 @@ test('Phase 19.8: Breakthrough training stays OFF by default, obeys tiered prici
   } finally {
     await planner.close()
   }
+})
+
+test('Phase 19.9: Default-OFF password auto-relogin handles 401 single-flight refresh, cross-instance disk reuse, and permanent circuit breaker', async () => {
+  const tmpDir = makeTempDir('kernel-p19-relogin-')
+  const sessionPath = path.join(tmpDir, '.session.json')
+  const credsPath = path.join(tmpDir, '.credentials.json')
+  fs.writeFileSync(sessionPath, JSON.stringify({ host: 'example.test', cookies: { sid: 'expired-sid-1' } }, null, 2), { mode: 0o600 })
+  fs.writeFileSync(credsPath, JSON.stringify({ login: 'demo_user', password: 'demo_password_123' }, null, 2), { mode: 0o600 })
+
+  let cfgCalls = 0
+  let loginCalls = 0
+  let passwordLoginEnabled = true
+  let rejectCreds = false
+  let simMs = 1_795_600_000_000
+
+  const mockFetch = async (urlStr, init = {}) => {
+    const u = new URL(urlStr)
+    if (u.pathname === '/api/auth/config') {
+      cfgCalls++
+      return new Response(JSON.stringify({ password_login: passwordLoginEnabled }), { status: 200 })
+    }
+    if (u.pathname === '/api/auth/password-login') {
+      loginCalls++
+      const body = JSON.parse(init.body || '{}')
+      if (rejectCreds || body.password !== 'demo_password_123') {
+        return new Response(JSON.stringify({ error: '用户名或密码错误' }), { status: 401 })
+      }
+      return {
+        status: 200,
+        headers: { getSetCookie: () => ['sid=fresh-sid-123; Path=/; HttpOnly; SameSite=Lax'] },
+        text: async () => JSON.stringify({ ok: true, next: '/pets' }),
+      }
+    }
+    if (u.pathname === '/api/pet/world') {
+      const ck = init.headers?.cookie || ''
+      if (!ck.includes('sid=fresh-sid-123')) {
+        return new Response(JSON.stringify({ error: '请先登录' }), { status: 401 })
+      }
+      return new Response(JSON.stringify({ now: 1795600001, rev: 77, coins: 1000 }), { status: 200 })
+    }
+    return new Response(JSON.stringify({}), { status: 404 })
+  }
+
+  // 1) Auto-relogin stays OFF by default
+  const defaultOffClient = new KernelHttpClient({
+    baseUrl: 'https://game.example.invalid',
+    sessionFilePath: sessionPath,
+    nowMsFn: () => simMs,
+    sleepMsFn: async (ms) => { simMs += ms },
+    fetchImpl: mockFetch,
+  })
+  await assert.rejects(() => defaultOffClient.getJson('/api/pet/world'), /请先登录/)
+  assert.equal(cfgCalls, 0)
+  assert.equal(loginCalls, 0)
+  assert.equal(defaultOffClient.stats.reloginCount, 0)
+
+  // 2) Enabled: two concurrent 401 calls share ONE password-login, update disk atomically, and replay cleanly
+  const reloginClient = new KernelHttpClient({
+    baseUrl: 'https://game.example.invalid',
+    sessionFilePath: sessionPath,
+    autoRelogin: { enabled: true, credentialsFilePath: credsPath },
+    nowMsFn: () => simMs,
+    sleepMsFn: async (ms) => { simMs += ms },
+    fetchImpl: mockFetch,
+  })
+  const [w1, w2] = await Promise.all([
+    reloginClient.getJson('/api/pet/world'),
+    reloginClient.getJson('/api/pet/world'),
+  ])
+  assert.equal(w1.rev, 77)
+  assert.equal(w2.rev, 77)
+  assert.equal(cfgCalls, 1)
+  assert.equal(loginCalls, 1)
+  assert.equal(reloginClient.stats.reloginCount, 1)
+  assert.equal(parseSessionCookieHeader(sessionPath), 'sid=fresh-sid-123')
+
+  // 3) Another client instance hitting 401 with an old cookie detects a fresh disk session written concurrently without relogging in
+  fs.writeFileSync(sessionPath, JSON.stringify({ host: 'example.test', cookies: { sid: 'expired-sid-1' } }, null, 2), { mode: 0o600 })
+  let siblingFirst = true
+  const siblingClient = new KernelHttpClient({
+    baseUrl: 'https://game.example.invalid',
+    sessionFilePath: sessionPath,
+    autoRelogin: { enabled: true, credentialsFilePath: credsPath },
+    nowMsFn: () => simMs,
+    sleepMsFn: async (ms) => { simMs += ms },
+    fetchImpl: async (urlStr, init = {}) => {
+      const u = new URL(urlStr)
+      if (u.pathname === '/api/pet/world' && siblingFirst) {
+        siblingFirst = false
+        // Simulate sibling daemon refreshing session.json while this request was in flight
+        fs.writeFileSync(sessionPath, JSON.stringify({ host: 'example.test', cookies: { sid: 'fresh-sid-123' } }, null, 2), { mode: 0o600 })
+        return new Response(JSON.stringify({ error: '请先登录' }), { status: 401 })
+      }
+      return mockFetch(urlStr, init)
+    },
+  })
+  const w3 = await siblingClient.getJson('/api/pet/world')
+  assert.equal(w3.rev, 77)
+  assert.equal(loginCalls, 1, 'Sibling client must pick up on-disk fresh cookie instead of hitting password-login again')
+
+  // 3b) Two independent KernelHttpClient instances racing on the same expired disk session share the file lock -> only 1 relogin
+  fs.writeFileSync(sessionPath, JSON.stringify({ host: 'example.test', cookies: { sid: 'expired-sid-race' } }, null, 2), { mode: 0o600 })
+  const makeRaceClient = () => new KernelHttpClient({
+    baseUrl: 'https://game.example.invalid',
+    sessionFilePath: sessionPath,
+    autoRelogin: { enabled: true, credentialsFilePath: credsPath },
+    nowMsFn: () => simMs,
+    sleepMsFn: async (ms) => { simMs += ms },
+    fetchImpl: mockFetch,
+  })
+  const [wr1, wr2] = await Promise.all([
+    makeRaceClient().getJson('/api/pet/world'),
+    makeRaceClient().getJson('/api/pet/world'),
+  ])
+  assert.equal(wr1.rev, 77)
+  assert.equal(wr2.rev, 77)
+  assert.equal(loginCalls, 2, 'Cross-instance lock must serialize concurrent 401s into a single password-login')
+
+  // 4) Wrong credentials trip permanent circuit breaker so subsequent 401 calls do NOT lock the account
+  fs.writeFileSync(sessionPath, JSON.stringify({ cookies: { sid: 'expired-sid-2' } }), { mode: 0o600 })
+  rejectCreds = true
+  const badCredsClient = new KernelHttpClient({
+    baseUrl: 'https://game.example.invalid',
+    sessionFilePath: sessionPath,
+    autoRelogin: { enabled: true, credentialsFilePath: credsPath, cooldownMs: 0 },
+    nowMsFn: () => simMs,
+    sleepMsFn: async (ms) => { simMs += ms },
+    fetchImpl: mockFetch,
+  })
+  await assert.rejects(() => badCredsClient.getJson('/api/pet/world'), /请先登录/)
+  assert.equal(loginCalls, 3)
+  assert.equal(badCredsClient.stats.reloginFailCount, 1)
+  assert.equal(badCredsClient._reloginCircuitBroken, true)
+
+  await assert.rejects(() => badCredsClient.getJson('/api/pet/world'), /请先登录/)
+  assert.equal(loginCalls, 3, 'Circuit-broken client MUST NOT retry password-login on further 401s')
+})
+
+test('Phase 19.10: Stationary intrinsic breakpoint optimizer eliminates rounding dead-zones & manual --respec-once works without auto-respec', async () => {
+  const catalog = [
+    { id: 'w_crit', name: 'CritWeapon', slot: 'weapon', rarity: 4, skill: true, stats: { atk: 16, hp: 30, spd: 0, agi: 0, def: 0 } },
+    { id: 'w_drain', name: 'DrainWeapon', slot: 'weapon', rarity: 3, skill: true, stats: { atk: 10, hp: 10, spd: 4, agi: 4, def: 0 } },
+    { id: 'a_def', name: 'DefArmor', slot: 'armor', rarity: 4, stats: { def: 12, hp: 60 } },
+    { id: 'c_rev', name: 'RevCharm', slot: 'charm', rarity: 4, stats: { hp: 80, spd: 3 }, passive: { kind: 'revive', value: 0.12 } },
+  ]
+  const gearFloat = {
+    atk: 16 * 0.3 * 1.4, // 6.72
+    hp: (30 + 60 + 80) * 0.3 * 1.4, // 71.4
+    spd: 3 * 0.3 * 1.4, // 1.26
+  }
+  const makeDeadzoneGear = (free = 0) => ({
+    adopted: true,
+    coins: 50000,
+    level: 23,
+    free,
+    points: { str: 44, vit: 17, agi: 0, spd: 5 },
+    prices: { respec: 3000 },
+    gear: {
+      weapon: { id: 'w_crit', enh: 10 },
+      armor: { id: 'a_def', enh: 10 },
+      charm: { id: 'c_rev', enh: 10 },
+    },
+    items: [
+      { id: 'w_crit', enh: 10 },
+      { id: 'w_drain', enh: 10 },
+      { id: 'a_def', enh: 10 },
+      { id: 'c_rev', enh: 10 },
+    ],
+    catalog,
+    breakdown: {
+      // Exact base floats: hp=384.3, atk=35.1, spd=21.15 -> str=44 (59.42->59 vs 59.02->59) & spd=5 (24.41->24 vs 24.01->24) are dead-zones!
+      hp: { base: 384, points: 68, gear: Math.round(gearFloat.hp), total: Math.round(384.3 + 17 * 4 + gearFloat.hp) },
+      atk: { base: 35, points: 18, gear: Math.round(gearFloat.atk), total: Math.round(35.1 + 44 * 0.4 + gearFloat.atk) },
+      def: { base: 0, points: 0, gear: 5, total: 5 },
+      agi: { base: 20, points: 0, gear: 0, total: 20 },
+      spd: { base: 21, points: 2, gear: Math.round(gearFloat.spd), total: Math.round(21.15 + 5 * 0.4 + gearFloat.spd) },
+    },
+  })
+
+  // Simulated prior same-level panel observations collected by recordObservedPanel
+  const observedPanels = {
+    'c_rev:10:23|w:w_crit:10|a:a_def:10|p:44,16,0,6': {
+      hp: Math.round(384.3 + 16 * 4 + gearFloat.hp),
+      atk: Math.round(35.1 + 44 * 0.4 + gearFloat.atk),
+      def: 5,
+      agi: 20,
+      spd: Math.round(21.15 + 6 * 0.4 + gearFloat.spd),
+    },
+    'c_rev:10:23|w:w_drain:10|a:a_def:10|p:43,18,0,5': {
+      hp: Math.round(384.3 + 18 * 4 + (10 + 60 + 80) * 0.3 * 1.4),
+      atk: Math.round(35.1 + 43 * 0.4 + 10 * 0.3 * 1.4),
+      def: 5,
+      agi: Math.round(20 + 4 * 0.3 * 1.4),
+      spd: Math.round(21.15 + 5 * 0.4 + (4 + 3) * 0.3 * 1.4),
+    },
+  }
+
+  // 1) Never triggers automatic respec when free === 0
+  const noFreePlan = planGearAndPoints(makeDeadzoneGear(0), { observedPanels })
+  assert.equal(noFreePlan.allocate, false)
+  assert.deepEqual(noFreePlan.points, { str: 44, vit: 17, agi: 0, spd: 5 })
+
+  // 2) Full stationary breakpoint search picks exact rounding steps with ZERO wasted points
+  const opt = computeOptimalStatAllocation(makeDeadzoneGear(0), { observedPanels, trials: 60 })
+  assert.equal(opt.detail.weapon.best, 'w_crit')
+  assert.equal(opt.points.str + opt.points.vit + opt.points.agi + opt.points.spd, 66)
+  if (opt.points.str > 0) {
+    assert.ok(
+      Math.round(35.1 + opt.points.str * 0.4 + gearFloat.atk) > Math.round(35.1 + (opt.points.str - 1) * 0.4 + gearFloat.atk),
+      `Expected non-wasted str breakpoint, got str=${opt.points.str}`
+    )
+  }
+  if (opt.points.spd > 0) {
+    assert.ok(
+      Math.round(21.15 + opt.points.spd * 0.4 + gearFloat.spd) > Math.round(21.15 + (opt.points.spd - 1) * 0.4 + gearFloat.spd),
+      `Expected non-wasted spd breakpoint, got spd=${opt.points.spd}`
+    )
+  }
+
+  // 3) Free level-up points (+3) allocate monotonically >= current points with allocate=true
+  const freePlan = planGearAndPoints(makeDeadzoneGear(3), { observedPanels })
+  assert.equal(freePlan.allocate, true)
+  assert.equal(freePlan.points.str >= 44 && freePlan.points.vit >= 17 && freePlan.points.spd >= 5, true)
+  assert.equal(freePlan.points.str + freePlan.points.vit + freePlan.points.agi + freePlan.points.spd, 69)
+
+  // 4) executeAuthorizedRespec supports dryRun preview and atomic respec -> points with gear-lock persistence
+  const tmpDir = makeTempDir('kernel-p19-respec-')
+  const lockRoot = path.join(tmpDir, 'locks')
+  const callLog = []
+  let srvGear = makeDeadzoneGear(0)
+
+  const client = new KernelHttpClient({
+    baseUrl: 'https://game.example.invalid',
+    cookieHeader: 'sid=test',
+    fetchImpl: async (urlStr, init = {}) => {
+      const p = new URL(urlStr).pathname
+      const body = init.body ? JSON.parse(init.body) : null
+      callLog.push(`${init.method || 'GET'} ${p}`)
+      if (p === '/api/pet/battle/gear') {
+        return new Response(JSON.stringify(srvGear), { status: 200 })
+      }
+      if (p === '/api/pet/battle/respec' && init.method === 'POST') {
+        assert.ok(typeof body?.operation === 'string' && body.operation.length >= 16)
+        srvGear = {
+          ...srvGear,
+          coins: srvGear.coins - 3000,
+          free: 66,
+          points: { str: 0, vit: 0, agi: 0, spd: 0 },
+        }
+        return new Response(JSON.stringify(srvGear), { status: 200 })
+      }
+      if (p === '/api/pet/battle/points' && init.method === 'POST') {
+        const np = body.points
+        srvGear = {
+          ...srvGear,
+          free: 0,
+          points: { ...np },
+          breakdown: {
+            hp: { base: 384, points: np.vit * 4, gear: Math.round(gearFloat.hp), total: Math.round(384.3 + np.vit * 4 + gearFloat.hp) },
+            atk: { base: 35, points: Math.round(np.str * 0.4), gear: Math.round(gearFloat.atk), total: Math.round(35.1 + np.str * 0.4 + gearFloat.atk) },
+            def: { base: 0, points: 0, gear: 5, total: 5 },
+            agi: { base: 20, points: Math.round(np.agi * 0.4), gear: 0, total: Math.round(20 + np.agi * 0.4) },
+            spd: { base: 21, points: Math.round(np.spd * 0.4), gear: Math.round(gearFloat.spd), total: Math.round(21.15 + np.spd * 0.4 + gearFloat.spd) },
+          },
+        }
+        return new Response(JSON.stringify(srvGear), { status: 200 })
+      }
+      return new Response(JSON.stringify({}), { status: 404 })
+    },
+  })
+
+  const dryRes = await executeAuthorizedRespec(client, { accountKey: 'main', lockRoot, cashReserveFloor: 10, dryRun: true })
+  assert.equal(dryRes.ok, true)
+  assert.equal(dryRes.status, 'dry-run-would-respec')
+  assert.equal(callLog.some((c) => c.startsWith('POST ')), false, 'dryRun must send zero POST requests')
+
+  callLog.length = 0
+  const execRes = await executeAuthorizedRespec(client, { accountKey: 'main', lockRoot, cashReserveFloor: 10, dryRun: false })
+  assert.equal(execRes.ok, true)
+  assert.equal(execRes.status, 'respec-completed')
+  assert.equal(execRes.cost, 3000)
+  assert.deepEqual(execRes.points, dryRes.targetPoints)
+  const rIdx = callLog.indexOf('POST /api/pet/battle/respec')
+  const pIdx = callLog.indexOf('POST /api/pet/battle/points')
+  assert.ok(rIdx >= 0 && pIdx > rIdx)
+  const savedSt = readAccountGearState('main', lockRoot)
+  assert.equal(savedSt.dirty, false)
+  assert.deepEqual(savedSt.gearSnap.points, dryRes.targetPoints)
 })

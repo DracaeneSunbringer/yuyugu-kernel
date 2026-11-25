@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import {
   SLOTS,
+  computeOptimalStatAllocation,
   executeWithTacticalLoadout,
   extractEquippedIds,
   planGearAndPoints,
@@ -410,8 +411,9 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
     : 0
 
   if (dryRun) {
+    const stDry = lockRoot ? readAccountGearState(accountKey, lockRoot) : {}
     const gearSnap = await httpClient.getJson('/api/pet/battle/gear')
-    const plan = planGearAndPoints(gearSnap)
+    const plan = planGearAndPoints(gearSnap, { observedPanels: stDry?.observedPanels || null })
     const trainPlan = planBattleTrainSteps(gearSnap, {
       enabled: Boolean(allowBattleTrain),
       cashReserveFloor,
@@ -498,7 +500,7 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
     }
 
     // First equip optimal resting defense gear ( recovers any prior `dirty` state as well! )
-    let plan = planGearAndPoints(gearSnap)
+    let plan = planGearAndPoints(gearSnap, { observedPanels: st.observedPanels })
     const equippedChanges = []
     let equipError = null
 
@@ -518,10 +520,10 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
     }
 
     // Multi-pass stat allocation: wearing the best weapon unlocks exact `wornSpdTotal`/`wornAtkTotal` observation,
-    // and Pass 2 immediately spends any `reserveForSpdObs` points freed after Pass 1's panel observation!
+    // and Pass 2 immediately spends any free points discovered after Pass 1's panel observation!
     const pointAllocations = []
     for (let pass = 0; pass < 2; pass++) {
-      plan = planGearAndPoints(gearSnap)
+      plan = planGearAndPoints(gearSnap, { observedPanels: st.observedPanels })
       if (!plan.allocate) break
       const ptRes = await httpClient.postJson('/api/pet/battle/points', { points: plan.points })
       if (!ptRes.ok) break
@@ -530,7 +532,7 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
       recordObservedPanel(st, gearSnap)
     }
 
-    const finalPlan = planGearAndPoints(gearSnap)
+    const finalPlan = planGearAndPoints(gearSnap, { observedPanels: st.observedPanels })
     const effResting = {
       weapon: finalPlan.detail.weapon?.best || gearSnap?.gear?.weapon?.id || null,
       armor: finalPlan.detail.armor?.best || gearSnap?.gear?.armor?.id || null,
@@ -576,6 +578,185 @@ export async function syncBattleProfilesAndPreparation(httpClient, {
     }
     throw err
   }
+}
+
+/**
+ * Manual one-shot authorized respec (`--respec-once`, NEVER called in automatic tick loop):
+ * Computes stationary intrinsic optimal breakpoints (or uses explicit `targetPoints`) inside
+ * `.battle-gear.<account>.lock`, performs atomic `respec -> points`, and records the fresh panel.
+ */
+export async function executeAuthorizedRespec(httpClient, {
+  accountKey = 'main',
+  lockRoot,
+  cashReserveFloor = 0,
+  targetPoints = null,
+  dryRun = false,
+} = {}) {
+  const normTarget = targetPoints
+    ? {
+        str: Math.floor(Number(targetPoints.str ?? 0)),
+        vit: Math.floor(Number(targetPoints.vit ?? 0)),
+        agi: Math.floor(Number(targetPoints.agi ?? 0)),
+        spd: Math.floor(Number(targetPoints.spd ?? 0)),
+      }
+    : null
+  if (normTarget && Object.values(normTarget).some((n) => !Number.isInteger(n) || n < 0)) {
+    throw new Error(`Invalid targetPoints: ${JSON.stringify(targetPoints)}`)
+  }
+
+  return withGearLock(lockRoot, accountKey, async () => {
+    const st = readAccountGearState(accountKey, lockRoot)
+    let gearSnap = await httpClient.getJson('/api/pet/battle/gear')
+    if (!gearSnap?.adopted) {
+      return { ok: false, status: 'not-adopted' }
+    }
+
+    const restPlan = planGearAndPoints(gearSnap, { observedPanels: st.observedPanels })
+    if (!dryRun) {
+      for (const slot of SLOTS) {
+        const wantId = restPlan.detail[slot]?.best
+        const curId = gearSnap?.gear?.[slot]?.id || null
+        if (wantId && wantId !== curId) {
+          const eqRes = await httpClient.postJson('/api/pet/battle/equip', { slot, item: wantId })
+          if (eqRes.ok) {
+            gearSnap = eqRes.body?.catalog ? eqRes.body : await httpClient.getJson('/api/pet/battle/gear')
+          }
+        }
+      }
+    }
+    recordObservedPanel(st, gearSnap)
+
+    const opt = computeOptimalStatAllocation(gearSnap, { observedPanels: st.observedPanels })
+    const desiredPoints = normTarget || opt.points
+    const curPts = {
+      str: Math.max(0, Math.floor(Number(gearSnap?.points?.str || 0))),
+      vit: Math.max(0, Math.floor(Number(gearSnap?.points?.vit || 0))),
+      agi: Math.max(0, Math.floor(Number(gearSnap?.points?.agi || 0))),
+      spd: Math.max(0, Math.floor(Number(gearSnap?.points?.spd || 0))),
+    }
+    const curFree = Math.max(0, Math.floor(Number(gearSnap?.free || 0)))
+    const totalAvail = curPts.str + curPts.vit + curPts.agi + curPts.spd + curFree
+    const targetSum = desiredPoints.str + desiredPoints.vit + desiredPoints.agi + desiredPoints.spd
+    if (targetSum !== totalAvail) {
+      return {
+        ok: false,
+        status: 'points-sum-mismatch',
+        totalAvail,
+        targetSum,
+        targetPoints: desiredPoints,
+      }
+    }
+
+    const alreadyAtTarget =
+      curFree === 0 &&
+      curPts.str === desiredPoints.str &&
+      curPts.vit === desiredPoints.vit &&
+      curPts.agi === desiredPoints.agi &&
+      curPts.spd === desiredPoints.spd
+
+    const diagnostics = {
+      offWinPct: opt.offWinPct,
+      defHoldPct: opt.defHoldPct,
+      combinedPct: opt.combinedPct,
+      candidatesEvaluated: opt.candidatesEvaluated,
+      computedOptimalPoints: opt.points,
+    }
+
+    if (alreadyAtTarget) {
+      st.gearSnap = gearSnap
+      st.updatedAt = Date.now()
+      writeAccountGearState(st, accountKey, lockRoot)
+      return {
+        ok: true,
+        status: 'already-at-target',
+        cost: 0,
+        points: curPts,
+        breakdown: gearSnap.breakdown,
+        diagnostics,
+      }
+    }
+
+    const respecCost = Math.max(0, Math.floor(Number(gearSnap?.prices?.respec ?? 3000)))
+    const coins = Math.max(0, Math.floor(Number(gearSnap?.coins ?? 0)))
+    if (coins - respecCost < Math.max(0, Math.floor(Number(cashReserveFloor || 0)))) {
+      return {
+        ok: false,
+        status: 'insufficient-coins-above-reserve',
+        coins,
+        respecCost,
+        cashReserveFloor,
+        targetPoints: desiredPoints,
+      }
+    }
+
+    if (dryRun) {
+      return {
+        ok: true,
+        status: 'dry-run-would-respec',
+        level: gearSnap.level,
+        cost: respecCost,
+        coins,
+        beforePoints: curPts,
+        targetPoints: desiredPoints,
+        beforeBreakdown: gearSnap.breakdown,
+        predictedPanel: normTarget ? null : opt.panel,
+        diagnostics,
+      }
+    }
+
+    const operation = crypto.randomUUID()
+    const rRespec = await httpClient.postJson('/api/pet/battle/respec', { operation })
+    if (!rRespec.ok) {
+      return {
+        ok: false,
+        status: 'respec-rejected',
+        httpStatus: rRespec.status,
+        error: rRespec.body?.error || rRespec.body?.msg || rRespec.error || `HTTP ${rRespec.status}`,
+      }
+    }
+    gearSnap = rRespec.body?.catalog ? rRespec.body : await httpClient.getJson('/api/pet/battle/gear')
+
+    const rPts = await httpClient.postJson('/api/pet/battle/points', { points: desiredPoints })
+    if (!rPts.ok) {
+      return {
+        ok: false,
+        status: 'points-rejected',
+        httpStatus: rPts.status,
+        error: rPts.body?.error || rPts.body?.msg || rPts.error || `HTTP ${rPts.status}`,
+      }
+    }
+    gearSnap = rPts.body?.catalog ? rPts.body : await httpClient.getJson('/api/pet/battle/gear')
+    recordObservedPanel(st, gearSnap)
+
+    const finalPlan = planGearAndPoints(gearSnap, { observedPanels: st.observedPanels })
+    const effResting = {
+      weapon: finalPlan.detail.weapon?.best || gearSnap?.gear?.weapon?.id || null,
+      armor: finalPlan.detail.armor?.best || gearSnap?.gear?.armor?.id || null,
+      charm: finalPlan.detail.charm?.best || gearSnap?.gear?.charm?.id || null,
+    }
+    const curEq = extractEquippedIds(gearSnap)
+    st.restingGear = effResting
+    st.restingCharm = effResting.charm
+    st.activeGear = curEq
+    st.activeCharm = curEq.charm
+    st.dirty = Boolean(SLOTS.some((s) => effResting[s] && curEq[s] !== effResting[s]))
+    st.updatedAt = Date.now()
+    st.gearSnap = gearSnap
+    writeAccountGearState(st, accountKey, lockRoot)
+
+    return {
+      ok: true,
+      status: 'respec-completed',
+      operation,
+      level: gearSnap.level,
+      cost: respecCost,
+      beforePoints: curPts,
+      points: gearSnap.points,
+      free: gearSnap.free,
+      breakdown: gearSnap.breakdown,
+      diagnostics,
+    }
+  })
 }
 
 export function pickArenaOpponent(opponentsList = [], excludeIds = null) {
